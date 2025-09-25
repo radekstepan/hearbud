@@ -130,11 +130,7 @@ def list_devices():
 # ================== Controller (PyAudio) ==================
 class RecordingController(threading.Thread):
     """
-    Captures:
-      - Mic (input device) via PyAudio
-      - Loopback (WASAPI loopback device you select explicitly, or auto-match)
-    Live gain: mic_gain and loop_gain can be changed while recording via SET_GAINS
-    Compatibility: If PyAudio build doesn't support 'as_loopback', retry without it.
+    Captures audio, processes it in chunks, and writes to a file continuously.
     """
     def __init__(self, command_queue, status_queue):
         super().__init__(daemon=True)
@@ -143,8 +139,6 @@ class RecordingController(threading.Thread):
         self.is_recording = False
 
         self.include_mic = True
-        self.raw_dump = False
-
         self.p = None
         self.mic_stream = None
         self.spk_stream = None
@@ -155,17 +149,15 @@ class RecordingController(threading.Thread):
         self.capture_sr_mic = TARGET_SR
         self.capture_sr_spk = TARGET_SR
 
-        # live gains
         self.mic_gain = GAIN_DEFAULT
         self.loop_gain = GAIN_DEFAULT
 
-        # raw dump
-        self.raw_wave = None
-        self.raw_frames_written = 0
-        self.raw_path = None
+        self.output_path = None
+        self.output_wave_file = None
+        self.processing_thread = None
+        self.mic_thread = None
+        self.loop_thread = None
 
-        # Start time for recording
-        self.start_time = None
 
     # ---------- PyAudio helpers ----------
     def _ensure_pyaudio(self):
@@ -184,8 +176,7 @@ class RecordingController(threading.Thread):
                         output_device=device_index if not is_input else None,
                         input_channels=ch_try if is_input else None,
                         output_channels=ch_try if not is_input else None,
-                        input_format=pyaudio.paInt16 if is_input else None,
-                        output_format=pyaudio.paInt16 if not is_input else None
+                        input_format=pyaudio.paInt16
                     )
                     return True, ch_try, sr_try
                 except ValueError:
@@ -230,10 +221,10 @@ class RecordingController(threading.Thread):
                     input=True,
                     input_device_index=lb_idx,
                     frames_per_buffer=BLOCK,
-                    as_loopback=True  # may fail on some builds
+                    as_loopback=True
                 )
                 return ch, sr
-            except TypeError:
+            except TypeError: # Fallback for builds without as_loopback
                 try:
                     self.spk_stream = self.p.open(
                         format=pyaudio.paInt16,
@@ -244,28 +235,18 @@ class RecordingController(threading.Thread):
                         frames_per_buffer=BLOCK
                     )
                     return ch, sr
-                except Exception as e2:
-                    last_err = e2
-                    time.sleep(0.4)
-            except Exception as e:
-                last_err = e
-                time.sleep(0.4)
+                except Exception as e2: last_err = e2; time.sleep(0.4)
+            except Exception as e: last_err = e; time.sleep(0.4)
         raise RuntimeError(
-            f"Cannot open loopback device [{lb_idx}] {lb_dev['name']}.\n"
-            f"Last error: {last_err}\n"
-            f"Tip: Pick an entry under 'Loopback device (what to capture)'. "
-            f"If you only have outputs and no loopback entries, ensure your driver exposes WASAPI loopback "
-            f"or install pyaudiowpatch."
+            f"Cannot open loopback device [{lb_idx}] {lb_dev['name']}.\nLast error: {last_err}"
         )
 
     def _match_loopback(self, spk_dev, loopbacks: dict):
         base = spk_dev['name'] if spk_dev else ""
         for name, d in loopbacks.items():
-            if base and name.startswith(base):
-                return d
+            if base and name.startswith(base): return d
         for name, d in loopbacks.items():
-            if base and (base in name or name in base):
-                return d
+            if base and (base in name or name in base): return d
         return None
 
     # ---------- Thread lifecycle ----------
@@ -286,296 +267,198 @@ class RecordingController(threading.Thread):
                 lg = float(args.get("loop_gain", self.loop_gain))
                 self.mic_gain = max(GAIN_MIN, min(GAIN_MAX, mg))
                 self.loop_gain = max(GAIN_MIN, min(GAIN_MAX, lg))
-                # lightweight status update
-                self.status_queue.put(("STATUS",
-                    f"Recording… (mic {self.mic_gain:.2f}×, out {self.loop_gain:.2f}×)"))
+                if self.is_recording:
+                    self.status_queue.put(("STATUS",
+                        f"Recording… (mic {self.mic_gain:.2f}×, out {self.loop_gain:.2f}×)"))
 
     def _teardown(self):
-        try:
-            if self.mic_stream:
-                if self.mic_stream.is_active(): self.mic_stream.stop_stream()
-                self.mic_stream.close()
-        except Exception:
-            pass
-        try:
-            if self.spk_stream:
-                if self.spk_stream.is_active(): self.spk_stream.stop_stream()
-                self.spk_stream.close()
-        except Exception:
-            pass
+        for stream in [self.mic_stream, self.spk_stream]:
+            if stream:
+                try:
+                    if stream.is_active(): stream.stop_stream()
+                    stream.close()
+                except Exception: pass
         if self.p:
             try: self.p.terminate()
             except Exception: pass
         self.p = None
-        self.mic_stream = None
-        self.spk_stream = None
-        self.start_time = None
+        self.mic_stream, self.spk_stream = None, None
 
     def start_recording(self, mic_device=None, spk_device=None, loopback_device=None,
-                        include_mic=True, raw_dump=False, mic_gain=GAIN_DEFAULT, loop_gain=GAIN_DEFAULT):
+                        include_mic=True, mic_gain=GAIN_DEFAULT, loop_gain=GAIN_DEFAULT, output_path=None):
         self._ensure_pyaudio()
+        if not output_path:
+            self.status_queue.put(("ERROR", "No output file was selected."))
+            return
 
         if spk_device is None and loopback_device is None:
             self.status_queue.put(("ERROR", "Select an output or a loopback device."))
-            self.status_queue.put(("STATUS", "Ready to record"))
             return
         if include_mic and mic_device is None:
-            self.status_queue.put(("ERROR", "Include microphone is enabled but no mic selected."))
-            self.status_queue.put(("STATUS", "Ready to record"))
+            self.status_queue.put(("ERROR", "Select a microphone to include it in the recording."))
             return
 
-        self.include_mic = bool(include_mic and not raw_dump)  # force mic off in raw mode
-        self.raw_dump = bool(raw_dump)
+        self.include_mic = bool(include_mic)
         self.mic_gain = float(mic_gain)
         self.loop_gain = float(loop_gain)
-        self.start_time = time.time()  # Record start time
+        self.output_path = output_path
 
-        # Open loopback
         try:
+            # Open audio streams
+            chosen_lb_name = ""
             if loopback_device is not None:
                 lb_ch, lb_sr = self._open_loopback_by_index(loopback_device)
                 chosen_lb_name = loopback_device['name']
             else:
                 _, _, loopbacks = list_devices()
-                if not loopbacks:
-                    raise RuntimeError("No WASAPI loopback devices found. "
-                                       "Pick a device under 'Loopback device' after clicking Refresh.")
+                if not loopbacks: raise RuntimeError("No WASAPI loopback devices found.")
                 lb_choice = self._match_loopback(spk_device, loopbacks) or next(iter(loopbacks.values()))
                 lb_ch, lb_sr = self._open_loopback_by_index(lb_choice)
                 chosen_lb_name = lb_choice['name']
+
+            if self.include_mic:
+                self._open_mic(mic_device)
+
+            # Determine output format and open WAV file
+            out_channels = getattr(self.spk_stream, "_channels", 2)
+            self.output_wave_file = wave.open(self.output_path, "wb")
+            self.output_wave_file.setnchannels(out_channels)
+            self.output_wave_file.setsampwidth(2)  # 16-bit
+            self.output_wave_file.setframerate(TARGET_SR)
+
         except Exception as e:
-            self.status_queue.put(("ERROR", f"Loopback error: {e}"))
+            self.status_queue.put(("ERROR", f"Failed to start recording: {e}"))
             self._teardown()
+            if self.output_wave_file: self.output_wave_file.close()
             self.status_queue.put(("STATUS", "Ready to record"))
             return
 
-        if self.include_mic:
-            try:
-                self._open_mic(mic_device)
-            except Exception as e:
-                self.status_queue.put(("ERROR", f"Mic error: {e}"))
-                self._teardown()
-                self.status_queue.put(("STATUS", "Ready to record"))
-                return
-
-        if self.raw_dump:
-            dump_dir = Path.home() / "Music" / "Recordings"
-            dump_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self.raw_path = str(dump_dir / f"raw_loopback_{ts}_{lb_sr}Hz.wav")
-            try:
-                self.raw_wave = wave.open(self.raw_path, "wb")
-                self.raw_wave.setnchannels(lb_ch)
-                self.raw_wave.setsampwidth(2)
-                self.raw_wave.setframerate(lb_sr)
-                self.raw_frames_written = 0
-                self.status_queue.put(("INFO", f"Raw dump → {self.raw_path}"))
-            except Exception as e:
-                self.status_queue.put(("ERROR", f"Cannot open raw WAV: {e}"))
-                self._teardown()
-                self.status_queue.put(("STATUS", "Ready to record"))
-                return
-
         self.is_recording = True
         mic_note = " + Mic" if self.include_mic else ""
-        self.status_queue.put(("STATUS", f"Recording… (Loopback {lb_sr/1000:.1f} kHz{mic_note}, "
-                                         f"mic {self.mic_gain:.2f}×, out {self.loop_gain:.2f}×)\n"
-                                         f"Loopback device: {chosen_lb_name}"))
+        self.status_queue.put(("STATUS", f"Recording to file… (Loopback{mic_note})\n"
+                                         f"Device: {chosen_lb_name}"))
 
-        # launch readers
+        # Launch reader and processing threads
         self.loop_thread = threading.Thread(target=self._read_loopback, daemon=True)
         self.loop_thread.start()
         if self.include_mic:
             self.mic_thread = threading.Thread(target=self._read_mic, daemon=True)
             self.mic_thread.start()
-        else:
-            self.mic_thread = None
+        self.processing_thread = threading.Thread(target=self._processing_and_writing_loop, daemon=True)
+        self.processing_thread.start()
 
     def stop_recording(self):
         if not self.is_recording:
             return
         self.is_recording = False
-        self.status_queue.put(("STATUS", "Processing audio…"))
+        self.status_queue.put(("STATUS", "Finalizing file…"))
 
+        # Join threads in order: producers, then consumer
         if self.mic_thread: self.mic_thread.join()
         if self.loop_thread: self.loop_thread.join()
+        if self.processing_thread: self.processing_thread.join()
 
-        if self.raw_dump:
-            try:
-                if self.raw_wave:
-                    self.raw_wave.close()
-                    self.status_queue.put(("INFO", f"Raw dump wrote {self.raw_frames_written} frames @ {self.capture_sr_spk} Hz"))
-                    self.status_queue.put(("INFO", f"Saved raw file:\n{self.raw_path}"))
-            except Exception as e:
-                self.status_queue.put(("ERROR", f"Error closing raw WAV: {e}"))
-            finally:
-                self.raw_wave = None
-                self.raw_frames_written = 0
-                self.raw_path = None
-            self._teardown()
-            self.status_queue.put(("STATUS", "Ready to record"))
-            return
+        try:
+            if self.output_wave_file:
+                self.output_wave_file.close()
+                self.status_queue.put(("INFO", f"Recording saved to\n{self.output_path}"))
+        except Exception as e:
+            self.status_queue.put(("ERROR", f"Error closing WAV file: {e}"))
+        finally:
+            self.output_wave_file = None
+            self.output_path = None
 
-        self._process_and_emit()
         self._teardown()
+        self.status_queue.put(("STATUS", "Ready to record"))
 
-    # ---------- Readers ----------
+    # ---------- Readers (Producers) ----------
     def _read_loopback(self):
-        last = 0.0
+        last_meter_update = 0.0
         try:
             while self.is_recording and self.spk_stream and self.spk_stream.is_active():
                 data = self.spk_stream.read(BLOCK, exception_on_overflow=False)
-                ch = getattr(self.spk_stream, "_channels", None) or 2
+                ch = getattr(self.spk_stream, "_channels", 2)
                 x = float_from_int16_bytes(data, ch)
+                gained_x = x * self.loop_gain
+                self.loop_queue.put(gained_x.copy())
 
-                if self.raw_dump:
-                    self.raw_wave.writeframes(data)
-                    self.raw_frames_written += len(x) if x.ndim == 1 else x.shape[0]
-                else:
-                    x *= self.loop_gain
-                    self.loop_queue.put((x.copy(), time.time() - self.start_time))
-
-                # METERING: reflect current *gained* level
                 now = time.time()
-                if now - last >= 0.1:
-                    peak = float(np.max(np.abs(x))) if x.size else 0.0
+                if now - last_meter_update >= 0.1:
+                    peak = float(np.max(np.abs(gained_x))) if gained_x.size else 0.0
                     self.status_queue.put(("LEVEL", ("sys", peak)))
-                    last = now
+                    last_meter_update = now
         except Exception as e:
-            if self.is_recording:
-                self.status_queue.put(("ERROR", f"Loopback read error: {e}"))
+            if self.is_recording: self.status_queue.put(("ERROR", f"Loopback read error: {e}"))
 
     def _read_mic(self):
-        last = 0.0
+        last_meter_update = 0.0
         try:
             while self.is_recording and self.mic_stream and self.mic_stream.is_active():
                 data = self.mic_stream.read(BLOCK, exception_on_overflow=False)
-                ch = getattr(self.mic_stream, "_channels", None) or 1
+                ch = getattr(self.mic_stream, "_channels", 1)
                 x = float_from_int16_bytes(data, ch)
-                x *= self.mic_gain
-                self.mic_queue.put((x.copy(), time.time() - self.start_time))
+                gained_x = x * self.mic_gain
+                self.mic_queue.put(gained_x.copy())
 
-                # METERING: reflect current *gained* level
                 now = time.time()
-                if now - last >= 0.1:
-                    peak = float(np.max(np.abs(x))) if x.size else 0.0
+                if now - last_meter_update >= 0.1:
+                    peak = float(np.max(np.abs(gained_x))) if gained_x.size else 0.0
                     self.status_queue.put(("LEVEL", ("mic", peak)))
-                    last = now
+                    last_meter_update = now
         except Exception as e:
-            if self.is_recording:
-                self.status_queue.put(("ERROR", f"Mic read error: {e}"))
+            if self.is_recording: self.status_queue.put(("ERROR", f"Mic read error: {e}"))
 
-    # ---------- Processing ----------
+    # ---------- Processing (Consumer) ----------
     def _drain(self, q):
         out = []
-        while True:
-            try:
-                out.append(q.get_nowait())
-            except queue.Empty:
-                break
+        while not q.empty():
+            try: out.append(q.get_nowait())
+            except queue.Empty: break
         return out
 
     def _limit_down(self, x: np.ndarray) -> np.ndarray:
-        """Soft limiter: only reduces if peak > TARGET_PEAK."""
         peak = float(np.max(np.abs(x))) if x.size else 0.0
         if peak > TARGET_PEAK and peak > 1e-9:
             x = x * (TARGET_PEAK / peak)
         return x
 
-    def _process_and_emit(self):
-        loop_frames = self._drain(self.loop_queue)
-        mic_frames = self._drain(self.mic_queue)
+    def _processing_and_writing_loop(self):
+        """Continuously processes and writes audio chunks until recording stops."""
+        while self.is_recording:
+            self._process_and_write_chunk()
+            time.sleep(0.1)  # Process available audio every 100ms
 
-        # Initialize channels based on configuration
-        channels = 2 if self.spk_stream else 1  # Default to 2 for loopback, 1 for mic-only
-        if self.spk_stream:
-            channels = getattr(self.spk_stream, "_channels", 2)
-        elif self.mic_stream:
-            channels = getattr(self.mic_stream, "_channels", 1)
+        # After stopping, do one final pass to process any leftover audio
+        self._process_and_write_chunk()
 
-        # Handle case with no audio captured from either source
-        if not loop_frames and not mic_frames:
-            silent_length = TARGET_SR  # 1 second at TARGET_SR
-            mixed = np.zeros((silent_length, channels) if channels > 1 else silent_length, dtype=np.float32)
-            self.status_queue.put(("INFO", f"No audio captured. Saving silent file @ {TARGET_SR} Hz"))
-            self.status_queue.put(("SAVE_FILE", to_int16(mixed)))
+    def _process_and_write_chunk(self):
+        """Processes one batch of audio from the queues and writes to the wave file."""
+        loop_chunks = self._drain(self.loop_queue)
+        mic_chunks = self._drain(self.mic_queue) if self.include_mic else []
+
+        if not loop_chunks and not mic_chunks:
             return
 
-        # Mic-only (system silent or not captured)
-        if mic_frames and not loop_frames:
-            mic_np = np.concatenate([f for f, _ in mic_frames], axis=0).astype(np.float32, copy=False)
-            mic_rs = resample_to(mic_np, self.capture_sr_mic, TARGET_SR)
-            mic_rs = self._limit_down(mic_rs)
-            self.status_queue.put(("INFO", f"Mic-only peak(gained): {float(np.max(np.abs(mic_rs))):.3f} (saved @ {TARGET_SR} Hz)"))
-            self.status_queue.put(("SAVE_FILE", to_int16(mic_rs)))
-            return
+        out_channels = self.output_wave_file.getnchannels()
 
-        # System-only (mic silent or not included)
-        if loop_frames and not mic_frames:
-            loop_np = np.concatenate([f for f, _ in loop_frames], axis=0).astype(np.float32, copy=False)
-            loop_rs = resample_to(loop_np, self.capture_sr_spk, TARGET_SR)
-            loop_rs = self._limit_down(loop_rs)
-            self.status_queue.put(("INFO", f"System-only peak(gained): {float(np.max(np.abs(loop_rs))):.3f} (saved @ {TARGET_SR} Hz)"))
-            self.status_queue.put(("SAVE_FILE", to_int16(loop_rs)))
-            return
+        mic_rs = resample_to(np.concatenate(mic_chunks, axis=0), self.capture_sr_mic, TARGET_SR) if mic_chunks else np.array([])
+        loop_rs = resample_to(np.concatenate(loop_chunks, axis=0), self.capture_sr_spk, TARGET_SR) if loop_chunks else np.array([])
 
-        # Both streams
-        # Extract frames and timestamps
-        mic_data = [(f, t) for f, t in mic_frames]
-        loop_data = [(f, t) for f, t in loop_frames]
+        mic_len, loop_len = len(as_2d(mic_rs)), len(as_2d(loop_rs))
+        max_len = max(mic_len, loop_len)
+        if max_len == 0: return
 
-        # Resample to TARGET_SR and calculate lengths
-        mic_np = np.concatenate([f for f, _ in mic_data], axis=0).astype(np.float32, copy=False)
-        loop_np = np.concatenate([f for f, _ in loop_data], axis=0).astype(np.float32, copy=False)
+        # Create buffers padded with silence to match the longest chunk
+        mic_buf = np.zeros((max_len, out_channels), dtype=np.float32)
+        if mic_len > 0: mic_buf[:mic_len] = as_2d(mic_rs)[:, :out_channels]
 
-        self.status_queue.put(("INFO", f"Max peaks (after applied gains, pre-resample): mic {float(np.max(np.abs(mic_np))):.3f}, "
-                                       f"sys {float(np.max(np.abs(loop_np))):.3f}"))
+        loop_buf = np.zeros((max_len, out_channels), dtype=np.float32)
+        if loop_len > 0: loop_buf[:loop_len] = as_2d(loop_rs)[:, :out_channels]
 
-        mic_rs = resample_to(mic_np, self.capture_sr_mic, TARGET_SR)
-        loop_rs = resample_to(loop_np, self.capture_sr_spk, TARGET_SR)
-
-        # Get first timestamps to determine start times
-        mic_start = mic_data[0][1] if mic_data else 0.0
-        loop_start = loop_data[0][1] if loop_data else 0.0
-
-        # Convert start times to samples at TARGET_SR
-        mic_start_samples = int(mic_start * TARGET_SR)
-        loop_start_samples = int(loop_start * TARGET_SR)
-
-        # Determine total length (max duration including start offsets)
-        mic_total_samples = mic_start_samples + len(mic_rs)
-        loop_total_samples = loop_start_samples + len(loop_rs)
-        total_samples = max(mic_total_samples, loop_total_samples)
-
-        # Initialize output arrays with silence
-        mic_out = np.zeros((total_samples, channels) if channels > 1 else total_samples, dtype=np.float32)
-        loop_out = np.zeros((total_samples, channels) if channels > 1 else total_samples, dtype=np.float32)
-
-        # Place resampled data in the correct position
-        if mic_rs.size > 0:
-            mic_out[mic_start_samples:mic_start_samples + len(mic_rs)] = as_2d(mic_rs)[:, :channels]
-        if loop_rs.size > 0:
-            loop_out[loop_start_samples:loop_start_samples + len(loop_rs)] = as_2d(loop_rs)[:, :channels]
-
-        # Mix the streams
-        mixed = mic_out + loop_out
-        mixed = self._limit_down(mixed)
-
-        mixed_i16 = to_int16(mixed)
-
-        if SAVE_STEMS:
-            try:
-                dbg = Path.home() / "Recordings" / "_stems"
-                dbg.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                write_wav(str(dbg / f"{ts}-mic.wav"), TARGET_SR, to_int16(self._limit_down(mic_out)))
-                write_wav(str(dbg / f"{ts}-loop.wav"), TARGET_SR, to_int16(self._limit_down(loop_out)))
-                write_wav(str(dbg / f"{ts}-mix.wav"), TARGET_SR, mixed_i16)
-            except Exception:
-                pass
-
-        self.status_queue.put(("SAVE_FILE", mixed_i16))
-        self.status_queue.put(("STATUS", "Ready to record"))
+        # Mix, limit, convert, and write to file
+        mixed = self._limit_down(mic_buf + loop_buf)
+        if mixed.size > 0:
+            self.output_wave_file.writeframes(to_int16(mixed).tobytes())
 
 
 # ================== Tk App ==================
@@ -583,15 +466,13 @@ class AudioRecorderApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Audio Recorder (WASAPI/PyAudio)")
-        self.root.geometry("680x840")
+        self.root.geometry("680x780")
         self.root.resizable(False, False)
 
         def _tk_exception_hook(exc, val, tb):
             msg = "".join(traceback.format_exception(exc, val, tb))
-            try:
-                messagebox.showerror("Tk Error", msg)
-            except Exception:
-                print(msg, file=sys.stderr)
+            try: messagebox.showerror("Unhandled Error", msg)
+            except Exception: print(msg, file=sys.stderr)
         self.root.report_callback_exception = _tk_exception_hook
         sys.excepthook = lambda exc, val, tb: _tk_exception_hook(exc, val, tb)
 
@@ -601,7 +482,6 @@ class AudioRecorderApp:
         self.controller.start()
 
         self._poll_after_id = None
-
         self.mic_devices, self.spk_devices, self.lb_devices = {}, {}, {}
         self.selected_mic_name = tk.StringVar()
         self.selected_spk_name = tk.StringVar()
@@ -609,22 +489,18 @@ class AudioRecorderApp:
         self.output_directory = tk.StringVar()
         self.set_default_output_directory()
 
-        # Gain controls (live)
         self.mic_gain_var = tk.DoubleVar(value=GAIN_DEFAULT)
         self.loop_gain_var = tk.DoubleVar(value=GAIN_DEFAULT)
 
-        # UI layout
+        # --- UI Layout ---
         self.main = tk.Frame(self.root, padx=20, pady=15)
         self.main.pack(expand=True, fill=tk.BOTH)
 
         devf = tk.LabelFrame(self.main, text="Audio Devices", padx=10, pady=10)
         devf.pack(pady=5, fill=tk.X, expand=True)
 
-        tip = (
-            "Pick your SPEAKERS/HEADPHONES as output. For reliability, pick a specific WASAPI "
-            "entry under 'Loopback device (what to capture)'. If one fails, try another.\n"
-            "Use the sliders to adjust Mic and Output gains live while recording."
-        )
+        tip = ("Pick your SPEAKERS/HEADPHONES. For best results, also select the matching WASAPI "
+               "entry under 'Loopback device'.\nUse sliders to adjust gain live while recording.")
         tk.Label(devf, text=tip, wraplength=620, justify=tk.LEFT, fg="darkblue")\
             .grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
@@ -632,48 +508,27 @@ class AudioRecorderApp:
         self.mic_menu = tk.OptionMenu(devf, self.selected_mic_name, "No devices found")
         self.mic_menu.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 5))
 
-        tk.Label(devf, text="Audio Output (render device):").grid(row=3, column=0, sticky="w")
+        tk.Label(devf, text="Audio Output (device to capture):").grid(row=3, column=0, sticky="w")
         self.spk_menu = tk.OptionMenu(devf, self.selected_spk_name, "No devices found")
         self.spk_menu.grid(row=4, column=0, columnspan=3, sticky="ew")
 
-        tk.Label(devf, text="Loopback device (what to capture):").grid(row=5, column=0, sticky="w", pady=(8,0))
+        tk.Label(devf, text="Loopback device (override):").grid(row=5, column=0, sticky="w", pady=(8,0))
         self.lb_menu = tk.OptionMenu(devf, self.selected_lb_name, "Auto (match speaker)")
         self.lb_menu.grid(row=6, column=0, columnspan=3, sticky="ew")
 
         self.include_mic_var = tk.BooleanVar(value=True)
-        ck = tk.Checkbutton(devf, text="Include microphone in recording", variable=self.include_mic_var)
-        ck.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        tk.Checkbutton(devf, text="Include microphone in recording", variable=self.include_mic_var)\
+            .grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        self.raw_dump_var = tk.BooleanVar(value=False)
-        raw_ck = tk.Checkbutton(devf, text="Raw loopback dump (no processing; auto-saves)", variable=self.raw_dump_var)
-        raw_ck.grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        # Live gain controls
         gains = tk.LabelFrame(self.main, text="Live Gain Controls", padx=10, pady=10)
         gains.pack(pady=8, fill=tk.X, expand=True)
+        self._create_gain_slider(gains, "Mic Gain", self.mic_gain_var)
+        self._create_gain_slider(gains, "Output Gain", self.loop_gain_var)
 
-        # Mic Gain
-        row = tk.Frame(gains); row.pack(fill=tk.X, pady=(0,6))
-        tk.Label(row, text="Mic Gain").pack(side=tk.LEFT)
-        self.mic_gain_scale = ttk.Scale(row, from_=GAIN_MIN, to=GAIN_MAX, orient="horizontal",
-                                        variable=self.mic_gain_var, command=self._on_gain_change)
-        self.mic_gain_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        self.mic_gain_label = tk.Label(row, text=self._fmt_gain_label(self.mic_gain_var.get()))
-        self.mic_gain_label.pack(side=tk.LEFT, padx=(6,0))
-
-        # Output Gain
-        row = tk.Frame(gains); row.pack(fill=tk.X)
-        tk.Label(row, text="Output Gain").pack(side=tk.LEFT)
-        self.loop_gain_scale = ttk.Scale(row, from_=GAIN_MIN, to=GAIN_MAX, orient="horizontal",
-                                         variable=self.loop_gain_var, command=self._on_gain_change)
-        self.loop_gain_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        self.loop_gain_label = tk.Label(row, text=self._fmt_gain_label(self.loop_gain_var.get()))
-        self.loop_gain_label.pack(side=tk.LEFT, padx=(6,0))
-
-        savef = tk.LabelFrame(self.main, text="Save Location", padx=10, pady=10)
+        savef = tk.LabelFrame(self.main, text="Default Save Location", padx=10, pady=10)
         savef.pack(pady=10, fill=tk.X, expand=True)
-        self.save_entry = tk.Entry(savef, textvariable=self.output_directory, state='readonly')
-        self.save_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        tk.Entry(savef, textvariable=self.output_directory, state='readonly')\
+            .grid(row=0, column=0, sticky="ew", padx=(0, 5))
         self.browse_btn = tk.Button(savef, text="Browse...", command=self.browse_directory)
         self.browse_btn.grid(row=0, column=1, sticky="e")
         savef.grid_columnconfigure(0, weight=1)
@@ -684,254 +539,180 @@ class AudioRecorderApp:
         self.status_label = tk.Label(self.main, text="Ready to record", font=("Arial", 12))
         self.status_label.pack(pady=5)
 
-        btnrow = tk.Frame(self.main)
-        btnrow.pack(pady=6)
+        btnrow = tk.Frame(self.main); btnrow.pack(pady=6)
         self.start_btn = tk.Button(btnrow, text="Start Recording", command=self.start_clicked)
         self.stop_btn = tk.Button(btnrow, text="Stop Recording", command=self.stop_clicked, state=tk.DISABLED)
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
-        meters = tk.LabelFrame(self.main, text="Live Levels", padx=10, pady=8)
-        meters.pack(pady=6, fill=tk.X)
-        r = tk.Frame(meters); r.pack(fill=tk.X, pady=2)
-        tk.Label(r, text="Mic:", width=8, anchor="e").pack(side=tk.LEFT)
-        self.mic_bar = ttk.Progressbar(r, orient="horizontal", length=360, mode="determinate", maximum=100)
-        self.mic_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        self.mic_db = tk.Label(r, text="-inf dBFS", width=10, anchor="w"); self.mic_db.pack(side=tk.LEFT)
+        self._create_meters()
 
-        r = tk.Frame(meters); r.pack(fill=tk.X, pady=2)
-        tk.Label(r, text="System:", width=8, anchor="e").pack(side=tk.LEFT)
-        self.sys_bar = ttk.Progressbar(r, orient="horizontal", length=360, mode="determinate", maximum=100)
-        self.sys_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        self.sys_db = tk.Label(r, text="-inf dBFS", width=10, anchor="w"); self.sys_db.pack(side=tk.LEFT)
-
-        # Handle window close + Ctrl+C
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        # Populate and loop
         self.populate_device_lists()
         self._schedule_poll()
+        try: signal.signal(signal.SIGINT, lambda s, f: self.root.after(0, self.on_close))
+        except Exception: pass
 
-        # Graceful Ctrl+C in console
-        try:
-            signal.signal(signal.SIGINT, lambda s, f: self.root.after(0, self.on_close))
-        except Exception:
-            pass  # not available in some embedded envs
+    def _create_gain_slider(self, parent, label_text, var):
+        row = tk.Frame(parent); row.pack(fill=tk.X, pady=2)
+        tk.Label(row, text=label_text, width=10).pack(side=tk.LEFT)
+        scale = ttk.Scale(row, from_=GAIN_MIN, to=GAIN_MAX, orient="horizontal", variable=var, command=self._on_gain_change)
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        label = tk.Label(row, text=self._fmt_gain_label(var.get()), width=12)
+        label.pack(side=tk.LEFT, padx=(6, 0))
+        var.label_widget = label
+
+    def _create_meters(self):
+        meters = tk.LabelFrame(self.main, text="Live Levels", padx=10, pady=8)
+        meters.pack(pady=6, fill=tk.X)
+        self.mic_bar, self.mic_db = self._create_meter_row(meters, "Mic:")
+        self.sys_bar, self.sys_db = self._create_meter_row(meters, "System:")
+
+    def _create_meter_row(self, parent, label_text):
+        r = tk.Frame(parent); r.pack(fill=tk.X, pady=2)
+        tk.Label(r, text=label_text, width=8, anchor="e").pack(side=tk.LEFT)
+        bar = ttk.Progressbar(r, orient="horizontal", length=360, mode="determinate", maximum=100)
+        bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        db_label = tk.Label(r, text="-inf dBFS", width=10, anchor="w")
+        db_label.pack(side=tk.LEFT)
+        return bar, db_label
 
     # ---------- UI actions ----------
     def _fmt_gain_label(self, g: float) -> str:
-        db = "-inf" if g <= 0 else f"{20*log10(g):.1f}"
+        db = "-inf" if g <= 0 else f"{20 * log10(g):.1f}"
         return f"{g:.2f}× ({db} dB)"
 
     def _on_gain_change(self, _evt=None):
-        mg = float(self.mic_gain_var.get())
-        lg = float(self.loop_gain_var.get())
-        self.mic_gain_label.config(text=self._fmt_gain_label(mg))
-        self.loop_gain_label.config(text=self._fmt_gain_label(lg))
-        self.command_queue.put(("SET_GAINS", {"mic_gain": mg, "loop_gain": lg}))
+        for var in [self.mic_gain_var, self.loop_gain_var]:
+            var.label_widget.config(text=self._fmt_gain_label(var.get()))
+        self.command_queue.put(("SET_GAINS", {"mic_gain": self.mic_gain_var.get(), "loop_gain": self.loop_gain_var.get()}))
 
     def _schedule_poll(self):
-        if getattr(self, "_poll_after_id", None) is None:
-            self._poll_after_id = self.root.after(100, self.process_status)
-
-    def _cancel_poll(self):
-        if getattr(self, "_poll_after_id", None) is not None:
-            try:
-                self.root.after_cancel(self._poll_after_id)
-            except Exception:
-                pass
-            self._poll_after_id = None
+        self._poll_after_id = self.root.after(100, self.process_status)
 
     @contextmanager
     def modal_guard(self):
-        self._cancel_poll()
-        try:
-            yield
-        finally:
-            self._schedule_poll()
+        if self._poll_after_id: self.root.after_cancel(self._poll_after_id)
+        try: yield
+        finally: self._schedule_poll()
 
     def start_clicked(self):
-        mic_name = self.selected_mic_name.get()
-        spk_name = self.selected_spk_name.get()
-        lb_name = self.selected_lb_name.get()
-        include_mic = self.include_mic_var.get()
-        raw_dump = self.raw_dump_var.get()
+        default_filename = f"recording-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.wav"
+        with self.modal_guard():
+            path = filedialog.asksaveasfilename(
+                parent=self.root,
+                initialdir=self._validated_initial_dir(),
+                initialfile=default_filename,
+                defaultextension=".wav",
+                filetypes=[("WAV files", "*.wav")],
+                title="Save recording as..."
+            )
+        if not path: return
 
-        spk_dev = self.spk_devices.get(spk_name)
-        mic_dev = self.mic_devices.get(mic_name)
+        spk_dev = self.spk_devices.get(self.selected_spk_name.get())
+        mic_dev = self.mic_devices.get(self.selected_mic_name.get())
+        lb_name = self.selected_lb_name.get()
         lb_dev = None if lb_name == "Auto (match speaker)" else self.lb_devices.get(lb_name)
+        include_mic = self.include_mic_var.get()
 
         if not spk_dev and not lb_dev:
-            with self.modal_guard():
-                messagebox.showerror("Error", "Select an output or a loopback device.")
+            with self.modal_guard(): messagebox.showerror("Error", "Select an output or loopback device.")
             return
-        if include_mic and not raw_dump and mic_name not in self.mic_devices:
-            with self.modal_guard():
-                messagebox.showerror("Error", "Select a valid microphone or uncheck 'Include microphone'.")
+        if include_mic and not mic_dev:
+            with self.modal_guard(): messagebox.showerror("Error", "Select a valid microphone or uncheck 'Include microphone'.")
             return
-        if raw_dump:
-            include_mic = False
 
-        for w in [self.start_btn, self.refresh_btn, self.browse_btn]:
-            w.config(state=tk.DISABLED)
+        for w in [self.start_btn, self.refresh_btn, self.browse_btn]: w.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
 
-        args = {
-            "mic_device": mic_dev,
-            "spk_device": spk_dev,
-            "loopback_device": lb_dev,
-            "include_mic": include_mic,
-            "raw_dump": raw_dump,
-            "mic_gain": float(self.mic_gain_var.get()),
-            "loop_gain": float(self.loop_gain_var.get()),
-        }
-        self.command_queue.put(("START", args))
+        self.command_queue.put(("START", {
+            "output_path": path, "mic_device": mic_dev, "spk_device": spk_dev,
+            "loopback_device": lb_dev, "include_mic": include_mic,
+            "mic_gain": self.mic_gain_var.get(), "loop_gain": self.loop_gain_var.get(),
+        }))
 
     def stop_clicked(self):
         self.command_queue.put(("STOP", {}))
 
     def process_status(self):
-        self._poll_after_id = None
         try:
-            for _ in range(8):
+            while True:
                 msgtype, data = self.status_queue.get_nowait()
-
                 if msgtype == "STATUS":
                     self.status_label.config(text=data)
-                    if data.startswith("Ready to record"):
-                        for w in [self.start_btn, self.refresh_btn, self.browse_btn]:
-                            w.config(state=tk.NORMAL)
+                    if data.startswith("Ready"):
+                        for w in [self.start_btn, self.refresh_btn, self.browse_btn]: w.config(state=tk.NORMAL)
                         self.stop_btn.config(state=tk.DISABLED)
-
                 elif msgtype == "INFO":
-                    with self.modal_guard():
-                        messagebox.showinfo("Info", data)
-
+                    with self.modal_guard(): messagebox.showinfo("Info", data)
                 elif msgtype == "ERROR":
-                    with self.modal_guard():
-                        messagebox.showerror("Recording Error", data)
+                    with self.modal_guard(): messagebox.showerror("Recording Error", data)
                     self.status_label.config(text="Ready to record")
-                    for w in [self.start_btn, self.refresh_btn, self.browse_btn]:
-                        w.config(state=tk.NORMAL)
+                    for w in [self.start_btn, self.refresh_btn, self.browse_btn]: w.config(state=tk.NORMAL)
                     self.stop_btn.config(state=tk.DISABLED)
-
                 elif msgtype == "LEVEL":
-                    tag, peak = data  # peak already multiplied by current gain
-                    db = fmt_dbfs(peak)
-                    pct = 0 if peak <= 0 else int(min(100, round(100.0 * peak, 1)))
-                    if tag == "mic":
-                        self.mic_bar['value'] = pct
-                        self.mic_db.config(text=f"{db:.1f} dBFS")
-                    else:
-                        self.sys_bar['value'] = pct
-                        self.sys_db.config(text=f"{db:.1f} dBFS")
-
-                elif msgtype == "SAVE_FILE":
-                    self.save_file_dialog(data)
-                    self.status_label.config(text="Ready to record")
-                    for w in [self.start_btn, self.refresh_btn, self.browse_btn]:
-                        w.config(state=tk.NORMAL)
-                    self.stop_btn.config(state=tk.DISABLED)
-
+                    tag, peak = data
+                    db, pct = fmt_dbfs(peak), int(min(100, round(100.0 * peak, 1)))
+                    bar, label = (self.mic_bar, self.mic_db) if tag == "mic" else (self.sys_bar, self.sys_db)
+                    bar['value'] = pct
+                    label.config(text=f"{db:.1f} dBFS")
         except queue.Empty:
             pass
         finally:
-            self._schedule_poll()
+            self._poll_after_id = self.root.after(100, self.process_status)
 
-    # ---------- Save helpers ----------
+    # ---------- File/Device Helpers ----------
     def set_default_output_directory(self):
         default_path = Path.home() / "Music" / "Recordings"
-        if not default_path.parent.exists():
-            default_path = Path.home() / "Recordings"
-        os.makedirs(default_path, exist_ok=True)
+        if not default_path.parent.exists(): default_path = Path.home() / "Recordings"
+        default_path.mkdir(parents=True, exist_ok=True)
         self.output_directory.set(str(default_path))
 
     def _validated_initial_dir(self) -> str:
         p = Path(self.output_directory.get())
-        if p.exists():
-            return str(p)
+        if p.exists(): return str(p)
         music = Path.home() / "Music"
         return str(music if music.exists() else Path.home())
 
     def browse_directory(self):
         with self.modal_guard():
-            d = filedialog.askdirectory(initialdir=self._validated_initial_dir(), title="Choose folder for recordings")
-            if d:
-                self.output_directory.set(d)
+            d = filedialog.askdirectory(initialdir=self._validated_initial_dir(), title="Choose default folder")
+            if d: self.output_directory.set(d)
 
-    def save_file_dialog(self, audio_i16: np.ndarray):
-        default_filename = f"recording-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.wav"
-        try:
-            with self.modal_guard():
-                path = filedialog.asksaveasfilename(
-                    parent=self.root,
-                    initialdir=self._validated_initial_dir(),
-                    initialfile=default_filename,
-                    defaultextension=".wav",
-                    filetypes=[("WAV files", "*.wav")],
-                    title="Save recording as..."
-                )
-        except Exception as e:
-            msg = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-            with self.modal_guard():
-                messagebox.showerror("File Dialog Error", msg)
-            return
-        if path:
-            try:
-                write_wav(path, TARGET_SR, audio_i16)
-                with self.modal_guard():
-                    messagebox.showinfo("Success", f"Recording saved to\n{path}")
-            except Exception as e:
-                with self.modal_guard():
-                    messagebox.showerror("Error", f"Could not save file: {e}")
-
-    # ---------- Devices & debug ----------
     def populate_device_lists(self):
         self.mic_devices, self.spk_devices, self.lb_devices = list_devices()
 
-        mic_menu = self.mic_menu["menu"]; mic_menu.delete(0, "end")
-        if self.mic_devices:
-            for name in self.mic_devices.keys():
-                mic_menu.add_command(label=name, command=lambda v=name: self.selected_mic_name.set(v))
+        def _populate(menu, var, devices, default_msg):
+            menu["menu"].delete(0, "end")
+            if devices:
+                for name in devices.keys(): menu["menu"].add_command(label=name, command=lambda v=name: var.set(v))
+                return True
+            else:
+                var.set(default_msg)
+                return False
+
+        if _populate(self.mic_menu, self.selected_mic_name, self.mic_devices, "No mics found"):
             self.selected_mic_name.set(next(iter(self.mic_devices)))
-        else:
-            self.selected_mic_name.set("No devices found")
 
-        spk_menu = self.spk_menu["menu"]; spk_menu.delete(0, "end")
-        if self.spk_devices:
-            for name in self.spk_devices.keys():
-                spk_menu.add_command(label=name, command=lambda v=name: self.selected_spk_name.set(v))
-            prefer = next((n for n in self.spk_devices if "Speakers" in n or "Headphones" in n), None)
+        if _populate(self.spk_menu, self.selected_spk_name, self.spk_devices, "No outputs found"):
+            prefer = next((n for n in self.spk_devices if "Speaker" in n or "Headphone" in n), None)
             self.selected_spk_name.set(prefer or next(iter(self.spk_devices)))
-        else:
-            self.selected_spk_name.set("No devices found")
 
-        lb_menu = self.lb_menu["menu"]; lb_menu.delete(0, "end")
+        lb_menu = self.lb_menu["menu"]
+        lb_menu.delete(0, "end")
         lb_menu.add_command(label="Auto (match speaker)", command=lambda: self.selected_lb_name.set("Auto (match speaker)"))
         if self.lb_devices:
-            for name in self.lb_devices.keys():
-                lb_menu.add_command(label=name, command=lambda v=name: self.selected_lb_name.set(v))
-        if self.selected_lb_name.get() not in self.lb_devices and self.selected_lb_name.get() != "Auto (match speaker)":
-            self.selected_lb_name.set("Auto (match speaker)")
+            for name in self.lb_devices: lb_menu.add_command(label=name, command=lambda v=name: self.selected_lb_name.set(v))
 
     def on_close(self):
-        # Graceful shutdown: stop controller thread and close window
-        try:
-            self.command_queue.put(("EXIT", {}))
-        except Exception:
-            pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+        self.command_queue.put(("EXIT", {}))
+        self.root.destroy()
 
 
 if __name__ == "__main__":
-    # Run Tk mainloop with KeyboardInterrupt safety
     root = tk.Tk()
     app = AudioRecorderApp(root)
     try:
         root.mainloop()
     except KeyboardInterrupt:
-        # Allow Ctrl+C to exit cleanly if mainloop didn't catch signal
         app.on_close()
