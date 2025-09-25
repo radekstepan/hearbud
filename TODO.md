@@ -1,5 +1,0 @@
-- [ ] fix: adjust the output levels of each mic/playback track
-- [ ] feat: start recording even if output isn't playing anything
-- [ ] feat: write into an mp3/wav file as you go
-- [ ] feat: remember previous output folder
-- [ ] feat: remember previous devices
