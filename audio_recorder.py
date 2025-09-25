@@ -427,6 +427,7 @@ class RecordingController(threading.Thread):
                     self.raw_wave.writeframes(data)
                     self.raw_frames_written += len(x) if x.ndim == 1 else x.shape[0]
                 else:
+                    x *= self.loop_gain
                     self.loop_queue.put(x.copy())
 
                 # METERING: reflect current *gained* level
@@ -434,7 +435,6 @@ class RecordingController(threading.Thread):
                 if now - last >= 0.1:
                     g = self.loop_gain
                     peak = float(np.max(np.abs(x))) if x.size else 0.0
-                    peak *= g
                     self.status_queue.put(("LEVEL", ("sys", peak)))
                     last = now
         except Exception as e:
@@ -448,14 +448,13 @@ class RecordingController(threading.Thread):
                 data = self.mic_stream.read(BLOCK, exception_on_overflow=False)
                 ch = getattr(self.mic_stream, "_channels", None) or 1
                 x = float_from_int16_bytes(data, ch)
+                x *= self.mic_gain
                 self.mic_queue.put(x.copy())
 
                 # METERING: reflect current *gained* level
                 now = time.time()
                 if now - last >= 0.1:
-                    g = self.mic_gain
                     peak = float(np.max(np.abs(x))) if x.size else 0.0
-                    peak *= g
                     self.status_queue.put(("LEVEL", ("mic", peak)))
                     last = now
         except Exception as e:
@@ -491,7 +490,6 @@ class RecordingController(threading.Thread):
         # System-only
         if not mic_frames:
             loop_np = np.concatenate(loop_frames, axis=0).astype(np.float32, copy=False)
-            loop_np *= self.loop_gain
             loop_rs = resample_to(loop_np, self.capture_sr_spk, TARGET_SR)
             loop_rs = self._limit_down(loop_rs)
             self.status_queue.put(("INFO", f"System-only peak(gained): {float(np.max(np.abs(loop_rs))):.3f} (saved @ {TARGET_SR} Hz)"))
@@ -501,9 +499,9 @@ class RecordingController(threading.Thread):
         # Mic-only
         if not loop_frames:
             mic_np = np.concatenate(mic_frames, axis=0).astype(np.float32, copy=False)
-            mic_np *= self.mic_gain
             mic_rs = resample_to(mic_np, self.capture_sr_mic, TARGET_SR)
             mic_rs = self._limit_down(mic_rs)
+            self.status_queue.put(("INFO", f"Mic-only peak(gained): {float(np.max(np.abs(mic_rs))):.3f} (saved @ {TARGET_SR} Hz)"))
             self.status_queue.put(("SAVE_FILE", to_int16(mic_rs)))
             return
 
@@ -511,12 +509,8 @@ class RecordingController(threading.Thread):
         mic_np = np.concatenate(mic_frames, axis=0).astype(np.float32, copy=False)
         loop_np = np.concatenate(loop_frames, axis=0).astype(np.float32, copy=False)
 
-        mic_np *= self.mic_gain
-        loop_np *= self.loop_gain
-
-        self.status_queue.put(("INFO", f"Peaks (pre-resample): mic {float(np.max(np.abs(mic_np))):.3f}, "
-                                       f"sys {float(np.max(np.abs(loop_np))):.3f} | "
-                                       f"Gains: mic {self.mic_gain:.2f}×, out {self.loop_gain:.2f}×"))
+        self.status_queue.put(("INFO", f"Max peaks (after applied gains, pre-resample): mic {float(np.max(np.abs(mic_np))):.3f}, "
+                                       f"sys {float(np.max(np.abs(loop_np))):.3f}"))
 
         mic_rs  = resample_to(mic_np,  self.capture_sr_mic, TARGET_SR)
         loop_rs = resample_to(loop_np, self.capture_sr_spk, TARGET_SR)
