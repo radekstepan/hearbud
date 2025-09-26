@@ -4,7 +4,7 @@ import time
 import threading
 import queue
 import traceback
-import wave
+import subprocess
 import signal
 from math import gcd, log10
 from pathlib import Path
@@ -12,7 +12,6 @@ from datetime import datetime
 from contextlib import contextmanager
 
 import numpy as np
-from scipy.io.wavfile import write as write_wav
 from scipy.signal import resample_poly
 
 import tkinter as tk
@@ -130,7 +129,7 @@ def list_devices():
 # ================== Controller (PyAudio) ==================
 class RecordingController(threading.Thread):
     """
-    Captures audio, processes it in chunks, and writes to a file continuously.
+    Captures audio, processes it in chunks, and pipes it to FFmpeg for MP3 encoding.
     """
     def __init__(self, command_queue, status_queue):
         super().__init__(daemon=True)
@@ -153,7 +152,7 @@ class RecordingController(threading.Thread):
         self.loop_gain = GAIN_DEFAULT
 
         self.output_path = None
-        self.output_wave_file = None
+        self.ffmpeg_process = None
         self.processing_thread = None
         self.mic_thread = None
         self.loop_thread = None
@@ -319,17 +318,32 @@ class RecordingController(threading.Thread):
             if self.include_mic:
                 self._open_mic(mic_device)
 
-            # Determine output format and open WAV file
+            # Determine output format and start FFmpeg process
             out_channels = getattr(self.spk_stream, "_channels", 2)
-            self.output_wave_file = wave.open(self.output_path, "wb")
-            self.output_wave_file.setnchannels(out_channels)
-            self.output_wave_file.setsampwidth(2)  # 16-bit
-            self.output_wave_file.setframerate(TARGET_SR)
+            command = [
+                'ffmpeg',
+                '-y',  # Overwrite output file if it exists
+                '-f', 's16le',  # Input format: signed 16-bit little-endian PCM
+                '-ar', str(TARGET_SR),  # Input sample rate
+                '-ac', str(out_channels),  # Input channels
+                '-i', 'pipe:0',  # Input is from stdin
+                '-b:a', '192k',  # Audio bitrate for MP3
+                self.output_path
+            ]
+            self.ffmpeg_process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
 
+        except FileNotFoundError:
+            self.status_queue.put(("ERROR", "FFmpeg not found. Please install FFmpeg and ensure it is in your system's PATH."))
+            self._teardown()
+            self.status_queue.put(("STATUS", "Ready to record"))
+            return
         except Exception as e:
             self.status_queue.put(("ERROR", f"Failed to start recording: {e}"))
             self._teardown()
-            if self.output_wave_file: self.output_wave_file.close()
+            if self.ffmpeg_process:
+                self.ffmpeg_process.kill()
             self.status_queue.put(("STATUS", "Ready to record"))
             return
 
@@ -359,13 +373,22 @@ class RecordingController(threading.Thread):
         if self.processing_thread: self.processing_thread.join()
 
         try:
-            if self.output_wave_file:
-                self.output_wave_file.close()
-                self.status_queue.put(("INFO", f"Recording saved to\n{self.output_path}"))
+            if self.ffmpeg_process and self.ffmpeg_process.stdin:
+                self.ffmpeg_process.stdin.close()
+            
+            if self.ffmpeg_process:
+                # Wait for FFmpeg to finish and check for errors
+                _, stderr_output = self.ffmpeg_process.communicate()
+                if self.ffmpeg_process.returncode != 0:
+                    error_msg = (f"FFmpeg error (code {self.ffmpeg_process.returncode}):\n"
+                                 f"{stderr_output.decode('utf-8', 'ignore')}")
+                    self.status_queue.put(("ERROR", error_msg))
+                else:
+                    self.status_queue.put(("INFO", f"Recording saved to\n{self.output_path}"))
         except Exception as e:
-            self.status_queue.put(("ERROR", f"Error closing WAV file: {e}"))
+            self.status_queue.put(("ERROR", f"Error finalizing MP3 file: {e}"))
         finally:
-            self.output_wave_file = None
+            self.ffmpeg_process = None
             self.output_path = None
 
         self._teardown()
@@ -432,14 +455,15 @@ class RecordingController(threading.Thread):
         self._process_and_write_chunk()
 
     def _process_and_write_chunk(self):
-        """Processes one batch of audio from the queues and writes to the wave file."""
+        """Processes one batch of audio from the queues and pipes it to FFmpeg."""
         loop_chunks = self._drain(self.loop_queue)
         mic_chunks = self._drain(self.mic_queue) if self.include_mic else []
 
         if not loop_chunks and not mic_chunks:
             return
 
-        out_channels = self.output_wave_file.getnchannels()
+        loop_ch_count = as_2d(loop_chunks[0]).shape[1] if loop_chunks else 2
+        out_channels = loop_ch_count
 
         mic_rs = resample_to(np.concatenate(mic_chunks, axis=0), self.capture_sr_mic, TARGET_SR) if mic_chunks else np.array([])
         loop_rs = resample_to(np.concatenate(loop_chunks, axis=0), self.capture_sr_spk, TARGET_SR) if loop_chunks else np.array([])
@@ -450,22 +474,35 @@ class RecordingController(threading.Thread):
 
         # Create buffers padded with silence to match the longest chunk
         mic_buf = np.zeros((max_len, out_channels), dtype=np.float32)
-        if mic_len > 0: mic_buf[:mic_len] = as_2d(mic_rs)[:, :out_channels]
+        if mic_len > 0:
+            mic_2d = as_2d(mic_rs)
+            ch_to_copy = min(mic_2d.shape[1], out_channels)
+            mic_buf[:mic_len, :ch_to_copy] = mic_2d[:, :ch_to_copy]
 
         loop_buf = np.zeros((max_len, out_channels), dtype=np.float32)
-        if loop_len > 0: loop_buf[:loop_len] = as_2d(loop_rs)[:, :out_channels]
+        if loop_len > 0:
+            loop_2d = as_2d(loop_rs)
+            ch_to_copy = min(loop_2d.shape[1], out_channels)
+            loop_buf[:loop_len, :ch_to_copy] = loop_2d[:, :ch_to_copy]
 
-        # Mix, limit, convert, and write to file
+        # Mix, limit, convert, and write to ffmpeg process
         mixed = self._limit_down(mic_buf + loop_buf)
         if mixed.size > 0:
-            self.output_wave_file.writeframes(to_int16(mixed).tobytes())
+            try:
+                if self.ffmpeg_process and self.ffmpeg_process.stdin:
+                    self.ffmpeg_process.stdin.write(to_int16(mixed).tobytes())
+            except (BrokenPipeError, OSError):
+                # FFmpeg process has likely terminated
+                if self.is_recording:
+                    self.status_queue.put(("ERROR", "FFmpeg process terminated unexpectedly."))
+                self.is_recording = False  # Stop the loop
 
 
 # ================== Tk App ==================
 class AudioRecorderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Audio Recorder (WASAPI/PyAudio)")
+        self.root.title("Audio Recorder (WASAPI/PyAudio) -> MP3")
         self.root.geometry("680x780")
         self.root.resizable(False, False)
 
@@ -597,14 +634,14 @@ class AudioRecorderApp:
         finally: self._schedule_poll()
 
     def start_clicked(self):
-        default_filename = f"recording-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.wav"
+        default_filename = f"recording-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp3"
         with self.modal_guard():
             path = filedialog.asksaveasfilename(
                 parent=self.root,
                 initialdir=self._validated_initial_dir(),
                 initialfile=default_filename,
-                defaultextension=".wav",
-                filetypes=[("WAV files", "*.wav")],
+                defaultextension=".mp3",
+                filetypes=[("MP3 files", "*.mp3"), ("All files", "*.*")],
                 title="Save recording as..."
             )
         if not path: return
