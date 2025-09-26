@@ -164,6 +164,9 @@ class RecordingController(threading.Thread):
         self.raw_frames_written = 0
         self.raw_path = None
 
+        # Start time for recording
+        self.start_time = None
+
     # ---------- PyAudio helpers ----------
     def _ensure_pyaudio(self):
         if self.p is None:
@@ -306,6 +309,7 @@ class RecordingController(threading.Thread):
         self.p = None
         self.mic_stream = None
         self.spk_stream = None
+        self.start_time = None
 
     def start_recording(self, mic_device=None, spk_device=None, loopback_device=None,
                         include_mic=True, raw_dump=False, mic_gain=GAIN_DEFAULT, loop_gain=GAIN_DEFAULT):
@@ -324,6 +328,7 @@ class RecordingController(threading.Thread):
         self.raw_dump = bool(raw_dump)
         self.mic_gain = float(mic_gain)
         self.loop_gain = float(loop_gain)
+        self.start_time = time.time()  # Record start time
 
         # Open loopback
         try:
@@ -428,12 +433,11 @@ class RecordingController(threading.Thread):
                     self.raw_frames_written += len(x) if x.ndim == 1 else x.shape[0]
                 else:
                     x *= self.loop_gain
-                    self.loop_queue.put(x.copy())
+                    self.loop_queue.put((x.copy(), time.time() - self.start_time))
 
                 # METERING: reflect current *gained* level
                 now = time.time()
                 if now - last >= 0.1:
-                    g = self.loop_gain
                     peak = float(np.max(np.abs(x))) if x.size else 0.0
                     self.status_queue.put(("LEVEL", ("sys", peak)))
                     last = now
@@ -449,7 +453,7 @@ class RecordingController(threading.Thread):
                 ch = getattr(self.mic_stream, "_channels", None) or 1
                 x = float_from_int16_bytes(data, ch)
                 x *= self.mic_gain
-                self.mic_queue.put(x.copy())
+                self.mic_queue.put((x.copy(), time.time() - self.start_time))
 
                 # METERING: reflect current *gained* level
                 now = time.time()
@@ -482,44 +486,79 @@ class RecordingController(threading.Thread):
         loop_frames = self._drain(self.loop_queue)
         mic_frames = self._drain(self.mic_queue)
 
+        # Initialize channels based on configuration
+        channels = 2 if self.spk_stream else 1  # Default to 2 for loopback, 1 for mic-only
+        if self.spk_stream:
+            channels = getattr(self.spk_stream, "_channels", 2)
+        elif self.mic_stream:
+            channels = getattr(self.mic_stream, "_channels", 1)
+
+        # Handle case with no audio captured from either source
         if not loop_frames and not mic_frames:
-            self.status_queue.put(("INFO", "No audio captured. Nothing saved."))
-            self.status_queue.put(("STATUS", "Ready to record"))
+            silent_length = TARGET_SR  # 1 second at TARGET_SR
+            mixed = np.zeros((silent_length, channels) if channels > 1 else silent_length, dtype=np.float32)
+            self.status_queue.put(("INFO", f"No audio captured. Saving silent file @ {TARGET_SR} Hz"))
+            self.status_queue.put(("SAVE_FILE", to_int16(mixed)))
             return
 
-        # System-only
-        if not mic_frames:
-            loop_np = np.concatenate(loop_frames, axis=0).astype(np.float32, copy=False)
-            loop_rs = resample_to(loop_np, self.capture_sr_spk, TARGET_SR)
-            loop_rs = self._limit_down(loop_rs)
-            self.status_queue.put(("INFO", f"System-only peak(gained): {float(np.max(np.abs(loop_rs))):.3f} (saved @ {TARGET_SR} Hz)"))
-            self.status_queue.put(("SAVE_FILE", to_int16(loop_rs)))
-            return
-
-        # Mic-only
-        if not loop_frames:
-            mic_np = np.concatenate(mic_frames, axis=0).astype(np.float32, copy=False)
+        # Mic-only (system silent or not captured)
+        if mic_frames and not loop_frames:
+            mic_np = np.concatenate([f for f, _ in mic_frames], axis=0).astype(np.float32, copy=False)
             mic_rs = resample_to(mic_np, self.capture_sr_mic, TARGET_SR)
             mic_rs = self._limit_down(mic_rs)
             self.status_queue.put(("INFO", f"Mic-only peak(gained): {float(np.max(np.abs(mic_rs))):.3f} (saved @ {TARGET_SR} Hz)"))
             self.status_queue.put(("SAVE_FILE", to_int16(mic_rs)))
             return
 
+        # System-only (mic silent or not included)
+        if loop_frames and not mic_frames:
+            loop_np = np.concatenate([f for f, _ in loop_frames], axis=0).astype(np.float32, copy=False)
+            loop_rs = resample_to(loop_np, self.capture_sr_spk, TARGET_SR)
+            loop_rs = self._limit_down(loop_rs)
+            self.status_queue.put(("INFO", f"System-only peak(gained): {float(np.max(np.abs(loop_rs))):.3f} (saved @ {TARGET_SR} Hz)"))
+            self.status_queue.put(("SAVE_FILE", to_int16(loop_rs)))
+            return
+
         # Both streams
-        mic_np = np.concatenate(mic_frames, axis=0).astype(np.float32, copy=False)
-        loop_np = np.concatenate(loop_frames, axis=0).astype(np.float32, copy=False)
+        # Extract frames and timestamps
+        mic_data = [(f, t) for f, t in mic_frames]
+        loop_data = [(f, t) for f, t in loop_frames]
+
+        # Resample to TARGET_SR and calculate lengths
+        mic_np = np.concatenate([f for f, _ in mic_data], axis=0).astype(np.float32, copy=False)
+        loop_np = np.concatenate([f for f, _ in loop_data], axis=0).astype(np.float32, copy=False)
 
         self.status_queue.put(("INFO", f"Max peaks (after applied gains, pre-resample): mic {float(np.max(np.abs(mic_np))):.3f}, "
                                        f"sys {float(np.max(np.abs(loop_np))):.3f}"))
 
-        mic_rs  = resample_to(mic_np,  self.capture_sr_mic, TARGET_SR)
+        mic_rs = resample_to(mic_np, self.capture_sr_mic, TARGET_SR)
         loop_rs = resample_to(loop_np, self.capture_sr_spk, TARGET_SR)
 
-        mic2, loop2 = match_channels(mic_rs, loop_rs)
-        L = min(len(mic2), len(loop2))
-        mic2, loop2 = mic2[:L], loop2[:L]
+        # Get first timestamps to determine start times
+        mic_start = mic_data[0][1] if mic_data else 0.0
+        loop_start = loop_data[0][1] if loop_data else 0.0
 
-        mixed = mic2 + loop2
+        # Convert start times to samples at TARGET_SR
+        mic_start_samples = int(mic_start * TARGET_SR)
+        loop_start_samples = int(loop_start * TARGET_SR)
+
+        # Determine total length (max duration including start offsets)
+        mic_total_samples = mic_start_samples + len(mic_rs)
+        loop_total_samples = loop_start_samples + len(loop_rs)
+        total_samples = max(mic_total_samples, loop_total_samples)
+
+        # Initialize output arrays with silence
+        mic_out = np.zeros((total_samples, channels) if channels > 1 else total_samples, dtype=np.float32)
+        loop_out = np.zeros((total_samples, channels) if channels > 1 else total_samples, dtype=np.float32)
+
+        # Place resampled data in the correct position
+        if mic_rs.size > 0:
+            mic_out[mic_start_samples:mic_start_samples + len(mic_rs)] = as_2d(mic_rs)[:, :channels]
+        if loop_rs.size > 0:
+            loop_out[loop_start_samples:loop_start_samples + len(loop_rs)] = as_2d(loop_rs)[:, :channels]
+
+        # Mix the streams
+        mixed = mic_out + loop_out
         mixed = self._limit_down(mixed)
 
         mixed_i16 = to_int16(mixed)
@@ -529,8 +568,8 @@ class RecordingController(threading.Thread):
                 dbg = Path.home() / "Recordings" / "_stems"
                 dbg.mkdir(parents=True, exist_ok=True)
                 ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                write_wav(str(dbg / f"{ts}-mic.wav"), TARGET_SR, to_int16(self._limit_down(mic2)))
-                write_wav(str(dbg / f"{ts}-loop.wav"), TARGET_SR, to_int16(self._limit_down(loop2)))
+                write_wav(str(dbg / f"{ts}-mic.wav"), TARGET_SR, to_int16(self._limit_down(mic_out)))
+                write_wav(str(dbg / f"{ts}-loop.wav"), TARGET_SR, to_int16(self._limit_down(loop_out)))
                 write_wav(str(dbg / f"{ts}-mix.wav"), TARGET_SR, mixed_i16)
             except Exception:
                 pass
