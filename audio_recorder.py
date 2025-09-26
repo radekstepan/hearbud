@@ -6,6 +6,7 @@ import queue
 import traceback
 import subprocess
 import signal
+import json
 from math import gcd, log10
 from pathlib import Path
 from datetime import datetime
@@ -29,6 +30,7 @@ TARGET_SR = 48000           # always save at 48k
 BLOCK = 1024                # frames per read
 TARGET_PEAK = 0.98          # soft limiter trims only if > TARGET_PEAK (never boosts)
 MIN_ACTIVE_PEAK = 1e-4
+CONFIG_FILE = Path.home() / ".audiorecorder_config.json"
 
 # try 48k first, then common fallbacks
 SR_CANDIDATES = [48000, 44100, 32000, 24000]
@@ -528,6 +530,7 @@ class AudioRecorderApp:
 
         self.mic_gain_var = tk.DoubleVar(value=GAIN_DEFAULT)
         self.loop_gain_var = tk.DoubleVar(value=GAIN_DEFAULT)
+        self.include_mic_var = tk.BooleanVar(value=True)
 
         # --- UI Layout ---
         self.main = tk.Frame(self.root, padx=20, pady=15)
@@ -553,7 +556,7 @@ class AudioRecorderApp:
         self.lb_menu = tk.OptionMenu(devf, self.selected_lb_name, "Auto (match speaker)")
         self.lb_menu.grid(row=6, column=0, columnspan=3, sticky="ew")
 
-        self.include_mic_var = tk.BooleanVar(value=True)
+        
         tk.Checkbutton(devf, text="Include microphone in recording", variable=self.include_mic_var)\
             .grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
@@ -584,8 +587,10 @@ class AudioRecorderApp:
 
         self._create_meters()
 
+        # --- Final setup ---
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.populate_device_lists()
+        self.populate_device_lists() # First, populate devices and set OS defaults
+        self._load_settings()         # Then, override with user's saved preferences
         self._schedule_poll()
         try: signal.signal(signal.SIGINT, lambda s, f: self.root.after(0, self.on_close))
         except Exception: pass
@@ -698,7 +703,58 @@ class AudioRecorderApp:
         finally:
             self._poll_after_id = self.root.after(100, self.process_status)
 
-    # ---------- File/Device Helpers ----------
+    # ---------- File/Device/Settings Helpers ----------
+    def _save_settings(self):
+        """Saves current settings to the JSON config file."""
+        settings = {
+            "mic_device": self.selected_mic_name.get(),
+            "spk_device": self.selected_spk_name.get(),
+            "lb_device": self.selected_lb_name.get(),
+            "mic_gain": self.mic_gain_var.get(),
+            "loop_gain": self.loop_gain_var.get(),
+            "include_mic": self.include_mic_var.get(),
+            "output_dir": self.output_directory.get(),
+        }
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Warning: Could not save settings to {CONFIG_FILE}\n{e}", file=sys.stderr)
+
+    def _load_settings(self):
+        """Loads settings from the JSON config file if it exists."""
+        if not CONFIG_FILE.exists():
+            return
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                settings = json.load(f)
+
+            # Restore device selections, but only if the device still exists
+            if settings.get("mic_device") in self.mic_devices:
+                self.selected_mic_name.set(settings["mic_device"])
+            if settings.get("spk_device") in self.spk_devices:
+                self.selected_spk_name.set(settings["spk_device"])
+            
+            lb_name = settings.get("lb_device", "Auto (match speaker)")
+            if lb_name == "Auto (match speaker)" or lb_name in self.lb_devices:
+                 self.selected_lb_name.set(lb_name)
+
+            # Restore other settings
+            self.mic_gain_var.set(float(settings.get("mic_gain", GAIN_DEFAULT)))
+            self.loop_gain_var.set(float(settings.get("loop_gain", GAIN_DEFAULT)))
+            self.include_mic_var.set(bool(settings.get("include_mic", True)))
+            
+            # Restore directory, if it's still a valid path
+            saved_dir = settings.get("output_dir")
+            if saved_dir and Path(saved_dir).exists():
+                self.output_directory.set(saved_dir)
+
+            self._on_gain_change() # Update gain labels in UI
+
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            print(f"Warning: Could not load or parse settings from {CONFIG_FILE}\n{e}", file=sys.stderr)
+
+
     def set_default_output_directory(self):
         default_path = Path.home() / "Music" / "Recordings"
         if not default_path.parent.exists(): default_path = Path.home() / "Recordings"
@@ -717,31 +773,50 @@ class AudioRecorderApp:
             if d: self.output_directory.set(d)
 
     def populate_device_lists(self):
+        """Refreshes device lists and sets defaults."""
         self.mic_devices, self.spk_devices, self.lb_devices = list_devices()
+        
+        # Try to get OS default devices
+        default_mic, default_spk = None, None
+        try:
+            p = pyaudio.PyAudio()
+            default_mic = p.get_default_input_device_info()['name']
+            default_spk = p.get_default_output_device_info()['name']
+            p.terminate()
+        except Exception:
+            pass # Silently fail if defaults can't be found
 
-        def _populate(menu, var, devices, default_msg):
+        def _populate(menu, var, devices, default_name, default_msg):
             menu["menu"].delete(0, "end")
             if devices:
-                for name in devices.keys(): menu["menu"].add_command(label=name, command=lambda v=name: var.set(v))
+                for name in devices.keys(): 
+                    menu["menu"].add_command(label=name, command=lambda v=name: var.set(v))
+                
+                # Set initial selection
+                if default_name and default_name in devices:
+                    var.set(default_name)
+                else:
+                    var.set(next(iter(devices)))
                 return True
             else:
                 var.set(default_msg)
                 return False
 
-        if _populate(self.mic_menu, self.selected_mic_name, self.mic_devices, "No mics found"):
-            self.selected_mic_name.set(next(iter(self.mic_devices)))
+        _populate(self.mic_menu, self.selected_mic_name, self.mic_devices, default_mic, "No mics found")
+        _populate(self.spk_menu, self.selected_spk_name, self.spk_devices, default_spk, "No outputs found")
 
-        if _populate(self.spk_menu, self.selected_spk_name, self.spk_devices, "No outputs found"):
-            prefer = next((n for n in self.spk_devices if "Speaker" in n or "Headphone" in n), None)
-            self.selected_spk_name.set(prefer or next(iter(self.spk_devices)))
-
+        # Repopulate loopback menu
         lb_menu = self.lb_menu["menu"]
         lb_menu.delete(0, "end")
         lb_menu.add_command(label="Auto (match speaker)", command=lambda: self.selected_lb_name.set("Auto (match speaker)"))
         if self.lb_devices:
-            for name in self.lb_devices: lb_menu.add_command(label=name, command=lambda v=name: self.selected_lb_name.set(v))
+            for name in self.lb_devices: 
+                lb_menu.add_command(label=name, command=lambda v=name: self.selected_lb_name.set(v))
+
 
     def on_close(self):
+        """Handles application shutdown, saving settings first."""
+        self._save_settings()
         self.command_queue.put(("EXIT", {}))
         self.root.destroy()
 
