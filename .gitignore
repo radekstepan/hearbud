@@ -1,6 +1,2 @@
-venv/
-build/
-dist/
-AudioRecorder.spec
 repomix-output.xml
 *.mp3

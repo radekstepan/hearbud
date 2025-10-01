@@ -60,7 +60,7 @@ using CSCore.MediaFoundation; // MP3 encoder
 using CSCore.SoundIn;
 using CSCore.Streams;
 
-namespace WasapiLoopMix
+namespace Hearbud
 {
     // Identifies which source a level meter event refers to.
     public enum LevelSource { Mic, System }

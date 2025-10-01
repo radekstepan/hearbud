@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Threading.Tasks;
 
-namespace WasapiLoopMix
+namespace Hearbud
 {
     public partial class App : System.Windows.Application
     {
@@ -31,7 +31,7 @@ namespace WasapiLoopMix
     internal static class CrashLog
     {
         private static readonly string LogDir =
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WasapiLoopMix");
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Hearbud");
         private static readonly string LogPath = Path.Combine(LogDir, "logs.txt");
 
         public static void LogAndShow(string where, Exception? ex)
@@ -50,7 +50,7 @@ namespace WasapiLoopMix
                 System.Windows.MessageBox.Show(
                     $"A fatal error occurred in {where}.\n\n{msg}\n\n" +
                     $"A log was written to:\n{LogPath}",
-                    "WasapiLoopMix – Crash",
+                    "Hearbud - Crash",
                     System.Windows.MessageBoxButton.OK,
                     System.Windows.MessageBoxImage.Error);
             }

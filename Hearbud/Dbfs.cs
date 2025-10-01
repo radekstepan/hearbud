@@ -1,6 +1,6 @@
 using System;
 
-namespace WasapiLoopMix
+namespace Hearbud
 {
     public static class Dbfs
     {

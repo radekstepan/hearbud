@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Text.Json;
 
-namespace WasapiLoopMix
+namespace Hearbud
 {
     public sealed class AppSettings
     {
@@ -23,7 +23,7 @@ namespace WasapiLoopMix
         public bool IncludeMic { get; set; } = true;
 
         private static string ConfigPath =>
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".audiorecorder_config.json");
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".hearbud_config.json");
 
         public static AppSettings Load()
         {

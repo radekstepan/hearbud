@@ -13,7 +13,7 @@ using System.Windows.Controls; // ComboBoxItem
 using WpfMessageBox = System.Windows.MessageBox;
 using WinFormsFolderBrowserDialog = System.Windows.Forms.FolderBrowserDialog;
 
-namespace WasapiLoopMix
+namespace Hearbud
 {
     public partial class MainWindow : Window
     {

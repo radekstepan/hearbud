@@ -1,8 +1,0 @@
-numpy>=2.1,<3
-scipy>=1.13,<2
-# Works with either pyaudiowpatch (preferred) or plain pyaudio.
-# If you already have plain pyaudio installed and can't change it, the app still works
-# as long as you select an actual WASAPI loopback device from the dropdown.
-pyaudiowpatch>=0.2.12
-# pyaudio>=0.2.11  # Optional: Install if pyaudiowpatch is not used
-sv-ttk>=2.6.0
