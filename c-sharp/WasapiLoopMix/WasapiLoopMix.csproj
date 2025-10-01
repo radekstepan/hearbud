@@ -11,6 +11,7 @@
     <AssemblyName>WasapiLoopMix</AssemblyName>
     <RootNamespace>WasapiLoopMix</RootNamespace>
     <NoWarn>NU1701</NoWarn>
+    <Version>0.1.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

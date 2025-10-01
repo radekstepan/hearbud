@@ -3,14 +3,280 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              StartupUri="MainWindow.xaml">
   <Application.Resources>
-    <Style TargetType="ProgressBar">
-      <Setter Property="Height" Value="16"/>
-    </Style>
-    <Style TargetType="TextBlock">
-      <Setter Property="TextWrapping" Value="Wrap"/>
-    </Style>
-    <Style TargetType="Slider">
-      <Setter Property="IsMoveToPointEnabled" Value="True"/>
-    </Style>
+    <ResourceDictionary>
+      <!-- Colors -->
+      <SolidColorBrush x:Key="AppBackground" Color="#FF2D2D30"/>
+      <SolidColorBrush x:Key="ControlBackground" Color="#FF3F3F41"/>
+      <SolidColorBrush x:Key="ControlBorder" Color="#FF555555"/>
+      <SolidColorBrush x:Key="ControlForeground" Color="#FFF1F1F1"/>
+      <SolidColorBrush x:Key="ControlDisabled" Color="#FF4F4F4F"/>
+      <SolidColorBrush x:Key="AccentBrush" Color="#FFEA7D24"/>
+      <SolidColorBrush x:Key="AccentForeground" Color="White"/>
+      <SolidColorBrush x:Key="ClipBrush" Color="#FFD13438"/>
+
+      <!-- Base Styles -->
+      <Style TargetType="TextBlock">
+        <Setter Property="TextWrapping" Value="Wrap"/>
+        <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+      </Style>
+
+      <Style TargetType="Separator">
+        <Setter Property="Background" Value="{StaticResource ControlBorder}"/>
+        <Setter Property="Margin" Value="0,8"/>
+        <Setter Property="Height" Value="1"/>
+      </Style>
+
+      <!-- GroupBox -->
+      <Style TargetType="GroupBox">
+        <Setter Property="BorderBrush" Value="{StaticResource ControlBorder}"/>
+        <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="Padding" Value="10"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="GroupBox">
+              <Grid>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Border Grid.Row="0"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="4,4,0,0"
+                        Background="{StaticResource ControlBackground}">
+                  <ContentPresenter Margin="8,4"
+                                    ContentSource="Header"
+                                    RecognizesAccessKey="True"
+                                    TextElement.FontWeight="SemiBold"/>
+                </Border>
+                <Border Grid.Row="1"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="1,0,1,1"
+                        CornerRadius="0,0,4,4">
+                  <ContentPresenter Margin="{TemplateBinding Padding}"/>
+                </Border>
+              </Grid>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+
+      <!-- TextBox -->
+      <Style TargetType="TextBox">
+        <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource ControlBorder}"/>
+        <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+        <Setter Property="Padding" Value="5"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Style.Triggers>
+          <Trigger Property="IsReadOnly" Value="True">
+            <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+          </Trigger>
+        </Style.Triggers>
+      </Style>
+      
+      <!-- ComboBox full re-template -->
+      <ControlTemplate x:Key="ComboBoxToggleButtonTemplate" TargetType="ToggleButton">
+          <Grid>
+              <Grid.ColumnDefinitions>
+                  <ColumnDefinition />
+                  <ColumnDefinition Width="20" />
+              </Grid.ColumnDefinitions>
+              <Border Grid.Column="0" Grid.ColumnSpan="2"
+                      CornerRadius="3"
+                      Background="{StaticResource ControlBackground}"
+                      BorderBrush="{StaticResource ControlBorder}"
+                      BorderThickness="1" />
+              <Border Grid.Column="1"
+                      CornerRadius="0,3,3,0"
+                      Margin="1"
+                      Background="Transparent"
+                      BorderThickness="0" />
+              <Path Grid.Column="1"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    Data="M0,0 L4,4 L8,0 Z"
+                    Fill="{StaticResource ControlForeground}" />
+          </Grid>
+      </ControlTemplate>
+      
+      <Style TargetType="ComboBox">
+          <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+          <Setter Property="Padding" Value="5"/>
+          <Setter Property="VerticalContentAlignment" Value="Center"/>
+          <Setter Property="Template">
+              <Setter.Value>
+                  <ControlTemplate TargetType="ComboBox">
+                      <Grid>
+                          <ToggleButton
+                              Template="{StaticResource ComboBoxToggleButtonTemplate}"
+                              Focusable="false"
+                              IsChecked="{Binding Path=IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                              ClickMode="Press"/>
+
+                          <ContentPresenter
+                              Name="ContentSite"
+                              IsHitTestVisible="False"
+                              Content="{TemplateBinding SelectionBoxItem}"
+                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                              ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
+                              Margin="5,5,25,5"
+                              VerticalAlignment="Center"
+                              HorizontalAlignment="Left"/>
+                          
+                          <Popup
+                              Name="Popup"
+                              Placement="Bottom"
+                              IsOpen="{TemplateBinding IsDropDownOpen}"
+                              AllowsTransparency="True"
+                              Focusable="False"
+                              PopupAnimation="Slide">
+
+                              <Grid Name="DropDown"
+                                    SnapsToDevicePixels="True"
+                                    MinWidth="{TemplateBinding ActualWidth}"
+                                    MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                  <Border
+                                      x:Name="DropDownBorder"
+                                      Background="{StaticResource ControlBackground}"
+                                      BorderThickness="1"
+                                      BorderBrush="{StaticResource ControlBorder}"/>
+                                  <ScrollViewer Margin="4,6,4,6" SnapsToDevicePixels="True">
+                                      <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained" />
+                                  </ScrollViewer>
+                              </Grid>
+                          </Popup>
+
+                      </Grid>
+                  </ControlTemplate>
+              </Setter.Value>
+          </Setter>
+      </Style>
+
+      <Style TargetType="ComboBoxItem">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+        <Setter Property="Padding" Value="5"/>
+        <Style.Triggers>
+          <Trigger Property="IsHighlighted" Value="True">
+            <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+            <Setter Property="Foreground" Value="{StaticResource AccentForeground}"/>
+          </Trigger>
+        </Style.Triggers>
+      </Style>
+
+      <!-- Button -->
+      <Style TargetType="Button">
+        <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+        <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource ControlBorder}"/>
+        <Setter Property="Padding" Value="10,6"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="Button">
+              <Border Background="{TemplateBinding Background}"
+                      BorderBrush="{TemplateBinding BorderBrush}"
+                      BorderThickness="{TemplateBinding BorderThickness}"
+                      CornerRadius="4">
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                  Margin="{TemplateBinding Padding}"/>
+              </Border>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+        <Style.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+          </Trigger>
+          <Trigger Property="IsEnabled" Value="False">
+            <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+            <Setter Property="Foreground" Value="#FF999999"/>
+          </Trigger>
+        </Style.Triggers>
+      </Style>
+
+      <Style x:Key="AccentButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+        <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+        <Setter Property="Foreground" Value="{StaticResource AccentForeground}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+        <Setter Property="FontWeight" Value="Bold"/>
+        <Style.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter Property="Background" Value="#FFD46E1F"/>
+            <Setter Property="BorderBrush" Value="#FFD46E1F"/>
+          </Trigger>
+          <Trigger Property="IsEnabled" Value="False">
+            <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+            <Setter Property="Foreground" Value="#FF999999"/>
+            <Setter Property="BorderBrush" Value="{StaticResource ControlDisabled}"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+          </Trigger>
+        </Style.Triggers>
+      </Style>
+
+      <!-- ProgressBar -->
+      <Style TargetType="ProgressBar">
+        <Setter Property="Height" Value="18"/>
+        <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource ControlBorder}"/>
+        <Setter Property="Foreground" Value="{StaticResource AccentBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ProgressBar">
+              <Border BorderBrush="{TemplateBinding BorderBrush}"
+                      BorderThickness="{TemplateBinding BorderThickness}"
+                      Background="{TemplateBinding Background}"
+                      CornerRadius="3">
+                <Grid>
+                  <Rectangle x:Name="PART_Track"/>
+                  <Rectangle x:Name="PART_Indicator"
+                             Fill="{TemplateBinding Foreground}"
+                             HorizontalAlignment="Left"
+                             RadiusX="3" RadiusY="3"/>
+                </Grid>
+              </Border>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+
+      <!-- Slider -->
+      <Style TargetType="Slider">
+        <Setter Property="IsMoveToPointEnabled" Value="True"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="Height" Value="30"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="Slider">
+              <Grid>
+                <Border x:Name="Track"
+                        Height="4"
+                        Background="{StaticResource ControlBorder}"
+                        CornerRadius="2"
+                        VerticalAlignment="Center"/>
+                <Track x:Name="PART_Track">
+                  <Track.Thumb>
+                    <Thumb Width="16" Height="16"
+                           Background="{StaticResource AccentBrush}"
+                           BorderBrush="{StaticResource AccentBrush}"
+                           BorderThickness="1">
+                      <Thumb.Template>
+                        <ControlTemplate TargetType="Thumb">
+                          <Ellipse Fill="{TemplateBinding Background}"/>
+                        </ControlTemplate>
+                      </Thumb.Template>
+                    </Thumb>
+                  </Track.Thumb>
+                </Track>
+              </Grid>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+    </ResourceDictionary>
   </Application.Resources>
 </Application>

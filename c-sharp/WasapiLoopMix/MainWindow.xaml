@@ -4,25 +4,18 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="Audio Recorder → WAV + MP3" Height="640" Width="960"
-        MinHeight="560" MinWidth="860">
-    <DockPanel LastChildFill="True" Margin="12">
-        <!-- Header -->
-        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
-            <TextBlock Text="Audio Recorder" FontSize="20" FontWeight="Bold" VerticalAlignment="Center"/>
-            <TextBlock Text="Capture system + mic → WAVs (+ mixed MP3)"
-                       VerticalAlignment="Center" Margin="8,0,0,0" Opacity="0.75"/>
-            <!-- Hide theme toggle -->
-            <Button Content="Toggle theme" HorizontalAlignment="Right" Margin="8,0,0,0"
-                    Click="OnToggleTheme" Visibility="Collapsed"/>
-        </StackPanel>
-        <Separator DockPanel.Dock="Top" Margin="0,0,0,6"/>
-
+        Title="Audio Recorder" Height="445" Width="960"
+        MinHeight="445" MinWidth="900"
+        ResizeMode="CanMinimize"
+        Background="{StaticResource AppBackground}"
+        Foreground="{StaticResource ControlForeground}">
+    <DockPanel LastChildFill="True" Margin="16">
         <!-- Main content -->
         <Grid>
             <Grid.RowDefinitions>
-                <RowDefinition Height="*"/>
-                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
@@ -32,67 +25,46 @@
             </Grid.ColumnDefinitions>
 
             <!-- Devices -->
-            <GroupBox Grid.Row="0" Grid.Column="0" Header="Audio Devices" Margin="0,0,6,6">
-                <StackPanel Margin="12">
-                    <TextBlock Text="Microphone (Input)"/>
+            <GroupBox Grid.Row="0" Grid.Column="0" Header="Audio Devices" Margin="0,0,8,4">
+                <StackPanel Margin="6">
+                    <TextBlock Text="Microphone (Input)" FontWeight="SemiBold"/>
                     <ComboBox x:Name="MicCombo" Margin="0,4,0,0"/>
-                    <TextBlock Text="Audio Output (to capture)" Margin="0,12,0,0"/>
+                    <TextBlock Text="Audio Output (to capture)" Margin="0,12,0,0" FontWeight="SemiBold"/>
                     <ComboBox x:Name="SpeakerCombo" Margin="0,4,0,0"/>
-                    <TextBlock Text="Loopback device (override)" Margin="0,12,0,0"/>
-                    <ComboBox x:Name="LoopbackCombo" Margin="0,4,0,0"/>
-                    <!-- Mic checkbox removed (mic always included) -->
                 </StackPanel>
             </GroupBox>
 
             <!-- Output -->
-            <GroupBox Grid.Row="0" Grid.Column="1" Header="Output Settings" Margin="6,0,0,6">
-                <StackPanel Margin="12">
-                    <TextBlock Text="Save Location"/>
+            <GroupBox Grid.Row="0" Grid.Column="1" Header="Output Settings" Margin="8,0,0,4">
+                <StackPanel Margin="6">
+                    <TextBlock Text="Save Location" FontWeight="SemiBold"/>
                     <DockPanel Margin="0,4,0,0">
+                        <Button Content="Browse…" Margin="8,0,0,0" Click="OnBrowseFolder" DockPanel.Dock="Right"/>
                         <TextBox x:Name="OutputFolderText" IsReadOnly="True" VerticalAlignment="Center"/>
-                        <Button Content="Browse…" Margin="8,0,0,0" Click="OnBrowseFolder"/>
                     </DockPanel>
 
-                    <TextBlock Text="Base File Name (no extension)" Margin="0,12,0,0"/>
+                    <TextBlock Text="Base File Name (no extension)" Margin="0,12,0,0" FontWeight="SemiBold"/>
                     <TextBox x:Name="BaseNameText" Margin="0,4,0,0"/>
-
-                    <!-- Keep space for potential future options -->
                 </StackPanel>
             </GroupBox>
 
             <!-- Gains -->
-            <GroupBox Grid.Row="1" Grid.Column="0" Header="Live Gain Controls" Margin="0,6,6,6">
-                <StackPanel Margin="12">
+            <GroupBox Grid.Row="1" Grid.Column="0" Header="Live Gain Controls" Margin="0,4,8,4">
+                <StackPanel Margin="6">
 
                     <!-- Mic row -->
-                    <Grid Margin="0,0,0,0">
+                    <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="100"/>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="150"/>
                         </Grid.ColumnDefinitions>
 
-                        <TextBlock Grid.Column="0" Text="Mic Gain" VerticalAlignment="Center"/>
-                        <Slider
-                            x:Name="MicGain"
-                            Grid.Column="1"
-                            Minimum="0.0"
-                            Maximum="3.0"
-                            Value="1.0"
-                            TickFrequency="0.1"
-                            IsSnapToTickEnabled="False"
-                            IsMoveToPointEnabled="True"
-                            LargeChange="0.1"
-                            SmallChange="0.01"
-                            Height="30"
-                            Margin="10,0,10,0"
-                            ValueChanged="OnGainChanged"/>
-                        <TextBlock
-                            x:Name="MicGainLabel"
-                            Grid.Column="2"
-                            TextAlignment="Right"
-                            FontFamily="Consolas"
-                            VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="0" Text="Mic Gain" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <Slider x:Name="MicGain" Grid.Column="1" Minimum="0.0" Maximum="3.0" Value="1.0"
+                                ValueChanged="OnGainChanged"/>
+                        <TextBlock x:Name="MicGainLabel" Grid.Column="2" TextAlignment="Right"
+                                   FontFamily="Consolas" VerticalAlignment="Center"/>
                     </Grid>
 
                     <!-- Output/System row -->
@@ -103,35 +75,19 @@
                             <ColumnDefinition Width="150"/>
                         </Grid.ColumnDefinitions>
 
-                        <TextBlock Grid.Column="0" Text="Output Gain" VerticalAlignment="Center"/>
-                        <Slider
-                            x:Name="LoopGain"
-                            Grid.Column="1"
-                            Minimum="0.0"
-                            Maximum="3.0"
-                            Value="1.0"
-                            TickFrequency="0.1"
-                            IsSnapToTickEnabled="False"
-                            IsMoveToPointEnabled="True"
-                            LargeChange="0.1"
-                            SmallChange="0.01"
-                            Height="30"
-                            Margin="10,0,10,0"
-                            ValueChanged="OnGainChanged"/>
-                        <TextBlock
-                            x:Name="LoopGainLabel"
-                            Grid.Column="2"
-                            TextAlignment="Right"
-                            FontFamily="Consolas"
-                            VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="0" Text="Output Gain" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <Slider x:Name="LoopGain" Grid.Column="1" Minimum="0.0" Maximum="3.0" Value="1.0"
+                                ValueChanged="OnGainChanged"/>
+                        <TextBlock x:Name="LoopGainLabel" Grid.Column="2" TextAlignment="Right"
+                                   FontFamily="Consolas" VerticalAlignment="Center"/>
                     </Grid>
 
                 </StackPanel>
             </GroupBox>
 
             <!-- Meters -->
-            <GroupBox Grid.Row="1" Grid.Column="1" Header="Live Levels" Margin="6,6,0,6">
-                <StackPanel Margin="12">
+            <GroupBox Grid.Row="1" Grid.Column="1" Header="Live Levels" Margin="8,4,0,4">
+                <StackPanel Margin="6">
                     <!-- Mic meter -->
                     <Grid>
                         <Grid.ColumnDefinitions>
@@ -140,10 +96,10 @@
                             <ColumnDefinition Width="80"/>
                             <ColumnDefinition Width="50"/>
                         </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Mic" VerticalAlignment="Center"/>
-                        <ProgressBar Grid.Column="1" x:Name="MicBar" Minimum="0" Maximum="100" Height="16" Margin="10,0,10,0"/>
+                        <TextBlock Grid.Column="0" Text="Mic" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <ProgressBar Grid.Column="1" x:Name="MicBar" Minimum="0" Maximum="100" Margin="10,0"/>
                         <TextBlock Grid.Column="2" x:Name="MicDb" TextAlignment="Right" FontFamily="Consolas" VerticalAlignment="Center"/>
-                        <TextBlock Grid.Column="3" x:Name="MicClip" Text="CLIP" Foreground="Gray" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                        <TextBlock Grid.Column="3" x:Name="MicClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="Center" Margin="8,0,0,0" FontWeight="Bold"/>
                     </Grid>
 
                     <!-- System meter -->
@@ -154,27 +110,28 @@
                             <ColumnDefinition Width="80"/>
                             <ColumnDefinition Width="50"/>
                         </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="System" VerticalAlignment="Center"/>
-                        <ProgressBar Grid.Column="1" x:Name="SysBar" Minimum="0" Maximum="100" Height="16" Margin="10,0,10,0"/>
+                        <TextBlock Grid.Column="0" Text="System" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <ProgressBar Grid.Column="1" x:Name="SysBar" Minimum="0" Maximum="100" Margin="10,0"/>
                         <TextBlock Grid.Column="2" x:Name="SysDb" TextAlignment="Right" FontFamily="Consolas" VerticalAlignment="Center"/>
-                        <TextBlock Grid.Column="3" x:Name="SysClip" Text="CLIP" Foreground="Gray" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                        <TextBlock Grid.Column="3" x:Name="SysClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="center" Margin="8,0,0,0" FontWeight="Bold"/>
                     </Grid>
                 </StackPanel>
             </GroupBox>
 
             <!-- Controls -->
-            <StackPanel Orientation="Horizontal" Grid.Row="2" Grid.ColumnSpan="2" Margin="0,6,0,6">
+            <StackPanel Orientation="Horizontal" Grid.Row="2" Grid.ColumnSpan="2" Margin="0,8,0,0">
                 <Button x:Name="RefreshBtn" Content="Refresh Devices" Click="OnRefreshDevices"/>
-                <TextBlock Text=" " Width="8"/>
-                <Button x:Name="StartBtn" Content="Start Recording (Ctrl+R)" Click="OnStart" />
-                <TextBlock Text=" " Width="8"/>
-                <Button x:Name="StopBtn" Content="Stop (Ctrl+S)" Click="OnStop" IsEnabled="False"/>
+                <Button x:Name="StartBtn" Content="Start Recording (Ctrl+R)" Click="OnStart" Margin="8,0,0,0"
+                        Style="{StaticResource AccentButton}"/>
+                <Button x:Name="StopBtn" Content="Stop (Ctrl+S)" Click="OnStop" IsEnabled="False" Margin="8,0,0,0"
+                        Style="{StaticResource AccentButton}"/>
             </StackPanel>
 
             <!-- Status bar -->
-            <Separator Grid.Row="3" Grid.ColumnSpan="2" Margin="0,6,0,6"/>
-            <DockPanel Grid.Row="4" Grid.ColumnSpan="2">
-                <TextBlock x:Name="StatusText" Text="Ready to record" />
+            <Separator Grid.Row="3" Grid.ColumnSpan="2" Margin="0,8,0,0"/>
+            <DockPanel Grid.Row="4" Grid.ColumnSpan="2" Margin="0,4,0,0">
+                <TextBlock x:Name="VersionText" DockPanel.Dock="Right" Opacity="0.5" VerticalAlignment="Center"/>
+                <TextBlock x:Name="StatusText" Text="Ready to record" Opacity="0.8" />
             </DockPanel>
         </Grid>
     </DockPanel>
