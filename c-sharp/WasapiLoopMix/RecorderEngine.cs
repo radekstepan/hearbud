@@ -1,5 +1,6 @@
+// file: WasapiLoopMix/RecorderEngine.cs
 // ----------------------------------------------------------------------------------------------------
-// PURPOSE
+// PURPOSE (for LLMs and future maintainers)
 // ----------------------------------------------------------------------------------------------------
 // This class records Windows system audio (WASAPI loopback) and, optionally, a microphone, in real-time.
 // It writes three WAV files during capture:
@@ -66,13 +67,15 @@ namespace WasapiLoopMix
     public enum LevelSource { Mic, System }
 
     // Event payload for real-time level updates to the UI.
+    // Added RMS: represents "loudness" over the throttling window; Peak indicates "headroom".
     public sealed class LevelChangedEventArgs : EventArgs
     {
-        public LevelChangedEventArgs(LevelSource source, float peak, bool clipped)
-        { Source = source; Peak = peak; Clipped = clipped; }
+        public LevelChangedEventArgs(LevelSource source, float rms, float peak, bool clipped)
+        { Source = source; Rms = rms; Peak = peak; Clipped = clipped; }
         public LevelSource Source { get; }
-        public float Peak { get; }
-        public bool Clipped { get; }
+        public float Rms { get; }     // Root-mean-square over the most recent window (post-gain, pre-clip)
+        public float Peak { get; }    // Maximum absolute sample over the same window (post-gain)
+        public bool Clipped { get; }  // True if any sample exceeded |1.0| in the window (before soft clip)
     }
 
     // High-level status for UI (info/errors/stopped summary).
@@ -208,6 +211,12 @@ namespace WasapiLoopMix
         private long _lastLevelTickSys = 0;
         private float _peakSinceLastMic = 0f;
         private float _peakSinceLastSys = 0f;
+        private double _rmsSumSinceLastMic = 0.0;
+        private double _rmsSumSinceLastSys = 0.0;
+        private long _rmsCountSinceLastMic = 0;
+        private long _rmsCountSinceLastSys = 0;
+        private bool _clippedSinceLastMic = false;
+        private bool _clippedSinceLastSys = false;
 
         private volatile bool _disposed;
 
@@ -232,6 +241,9 @@ namespace WasapiLoopMix
                 _lastLoopTick = Stopwatch.GetTimestamp();
                 _lastLevelTickMic = _lastLevelTickSys = _lastLoopTick; // initialize throttling timers
                 _peakSinceLastMic = _peakSinceLastSys = 0f;
+                _rmsSumSinceLastMic = _rmsSumSinceLastSys = 0.0;
+                _rmsCountSinceLastMic = _rmsCountSinceLastSys = 0;
+                _clippedSinceLastMic = _clippedSinceLastSys = false;
 
                 RaiseStatus(EngineStatusKind.Info, "Monitoring…");
                 Info("Monitoring started");
@@ -493,34 +505,67 @@ namespace WasapiLoopMix
 
                 int conv = ConvertToTarget(_micInBuf, got, _micSrc.WaveFormat, _outRate, _outChannels, ref _micConvBuf);
 
-                // meters (mic) — accumulate max since last UI tick, then emit at ~20 Hz
-                float peakMic = 0f;
+                // Determine whether loopback has been silent long enough to enter mic-driven mode.
+                long nowTicksA = Stopwatch.GetTimestamp();
+                double msSinceLoop = (nowTicksA - _lastLoopTick) * _tickMs;
+                bool loopSilent = msSinceLoop > LoopSilentMsThreshold;
+
+                // meters (mic): compute peak and accumulate RMS cheaply over this block
+                float blockPeak = 0f;
+                double blockRmsSum = 0.0;
+                bool blockClipped = false;
                 for (int i = 0; i < conv; i++)
                 {
-                    float av = MathF.Abs((float)(_micConvBuf[i] * MicGain));
-                    if (av > peakMic) peakMic = av;
+                    float sample = (float)(_micConvBuf[i] * MicGain);
+                    float abs = MathF.Abs(sample);
+                    if (abs > blockPeak) blockPeak = abs;
+                    blockRmsSum += (double)abs * abs;
+                    if (abs > 1f) blockClipped = true;
                 }
-                if (peakMic > _peakSinceLastMic) _peakSinceLastMic = peakMic;
+                if (blockPeak > _peakSinceLastMic) _peakSinceLastMic = blockPeak;
+                _rmsSumSinceLastMic += blockRmsSum;
+                _rmsCountSinceLastMic += conv;
+                _clippedSinceLastMic |= blockClipped;
 
-                long nowTicks = Stopwatch.GetTimestamp();
-                double msSince = (nowTicks - _lastLevelTickMic) * _tickMs;
-                if (msSince >= LevelThrottleMs)
+                // Throttled level event (~20 Hz)
+                double msSince = (nowTicksA - _lastLevelTickMic) * _tickMs;
+                if (msSince >= LevelThrottleMs && _rmsCountSinceLastMic > 0)
                 {
-                    LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.Mic, _peakSinceLastMic, clipped: false));
+                    float rms = (float)Math.Sqrt(_rmsSumSinceLastMic / _rmsCountSinceLastMic);
+                    LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.Mic, rms, _peakSinceLastMic, _clippedSinceLastMic));
                     _peakSinceLastMic = 0f;
-                    _lastLevelTickMic = nowTicks;
+                    _rmsSumSinceLastMic = 0.0;
+                    _rmsCountSinceLastMic = 0;
+                    _clippedSinceLastMic = false;
+                    _lastLevelTickMic = nowTicksA;
                 }
 
-                // Push to ring
-                lock (_micRingLock)
+                // RING-BUFFER POLICY FIX:
+                // When loopback is silent and we are *already writing* mic-only audio to the mix/system files,
+                // we must NOT accumulate those mic samples in the ring; otherwise they will be mixed again with
+                // *future* loopback when it resumes, causing "old mic over new system" echoes.
+                if (loopSilent)
                 {
-                    EnsureRingCapacity(conv);
-                    for (int i = 0; i < conv; i++)
+                    // Drop any existing backlog to realign the timeline to "now".
+                    lock (_micRingLock)
                     {
-                        _micRing[_micW] = _micConvBuf[i];
-                        _micW = (_micW + 1) % _micRing.Length;
-                        if (_micCount < _micRing.Length) _micCount++;
-                        else _micR = (_micR + 1) % _micRing.Length;
+                        _micR = _micW;
+                        _micCount = 0;
+                    }
+                }
+                else
+                {
+                    // Normal path: push into ring for the loopback-driven mixer to pull from.
+                    lock (_micRingLock)
+                    {
+                        EnsureRingCapacity(conv);
+                        for (int i = 0; i < conv; i++)
+                        {
+                            _micRing[_micW] = _micConvBuf[i];
+                            _micW = (_micW + 1) % _micRing.Length;
+                            if (_micCount < _micRing.Length) _micCount++;
+                            else _micR = (_micR + 1) % _micRing.Length;
+                        }
                     }
                 }
 
@@ -532,40 +577,36 @@ namespace WasapiLoopMix
                     _wavMic.Write(_pcm16Mic, 0, conv * 2);
                 }
 
-                // Mic-driven path when loopback is silent
-                if (_recording && _wavMix != null && _wavSys != null)
+                // Mic-driven path when loopback is silent:
+                // - Write zeros to system.wav and mic-only (gain+headroom+soft-clip) to mix.wav.
+                if (_recording && _wavMix != null && _wavSys != null && loopSilent)
                 {
-                    long now = Stopwatch.GetTimestamp();
-                    double msSinceLoop = (now - _lastLoopTick) * _tickMs;
-                    if (msSinceLoop > LoopSilentMsThreshold)
+                    // system zeros
+                    EnsureCapacity(ref _pcm16Sys, conv * 2);
+                    Array.Clear(_pcm16Sys, 0, conv * 2);
+                    _wavSys.Write(_pcm16Sys, 0, conv * 2);
+
+                    // mic-only mix (apply gain, 0.5 headroom, soft-clip)
+                    EnsureCapacity(ref _mixBufF, conv);
+                    for (int i = 0; i < conv; i++)
                     {
-                        // system zeros
-                        EnsureCapacity(ref _pcm16Sys, conv * 2);
-                        Array.Clear(_pcm16Sys, 0, conv * 2);
-                        _wavSys.Write(_pcm16Sys, 0, conv * 2);
+                        float m = (float)(_micConvBuf[i] * MicGain);
+                        float a = m * 0.5f;
+                        a = SoftClipIfNeeded(a);
+                        _mixBufF[i] = a;
+                    }
 
-                        // mic-only mix (apply gain, 0.5 headroom, soft-clip)
-                        EnsureCapacity(ref _mixBufF, conv);
-                        for (int i = 0; i < conv; i++)
-                        {
-                            float m = (float)(_micConvBuf[i] * MicGain);
-                            float a = m * 0.5f;
-                            a = SoftClipIfNeeded(a);
-                            _mixBufF[i] = a;
-                        }
-
-                        if (_mixUse32Bit)
-                        {
-                            EnsureCapacity(ref _pcm32Mix, conv * 4);
-                            FloatToPcm32(_mixBufF, _pcm32Mix, conv);
-                            _wavMix.Write(_pcm32Mix, 0, conv * 4);
-                        }
-                        else
-                        {
-                            EnsureCapacity(ref _pcm16Mix, conv * 2);
-                            FloatToPcm16(_mixBufF, _pcm16Mix, conv); // includes TPDF dither
-                            _wavMix.Write(_pcm16Mix, 0, conv * 2);
-                        }
+                    if (_mixUse32Bit)
+                    {
+                        EnsureCapacity(ref _pcm32Mix, conv * 4);
+                        FloatToPcm32(_mixBufF, _pcm32Mix, conv);
+                        _wavMix.Write(_pcm32Mix, 0, conv * 4);
+                    }
+                    else
+                    {
+                        EnsureCapacity(ref _pcm16Mix, conv * 2);
+                        FloatToPcm16(_mixBufF, _pcm16Mix, conv); // includes TPDF dither
+                        _wavMix.Write(_pcm16Mix, 0, conv * 2);
                     }
                 }
             }
@@ -592,21 +633,33 @@ namespace WasapiLoopMix
                 int gotLoop = ReadExactSamples(_loopSrc, _loopBufF, wantFloats);
                 if (gotLoop <= 0) return;
 
-                // meters (system) — accumulate max since last UI tick, then emit at ~20 Hz
-                float peakSys = 0f;
+                // meters (system): compute peak and accumulate RMS over this block
+                float blockPeak = 0f;
+                double blockRmsSum = 0.0;
+                bool blockClipped = false;
                 for (int i = 0; i < gotLoop; i++)
                 {
-                    float av = MathF.Abs((float)(_loopBufF[i] * LoopGain));
-                    if (av > peakSys) peakSys = av;
+                    float sample = (float)(_loopBufF[i] * LoopGain);
+                    float abs = MathF.Abs(sample);
+                    if (abs > blockPeak) blockPeak = abs;
+                    blockRmsSum += (double)abs * abs;
+                    if (abs > 1f) blockClipped = true;
                 }
-                if (peakSys > _peakSinceLastSys) _peakSinceLastSys = peakSys;
+                if (blockPeak > _peakSinceLastSys) _peakSinceLastSys = blockPeak;
+                _rmsSumSinceLastSys += blockRmsSum;
+                _rmsCountSinceLastSys += gotLoop;
+                _clippedSinceLastSys |= blockClipped;
 
-                long nowTicks = Stopwatch.GetTimestamp();
+                long nowTicks = _lastLoopTick;
                 double msSince = (nowTicks - _lastLevelTickSys) * _tickMs;
-                if (msSince >= LevelThrottleMs)
+                if (msSince >= LevelThrottleMs && _rmsCountSinceLastSys > 0)
                 {
-                    LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.System, _peakSinceLastSys, clipped: false));
+                    float rms = (float)Math.Sqrt(_rmsSumSinceLastSys / _rmsCountSinceLastSys);
+                    LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.System, rms, _peakSinceLastSys, _clippedSinceLastSys));
                     _peakSinceLastSys = 0f;
+                    _rmsSumSinceLastSys = 0.0;
+                    _rmsCountSinceLastSys = 0;
+                    _clippedSinceLastSys = false;
                     _lastLevelTickSys = nowTicks;
                 }
 
