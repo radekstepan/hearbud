@@ -1,3 +1,4 @@
+// ----------------------------------------------------------------------------------------------------
 // PURPOSE
 // ----------------------------------------------------------------------------------------------------
 // This class records Windows system audio (WASAPI loopback) and, optionally, a microphone, in real-time.
@@ -18,7 +19,7 @@
 //   The MP3 is encoded at stop time from the already-written mix.wav. This decouples real-time capture
 //   from potentially slower MP3 encoding.
 // - Gains (MicGain / LoopGain) are applied in metering and mixing. The mix uses a simple 0.5*(s+m) average
-//   to maintain ~6 dB headroom and reduce clipping.
+//   to maintain ~6 dB headroom and reduce clipping. We apply a soft clipper before final clamp.
 // - Sample-rate / channel conversion for mic -> loopback format occurs on the fly using a simple linear
 //   resampler and basic channel up/down-mix. Loopback format defines the output WaveFormat for all files.
 // - The mic ring buffer absorbs clock & scheduling jitter between the two capture callbacks so that the
@@ -42,7 +43,7 @@
 //
 // LIMITATIONS
 // - Resampler is linear (good enough for voice/meeting scenarios, not audiophile grade).
-// - Mixing is a simple average; no limiter beyond per-sample clamp to [-1,1].
+// - Mixing is a simple average; final stage uses soft-clip + clamp to [-1,1].
 // - We rely on loopback sample rate/channels. If device settings change mid-session, behavior is undefined.
 //
 // ----------------------------------------------------------------------------------------------------
@@ -51,6 +52,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Threading; // ThreadLocal<Random> for dither RNG
 using CSCore;
 using CSCore.Codecs.WAV;
 using CSCore.CoreAudioAPI;
@@ -146,7 +148,11 @@ namespace WasapiLoopMix
         // Per-output writers/paths
         private WaveWriter? _wavSys;
         private WaveWriter? _wavMic;
+
+        // We support a higher bit-depth mix WAV to preserve quality before MP3 encoding.
         private WaveWriter? _wavMix;
+        private readonly bool _mixUse32Bit = true; // set true to write 32-bit PCM mix.wav
+
         private string _pathSys = "";
         private string _pathMic = "";
         private string _pathMix = "";
@@ -164,10 +170,13 @@ namespace WasapiLoopMix
         private float[] _tmpMicBlock  = new float[BlockFrames * 8];
         private float[] _mixBufF      = new float[BlockFrames * 8];
 
-        // PCM16 staging for WaveWriter (bytes).
+        // PCM staging for WaveWriter (bytes).
         private byte[]  _pcm16Sys     = new byte[BlockFrames * 8 * 2];
         private byte[]  _pcm16Mic     = new byte[BlockFrames * 8 * 2];
+
+        // Mix can target 16 or 32-bit. We keep both buffers and use the one we need.
         private byte[]  _pcm16Mix     = new byte[BlockFrames * 8 * 2];
+        private byte[]  _pcm32Mix     = new byte[BlockFrames * 8 * 4];
 
         // Microphone ring buffer:
         // - Stores float samples already converted to loopback's format.
@@ -184,6 +193,15 @@ namespace WasapiLoopMix
         private long _lastLoopTick = 0;
         private const int LoopSilentMsThreshold = 200; // if no system frames for >200ms, drive mix from mic
 
+        // ===== Diagnostics =====
+        private string _loopDevName = "";
+        private string _micDevName  = "(none)";
+        private long _micUnderrunBlocks = 0;
+        private long _loopBlockCounter = 0;
+        private double _lastMicBacklogSec = 0.0;
+        private double _micBacklogSecMax = 0.0;
+        private const int BacklogLogEveryNBlocks = 50;
+
         private volatile bool _disposed;
 
         // ===== Public API =====
@@ -197,11 +215,9 @@ namespace WasapiLoopMix
 
             if (!_monitoring)
             {
-                // Subscribe to samples
                 _loopIn!.DataAvailable += OnLoopbackData;
                 if (_micIn != null) _micIn.DataAvailable += OnMicData;
 
-                // Start devices (callbacks will begin)
                 _loopCap!.Start();
                 _micCap?.Start();
 
@@ -212,10 +228,7 @@ namespace WasapiLoopMix
             }
         }
 
-        // Start recording:
-        // - Ensures devices are open/started by calling Monitor().
-        // - Creates per-source WAVs and a mixed WAV on disk.
-        // - MP3 is encoded from the mixed WAV in Stop().
+        // Start recording (creates per-source WAVs + mixed WAV).
         public void Start(RecorderStartOptions opts)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(RecorderEngine));
@@ -223,7 +236,6 @@ namespace WasapiLoopMix
 
             _kbps = Math.Clamp(opts.Mp3BitrateKbps, 64, 320);
 
-            // Resolve base output path (<Music>\Recordings\rec-YYYYMMDD_HHMMSS if empty).
             var basePath = string.IsNullOrWhiteSpace(opts.OutputPath)
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings", $"rec-{DateTime.Now:yyyyMMdd_HHmmss}")
                 : opts.OutputPath;
@@ -232,50 +244,53 @@ namespace WasapiLoopMix
             var baseName = Path.GetFileName(basePath);
             Directory.CreateDirectory(outDir);
 
-            // Precompute paths and clear stale files (best-effort).
-            _pathSys = Path.Combine(outDir, $"{baseName}-system.wav");
-            _pathMic = Path.Combine(outDir, $"{baseName}-mic.wav");
-            _pathMix = Path.Combine(outDir, $"{baseName}-mix.wav");
-            _pathMp3 = Path.Combine(outDir, $"{baseName}.mp3");
-            TryDelete(_pathSys);
-            TryDelete(_pathMic);
-            TryDelete(_pathMix);
-            TryDelete(_pathMp3);
+            // ----------------------------------------------------------------------------------------
+            // Non-clobbering filenames:
+            // If a file already exists, append " (1)", " (2)", ... before the extension.
+            // We do this for all outputs: system.wav, mic.wav, mix.wav, .mp3, and the .txt log.
+            // ----------------------------------------------------------------------------------------
+            _pathSys = UniquePath(Path.Combine(outDir, $"{baseName}-system.wav"));
+            _pathMic = UniquePath(Path.Combine(outDir, $"{baseName}-mic.wav"));
+            _pathMix = UniquePath(Path.Combine(outDir, $"{baseName}-mix.wav"));
+            _pathMp3 = UniquePath(Path.Combine(outDir, $"{baseName}.mp3"));
 
-            // Open log
-            _logPath = Path.Combine(outDir, $"{baseName}.txt");
+            _logPath = UniquePath(Path.Combine(outDir, $"{baseName}.txt"));
             OpenLog();
 
-            // Session header
             Info("===== Session start =====");
+            Info($"Gains: LoopGain={LoopGain:F3}, MicGain={MicGain:F3}");
+            Info($"Devices: Loopback='{_loopDevName}', Mic='{_micDevName}'");
             Info($"System WAV: {_pathSys}");
             Info($"Mic    WAV: {_pathMic}");
-            Info($"Mix    WAV: {_pathMix}");
+            Info($"Mix    WAV: {_pathMix} ({(_mixUse32Bit ? "32-bit PCM" : "16-bit PCM")})");
             Info($"Mix   MP3 : {_pathMp3} @ {_kbps}kbps");
             Info($"Loopback fmt: sr={_outRate}, ch={_outChannels}");
 
-            // Create WAV writers using loopback-defining format.
             _wavSys = new WaveWriter(_pathSys, new CSCore.WaveFormat(_outRate, 16, _outChannels));
             _wavMic = new WaveWriter(_pathMic, new CSCore.WaveFormat(_outRate, 16, _outChannels));
-            _wavMix = new WaveWriter(_pathMix, new CSCore.WaveFormat(_outRate, 16, _outChannels));
+            // Use a higher bit depth for the MIX to avoid an extra quantization step before MP3.
+            _wavMix = new WaveWriter(_pathMix, new CSCore.WaveFormat(_outRate, _mixUse32Bit ? 32 : 16, _outChannels));
 
-            // Reset mic ring indices for a clean alignment.
             lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+
+            _micUnderrunBlocks = 0;
+            _loopBlockCounter = 0;
+            _lastMicBacklogSec = 0.0;
+            _micBacklogSecMax = 0.0;
 
             _recording = true;
             RaiseStatus(EngineStatusKind.Info, "Recording to WAV…");
             Info("Recording started");
         }
 
-        // Stop recording and monitoring:
-        // - Disposes WAV writers (finalize headers).
-        // - Encodes MP3 from mix.wav (if available).
-        // - Reports paths and success via Status event.
+        // Stop recording and monitoring; encode MP3 from mix.wav.
+        // IMPORTANT: fully release ALL file handles (WAV, MP3, LOG) so the user can delete/move files
+        // while the app stays open and ready for another session.
         public void Stop()
         {
             if (_disposed) return;
 
-            // Close WAV writers first (completes headers).
+            // Close WAV writers first (finalizes headers).
             bool okSys = false, okMic = false, okMix = false, okMp3 = false;
             try { _wavSys?.Dispose(); okSys = File.Exists(_pathSys) && new FileInfo(_pathSys).Length > 0; } catch { }
             try { _wavMic?.Dispose(); okMic = File.Exists(_pathMic) && new FileInfo(_pathMic).Length > 0; } catch { }
@@ -311,10 +326,20 @@ namespace WasapiLoopMix
                 Error("MP3 encode", ex);
             }
 
-            // Stop devices (but keep log open long enough to write status).
+            // Stop devices & unsubscribe callbacks (releases capture-related handles).
             StopInternal(fullStop: false);
 
-            // Consider success if ANY file has content (so user always sees the saved dialog)
+            // Final diagnostics to the log before closing it.
+            Info($"Mic ring underruns (micRead < loop): {_micUnderrunBlocks} block(s). " +
+                 $"Peak mic backlog: {_micBacklogSecMax:F4}s, Last backlog: {_lastMicBacklogSec:F4}s");
+            Info("Recording stopped");
+            Info("===== Session end =====");
+
+            // Close the session log so the .txt file is not locked after Stop.
+            TryDispose(ref _log);
+            _logPath = ""; // mark as closed; next Start() will set & open a new log
+
+            // Consider success if ANY file has content (so UI always sees a saved toast)
             bool anyOk = okSys || okMic || okMix || okMp3;
             RaiseStatus(
                 EngineStatusKind.Stopped,
@@ -322,11 +347,10 @@ namespace WasapiLoopMix
                 success: anyOk,
                 outputPathSystem: _pathSys, outputPathMic: _pathMic, outputPathMix: _pathMix, outputPathMp3: _pathMp3);
 
-            Info("Recording stopped");
-            Info("===== Session end =====");
+            // Reset paths so subsequent sessions don't accidentally reference previous files.
+            _pathSys = _pathMic = _pathMix = _pathMp3 = "";
         }
 
-        // Stop monitoring/capture streams without encoding step (used when user toggles monitor).
         public void StopMonitor() => StopInternal(fullStop: true);
 
         public void Dispose()
@@ -345,7 +369,6 @@ namespace WasapiLoopMix
 
         // ===== Devices =====
 
-        // (Re)open devices if IDs changed or not yet created. Loopback format defines output format.
         private void OpenDevices(RecorderStartOptions opts)
         {
             bool needReopen =
@@ -358,10 +381,8 @@ namespace WasapiLoopMix
 
             Info("Opening devices…");
 
-            // Unsubscribe first to avoid dangling callbacks.
             try { if (_loopIn != null) _loopIn.DataAvailable -= OnLoopbackData; } catch { }
             try { if (_micIn  != null) _micIn.DataAvailable  -= OnMicData; }      catch { }
-            // Dispose old captures/sources.
             TryStopDispose(ref _loopCap);
             TryStopDispose(ref _micCap);
             TryDispose(ref _loopIn);
@@ -369,7 +390,6 @@ namespace WasapiLoopMix
             TryDispose(ref _loopSrc);
             TryDispose(ref _micSrc);
 
-            // Resolve device objects from IDs
             MMDevice loopDev;
             MMDevice? micDev = null;
             using (var mmde = new MMDeviceEnumerator())
@@ -379,10 +399,12 @@ namespace WasapiLoopMix
                     micDev = mmde.GetDevice(opts.MicDeviceId!);
             }
 
+            _loopDevName = loopDev?.FriendlyName ?? "";
+            _micDevName  = micDev?.FriendlyName ?? "(none)";
+
             Info($"Loopback: {loopDev?.FriendlyName}");
             if (micDev != null) Info($"Mic: {micDev.FriendlyName}"); else Info("Mic: (none)");
 
-            // Loopback (defines the WaveFormat for outputs & conversions)
             _loopCap = new WasapiLoopbackCapture { Device = loopDev };
             _loopCap.Initialize();
             _outRate     = _loopCap.WaveFormat.SampleRate;
@@ -391,7 +413,6 @@ namespace WasapiLoopMix
             _loopIn  = new SoundInSource(_loopCap) { FillWithZeros = true };
             _loopSrc = _loopIn.ToSampleSource();
 
-            // Microphone (optional but generally expected)
             if (micDev != null)
             {
                 _micCap = new WasapiCapture { Device = micDev };
@@ -400,16 +421,13 @@ namespace WasapiLoopMix
                 _micIn  = new SoundInSource(_micCap) { FillWithZeros = true };
                 _micSrc = _micIn.ToSampleSource();
 
-                // Reset ring on (re)open to avoid stale alignment.
                 lock (_micRingLock) { _micR = _micW = _micCount = 0; }
             }
             else
             {
-                // We can still proceed with loopback-only sessions; UI should show warning.
                 RaiseStatus(EngineStatusKind.Error, "Microphone device not found/selected.");
             }
 
-            // Log device formats (best-effort; helpful for diagnostics).
             try
             {
                 using var ac = AudioClient.FromMMDevice(loopDev);
@@ -430,7 +448,6 @@ namespace WasapiLoopMix
             }
         }
 
-        // Stop & dispose capture objects and sources; if fullStop, also log a short message.
         private void StopInternal(bool fullStop)
         {
             if (_monitoring)
@@ -451,13 +468,6 @@ namespace WasapiLoopMix
 
         // ===== DataAvailable =====
 
-        // Microphone callback:
-        // - Reads float samples from mic, converts to loopback format (rate/channels).
-        // - Updates mic meter.
-        // - Pushes converted samples into ring buffer for loopback-driven mixing.
-        // - Always writes mic.wav immediately.
-        // - If loopback has been quiet for > threshold, we proactively write zeros to system.wav and a
-        //   mic-only block to mix.wav so that mic-only recording proceeds (driven by mic cadence).
         private void OnMicData(object? sender, DataAvailableEventArgs e)
         {
             if (_micSrc == null || _micIn == null || _micCap == null) return;
@@ -475,10 +485,9 @@ namespace WasapiLoopMix
                 int got = ReadExactSamples(_micSrc, _micInBuf, floatSamplesToRead);
                 if (got <= 0) return;
 
-                // Convert mic samples to match loopback (defines _outRate/_outChannels).
                 int conv = ConvertToTarget(_micInBuf, got, _micSrc.WaveFormat, _outRate, _outChannels, ref _micConvBuf);
 
-                // Meters for UI (apply UI gain to match perceived loudness in mix).
+                // meters
                 float peakMic = 0f;
                 for (int i = 0; i < conv; i++)
                 {
@@ -487,7 +496,7 @@ namespace WasapiLoopMix
                 }
                 LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.Mic, peakMic, clipped:false));
 
-                // Push into mic ring for later consumption by loopback-driven mixer.
+                // Push to ring
                 lock (_micRingLock)
                 {
                     EnsureRingCapacity(conv);
@@ -496,56 +505,58 @@ namespace WasapiLoopMix
                         _micRing[_micW] = _micConvBuf[i];
                         _micW = (_micW + 1) % _micRing.Length;
                         if (_micCount < _micRing.Length) _micCount++;
-                        else _micR = (_micR + 1) % _micRing.Length; // overwrite oldest
+                        else _micR = (_micR + 1) % _micRing.Length;
                     }
                 }
 
-                // Always append to mic.wav
+                // Always write mic WAV (16-bit PCM). We apply TPDF dither to reduce low-level distortion.
                 if (_recording && _wavMic != null)
                 {
                     EnsureCapacity(ref _pcm16Mic, conv * 2);
-                    FloatToPcm16(_micConvBuf, _pcm16Mic, conv);
+                    FloatToPcm16(_micConvBuf, _pcm16Mic, conv); // includes TPDF dither
                     _wavMic.Write(_pcm16Mic, 0, conv * 2);
                 }
 
-                // If loopback has been quiet, proactively write mic-driven blocks:
-                // - system.wav gets zeros (to maintain timeline congruence across files)
-                // - mix.wav gets mic-only (scaled by 0.5 to keep headroom consistent with (s+m)/2)
+                // Mic-driven path when loopback is silent
                 if (_recording && _wavMix != null && _wavSys != null)
                 {
                     long now = Stopwatch.GetTimestamp();
                     double msSinceLoop = (now - _lastLoopTick) * _tickMs;
                     if (msSinceLoop > LoopSilentMsThreshold)
                     {
-                        // system zeros
+                        // system zeros (16-bit PCM path; no need to dither silence)
                         EnsureCapacity(ref _pcm16Sys, conv * 2);
                         Array.Clear(_pcm16Sys, 0, conv * 2);
                         _wavSys.Write(_pcm16Sys, 0, conv * 2);
 
-                        // mic-only mix (mixing rule consistent with (m + 0)/2)
+                        // mic-only mix (apply gain, 0.5 headroom, then soft-clip if needed)
                         EnsureCapacity(ref _mixBufF, conv);
                         for (int i = 0; i < conv; i++)
                         {
                             float m = (float)(_micConvBuf[i] * MicGain);
                             float a = m * 0.5f; // consistent with (m + 0)/2 to keep headroom
-                            if (a > 1f) a = 1f; else if (a < -1f) a = -1f;
+                            a = SoftClipIfNeeded(a);
                             _mixBufF[i] = a;
                         }
-                        EnsureCapacity(ref _pcm16Mix, conv * 2);
-                        FloatToPcm16(_mixBufF, _pcm16Mix, conv);
-                        _wavMix.Write(_pcm16Mix, 0, conv * 2);
+
+                        if (_mixUse32Bit)
+                        {
+                            EnsureCapacity(ref _pcm32Mix, conv * 4);
+                            FloatToPcm32(_mixBufF, _pcm32Mix, conv);
+                            _wavMix.Write(_pcm32Mix, 0, conv * 4);
+                        }
+                        else
+                        {
+                            EnsureCapacity(ref _pcm16Mix, conv * 2);
+                            FloatToPcm16(_mixBufF, _pcm16Mix, conv); // includes TPDF dither
+                            _wavMix.Write(_pcm16Mix, 0, conv * 2);
+                        }
                     }
                 }
             }
             catch (Exception ex) { Error("OnMicData", ex); }
         }
 
-        // Loopback (system) callback:
-        // - Reads float samples at the loopback-defined format (this defines output timing).
-        // - Updates system meter.
-        // - Writes system.wav immediately.
-        // - Pulls same-sized mic block from ring; if not enough mic samples, zero-fills the remainder.
-        // - Mixes (s+m)/2 to mix.wav (with UI gains), clamping to [-1,1].
         private void OnLoopbackData(object? sender, DataAvailableEventArgs e)
         {
             if (_loopSrc == null || _loopCap == null || _loopIn == null) return;
@@ -575,13 +586,23 @@ namespace WasapiLoopMix
                 }
                 LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.System, peakSys, clipped:false));
 
-                // Write raw system WAV
+                // Write raw system WAV (16-bit + TPDF dither)
                 if (_recording && _wavSys != null)
                 {
                     EnsureCapacity(ref _pcm16Sys, gotLoop * 2);
-                    FloatToPcm16(_loopBufF, _pcm16Sys, gotLoop);
+                    FloatToPcm16(_loopBufF, _pcm16Sys, gotLoop); // includes TPDF dither
                     _wavSys.Write(_pcm16Sys, 0, gotLoop * 2);
                 }
+
+                // Backlog snapshot for drift diagnostics
+                int snapshotMicCount;
+                lock (_micRingLock)
+                {
+                    snapshotMicCount = _micCount;
+                }
+                double backlogSec = (double)snapshotMicCount / (_outChannels * _outRate);
+                _lastMicBacklogSec = backlogSec;
+                if (backlogSec > _micBacklogSecMax) _micBacklogSecMax = backlogSec;
 
                 // Pull same-length mic block from ring (zero-fill if underrun)
                 EnsureCapacity(ref _tmpMicBlock, gotLoop);
@@ -596,31 +617,49 @@ namespace WasapiLoopMix
                     }
                     _micCount -= micRead;
                 }
-                if (micRead < gotLoop) Array.Clear(_tmpMicBlock, micRead, gotLoop - micRead);
+                if (micRead < gotLoop)
+                {
+                    Array.Clear(_tmpMicBlock, micRead, gotLoop - micRead);
+                    _micUnderrunBlocks++;
+                }
 
-                // Simple average mix with UI gain balance and -6 dB inherent headroom
+                _loopBlockCounter++;
+                if (_loopBlockCounter % BacklogLogEveryNBlocks == 0)
+                {
+                    Info($"Mic ring backlog: {backlogSec:F4} s (max {_micBacklogSecMax:F4} s)");
+                }
+
+                // Mix: average with gains, then soft-clip the result *before* final clamp/quantize.
                 EnsureCapacity(ref _mixBufF, gotLoop);
                 for (int i = 0; i < gotLoop; i++)
                 {
                     float s = (float)(_loopBufF[i] * LoopGain);
                     float m = (float)(_tmpMicBlock[i] * MicGain);
                     float a = (s + m) * 0.5f; // -6 dB headroom
-                    if (a > 1f) a = 1f; else if (a < -1f) a = -1f;
+                    a = SoftClipIfNeeded(a);
                     _mixBufF[i] = a;
                 }
 
                 if (_recording && _wavMix != null)
                 {
-                    EnsureCapacity(ref _pcm16Mix, gotLoop * 2);
-                    FloatToPcm16(_mixBufF, _pcm16Mix, gotLoop);
-                    _wavMix.Write(_pcm16Mix, 0, gotLoop * 2);
+                    if (_mixUse32Bit)
+                    {
+                        EnsureCapacity(ref _pcm32Mix, gotLoop * 4);
+                        FloatToPcm32(_mixBufF, _pcm32Mix, gotLoop);
+                        _wavMix.Write(_pcm32Mix, 0, gotLoop * 4);
+                    }
+                    else
+                    {
+                        EnsureCapacity(ref _pcm16Mix, gotLoop * 2);
+                        FloatToPcm16(_mixBufF, _pcm16Mix, gotLoop); // includes TPDF dither
+                        _wavMix.Write(_pcm16Mix, 0, gotLoop * 2);
+                    }
                 }
             }
             catch (Exception ex) { Error("OnLoopbackData", ex); }
         }
 
         // Read exactly N float samples from an ISampleSource
-        // Rationale: CSCore.Read may return fewer samples than requested; we loop until exhausted.
         private static int ReadExactSamples(ISampleSource src, float[] dst, int count)
         {
             int total = 0;
@@ -635,13 +674,6 @@ namespace WasapiLoopMix
 
         // ===== Conversion & sample utils =====
 
-        // Convert float samples from arbitrary WaveFormat (srcFmt) to dstRate/dstCh (loopback-defined).
-        // Steps:
-        // 1) (If needed) Resample using linear interpolation (lightweight, OK for voice).
-        // 2) Channel convert:
-        //    - 1->2: duplicate mono to L/R
-        //    - >=2->1: average L+R (others ignored)
-        //    - M->N general: copy or clamp indices to fill channels
         private static int ConvertToTarget(float[] src, int floatCount, CSCore.WaveFormat srcFmt,
                                            int dstRate, int dstCh, ref float[] dst)
         {
@@ -706,7 +738,6 @@ namespace WasapiLoopMix
             }
             else
             {
-                // Generic channel mapping: copy existing channels; duplicate last if dst has more.
                 for (int f = 0; f < tempFrames; f++)
                 {
                     int si = f * srcCh;
@@ -718,34 +749,76 @@ namespace WasapiLoopMix
             return di2;
         }
 
-        // Convert normalized float samples [-1,1] to PCM16 little-endian bytes.
+        // Soft clipper: only engages when |x| > 1.0; uses tanh for a gentle knee then clamps to [-1,1].
+        private static float SoftClipIfNeeded(float x)
+        {
+            if (x > 1f || x < -1f) x = MathF.Tanh(x);
+            if (x > 1f) x = 1f; else if (x < -1f) x = -1f;
+            return x;
+        }
+
+        // ====== DITHERED 16-BIT QUANTIZATION ======
+        // TPDF (Triangular) dither: add (U1 - U2) * 1 LSB prior to rounding.
+        // Implementation detail:
+        //  - We operate in the integer domain right before rounding (scale by 32767).
+        //  - (rand1 - rand2) has triangular pdf in (-1, +1), i.e. ±1 LSB peak-to-peak.
+        //  - Cheap and thread-safe via ThreadLocal<Random>; avoids crunchy artefacts at very low levels.
+        private static readonly ThreadLocal<Random> _rng =
+            new ThreadLocal<Random>(() => new Random(unchecked(Environment.TickCount * 31 + Thread.CurrentThread.ManagedThreadId)));
+
         private static void FloatToPcm16(float[] src, byte[] dst, int count)
+        {
+            int j = 0;
+            var rng = _rng.Value!;
+            for (int i = 0; i < count; i++)
+            {
+                float v = src[i];
+                // Safety clamp to avoid NaNs or out-of-range
+                if (v > 1f) v = 1f; else if (v < -1f) v = -1f;
+
+                // Scale to integer domain
+                float scaled = v * 32767.0f;
+
+                // TPDF dither: two independent uniforms in [0,1), difference in (-1, +1)
+                float dither = (float)rng.NextDouble() - (float)rng.NextDouble();
+                float withDither = scaled + dither; // ±1 LSB peak-to-peak
+
+                int s = (int)MathF.Round(withDither);
+                if (s > short.MaxValue) s = short.MaxValue;
+                else if (s < short.MinValue) s = short.MinValue;
+
+                dst[j++] = (byte)(s & 0xFF);
+                dst[j++] = (byte)((s >> 8) & 0xFF);
+            }
+        }
+
+        // Convert normalized float [-1,1] to 32-bit signed PCM little-endian (no dither needed for 32-bit).
+        private static void FloatToPcm32(float[] src, byte[] dst, int count)
         {
             int j = 0;
             for (int i = 0; i < count; i++)
             {
                 float v = src[i];
                 if (v > 1f) v = 1f; else if (v < -1f) v = -1f;
-                short s = (short)Math.Round(v * short.MaxValue);
+                int s = (int)Math.Round(v * int.MaxValue);
                 dst[j++] = (byte)(s & 0xFF);
                 dst[j++] = (byte)((s >> 8) & 0xFF);
+                dst[j++] = (byte)((s >> 16) & 0xFF);
+                dst[j++] = (byte)((s >> 24) & 0xFF);
             }
         }
 
         // ===== Buffer helpers =====
-        // Ensures float[] has at least 'needed' length (rounded up to next power-of-two).
         private static void EnsureCapacity(ref float[] buf, int needed)
         {
             if (buf == null) buf = new float[NextPow2(needed)];
             else if (buf.Length < needed) Array.Resize(ref buf, NextPow2(needed));
         }
-        // Ensures byte[] has at least 'needed' length (rounded up to next power-of-two).
         private static void EnsureCapacity(ref byte[] buf, int needed)
         {
             if (buf == null) buf = new byte[NextPow2(needed)];
             else if (buf.Length < needed) Array.Resize(ref buf, NextPow2(needed));
         }
-        // Next power-of-two utility (min 256) to reduce frequent resizes.
         private static int NextPow2(int n)
         {
             if (n <= 0) return 256;
@@ -753,7 +826,6 @@ namespace WasapiLoopMix
             return n < 256 ? 256 : n;
         }
 
-        // Ensure the mic ring has room for 'roomNeeded' additional samples; if not, grow & preserve contents.
         private void EnsureRingCapacity(int roomNeeded)
         {
             if (_micRing.Length - _micCount >= roomNeeded) return;
@@ -771,7 +843,6 @@ namespace WasapiLoopMix
         }
 
         // ===== Logging & utils =====
-        // Non-fatal log open; failures are ignored to keep capture robust.
         private void OpenLog()
         {
             try
@@ -791,7 +862,6 @@ namespace WasapiLoopMix
         private void Warn(string msg)  => WriteLog("WARN",  msg);
         private void Error(string where, Exception ex) => WriteLog("ERROR", $"{where}: {ex}");
 
-        // Write a log line and mirror to Debug output; swallow errors to avoid impacting capture.
         private void WriteLog(string level, string msg, [CallerMemberName] string? where = null)
         {
             try
@@ -802,38 +872,63 @@ namespace WasapiLoopMix
             catch { }
         }
 
-        // Stop & dispose capture objects (loopback)
         private static void TryStopDispose(ref WasapiLoopbackCapture? cap)
         {
             try { cap?.Stop(); } catch { }
             try { cap?.Dispose(); } catch { }
             cap = null;
         }
-        // Stop & dispose capture objects (mic)
         private static void TryStopDispose(ref WasapiCapture? cap)
         {
             try { cap?.Stop(); } catch { }
             try { cap?.Dispose(); } catch { }
             cap = null;
         }
-        // Generic dispose helper
         private static void TryDispose<T>(ref T? obj) where T : class, IDisposable
         {
             try { obj?.Dispose(); } catch { }
             obj = null;
         }
-        // Best-effort delete (ignore failures due to sharing/permissions).
         private static void TryDelete(string path)
         {
             try { if (File.Exists(path)) File.Delete(path); } catch { }
         }
 
-        // UI status helper
         private void RaiseStatus(
             EngineStatusKind kind, string message, bool success = false,
             string? outputPathSystem = null, string? outputPathMic = null,
             string? outputPathMix = null, string? outputPathMp3 = null)
             => Status?.Invoke(this, new EngineStatusEventArgs(
                 kind, message, success, outputPathSystem, outputPathMic, outputPathMix, outputPathMp3));
+
+        // ===== Filename helper =====
+        // Given a desired path, return a version that does not clobber existing files by appending
+        // " (1)", " (2)", ... before the extension as needed.
+        private static string UniquePath(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return path;
+
+                var dir = Path.GetDirectoryName(path)!;
+                var name = Path.GetFileNameWithoutExtension(path);
+                var ext  = Path.GetExtension(path);
+
+                int i = 1;
+                string candidate;
+                do
+                {
+                    candidate = Path.Combine(dir, $"{name} ({i}){ext}");
+                    i++;
+                }
+                while (File.Exists(candidate));
+                return candidate;
+            }
+            catch
+            {
+                // If anything goes wrong, fall back to the original path (behavior prior to uniqueness).
+                return path;
+            }
+        }
     }
 }
