@@ -202,6 +202,13 @@ namespace WasapiLoopMix
         private double _micBacklogSecMax = 0.0;
         private const int BacklogLogEveryNBlocks = 50;
 
+        // ===== Level throttling (smooth, low-CPU UI meters, ~20 Hz per source) =====
+        private const double LevelThrottleMs = 50.0; // ~20 Hz
+        private long _lastLevelTickMic = 0;
+        private long _lastLevelTickSys = 0;
+        private float _peakSinceLastMic = 0f;
+        private float _peakSinceLastSys = 0f;
+
         private volatile bool _disposed;
 
         // ===== Public API =====
@@ -223,6 +230,9 @@ namespace WasapiLoopMix
 
                 _monitoring = true;
                 _lastLoopTick = Stopwatch.GetTimestamp();
+                _lastLevelTickMic = _lastLevelTickSys = _lastLoopTick; // initialize throttling timers
+                _peakSinceLastMic = _peakSinceLastSys = 0f;
+
                 RaiseStatus(EngineStatusKind.Info, "Monitoring…");
                 Info("Monitoring started");
             }
@@ -244,11 +254,7 @@ namespace WasapiLoopMix
             var baseName = Path.GetFileName(basePath);
             Directory.CreateDirectory(outDir);
 
-            // ----------------------------------------------------------------------------------------
-            // Non-clobbering filenames:
-            // If a file already exists, append " (1)", " (2)", ... before the extension.
-            // We do this for all outputs: system.wav, mic.wav, mix.wav, .mp3, and the .txt log.
-            // ----------------------------------------------------------------------------------------
+            // Non-clobbering filenames for all outputs & log.
             _pathSys = UniquePath(Path.Combine(outDir, $"{baseName}-system.wav"));
             _pathMic = UniquePath(Path.Combine(outDir, $"{baseName}-mic.wav"));
             _pathMix = UniquePath(Path.Combine(outDir, $"{baseName}-mix.wav"));
@@ -487,14 +493,23 @@ namespace WasapiLoopMix
 
                 int conv = ConvertToTarget(_micInBuf, got, _micSrc.WaveFormat, _outRate, _outChannels, ref _micConvBuf);
 
-                // meters
+                // meters (mic) — accumulate max since last UI tick, then emit at ~20 Hz
                 float peakMic = 0f;
                 for (int i = 0; i < conv; i++)
                 {
                     float av = MathF.Abs((float)(_micConvBuf[i] * MicGain));
                     if (av > peakMic) peakMic = av;
                 }
-                LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.Mic, peakMic, clipped:false));
+                if (peakMic > _peakSinceLastMic) _peakSinceLastMic = peakMic;
+
+                long nowTicks = Stopwatch.GetTimestamp();
+                double msSince = (nowTicks - _lastLevelTickMic) * _tickMs;
+                if (msSince >= LevelThrottleMs)
+                {
+                    LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.Mic, _peakSinceLastMic, clipped: false));
+                    _peakSinceLastMic = 0f;
+                    _lastLevelTickMic = nowTicks;
+                }
 
                 // Push to ring
                 lock (_micRingLock)
@@ -509,7 +524,7 @@ namespace WasapiLoopMix
                     }
                 }
 
-                // Always write mic WAV (16-bit PCM). We apply TPDF dither to reduce low-level distortion.
+                // Always write mic WAV (16-bit PCM with TPDF dither).
                 if (_recording && _wavMic != null)
                 {
                     EnsureCapacity(ref _pcm16Mic, conv * 2);
@@ -524,17 +539,17 @@ namespace WasapiLoopMix
                     double msSinceLoop = (now - _lastLoopTick) * _tickMs;
                     if (msSinceLoop > LoopSilentMsThreshold)
                     {
-                        // system zeros (16-bit PCM path; no need to dither silence)
+                        // system zeros
                         EnsureCapacity(ref _pcm16Sys, conv * 2);
                         Array.Clear(_pcm16Sys, 0, conv * 2);
                         _wavSys.Write(_pcm16Sys, 0, conv * 2);
 
-                        // mic-only mix (apply gain, 0.5 headroom, then soft-clip if needed)
+                        // mic-only mix (apply gain, 0.5 headroom, soft-clip)
                         EnsureCapacity(ref _mixBufF, conv);
                         for (int i = 0; i < conv; i++)
                         {
                             float m = (float)(_micConvBuf[i] * MicGain);
-                            float a = m * 0.5f; // consistent with (m + 0)/2 to keep headroom
+                            float a = m * 0.5f;
                             a = SoftClipIfNeeded(a);
                             _mixBufF[i] = a;
                         }
@@ -577,14 +592,23 @@ namespace WasapiLoopMix
                 int gotLoop = ReadExactSamples(_loopSrc, _loopBufF, wantFloats);
                 if (gotLoop <= 0) return;
 
-                // meters (system)
+                // meters (system) — accumulate max since last UI tick, then emit at ~20 Hz
                 float peakSys = 0f;
                 for (int i = 0; i < gotLoop; i++)
                 {
                     float av = MathF.Abs((float)(_loopBufF[i] * LoopGain));
                     if (av > peakSys) peakSys = av;
                 }
-                LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.System, peakSys, clipped:false));
+                if (peakSys > _peakSinceLastSys) _peakSinceLastSys = peakSys;
+
+                long nowTicks = Stopwatch.GetTimestamp();
+                double msSince = (nowTicks - _lastLevelTickSys) * _tickMs;
+                if (msSince >= LevelThrottleMs)
+                {
+                    LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.System, _peakSinceLastSys, clipped: false));
+                    _peakSinceLastSys = 0f;
+                    _lastLevelTickSys = nowTicks;
+                }
 
                 // Write raw system WAV (16-bit + TPDF dither)
                 if (_recording && _wavSys != null)
