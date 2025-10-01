@@ -1,6 +1,5 @@
-// file: WasapiLoopMix/RecorderEngine.cs
 // ----------------------------------------------------------------------------------------------------
-// PURPOSE (for LLMs and future maintainers)
+// PURPOSE
 // ----------------------------------------------------------------------------------------------------
 // This class records Windows system audio (WASAPI loopback) and, optionally, a microphone, in real-time.
 // It writes three WAV files during capture:
