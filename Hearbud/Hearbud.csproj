@@ -11,7 +11,7 @@
     <AssemblyName>Hearbud</AssemblyName>
     <RootNamespace>Hearbud</RootNamespace>
     <NoWarn>NU1701</NoWarn>
-    <Version>0.2.4</Version>
+    <Version>0.2.5</Version>
   </PropertyGroup>
 
   <ItemGroup>

@@ -53,6 +53,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Threading; // ThreadLocal<Random> for dither RNG
+using System.Threading.Tasks; // For async Stop
 using CSCore;
 using CSCore.Codecs.WAV;
 using CSCore.CoreAudioAPI;
@@ -78,7 +79,7 @@ namespace Hearbud
     }
 
     // High-level status for UI (info/errors/stopped summary).
-    public enum EngineStatusKind { Info, Error, Stopped }
+    public enum EngineStatusKind { Info, Error, Encoding, Stopped }
 
     // Detailed status payload; used to show paths and success in UI toasts.
     public sealed class EngineStatusEventArgs : EventArgs
@@ -129,6 +130,7 @@ namespace Hearbud
         // UI event hooks
         public event EventHandler<LevelChangedEventArgs>? LevelChanged;
         public event EventHandler<EngineStatusEventArgs>? Status;
+        public event EventHandler<int>? EncodingProgress; // Reports MP3 encoding progress (0-100)
 
         // CSCore capture objects for system loopback and mic.
         private WasapiLoopbackCapture? _loopCap;
@@ -300,10 +302,7 @@ namespace Hearbud
             Info("Recording started");
         }
 
-        // Stop recording and monitoring; encode MP3 from mix.wav.
-        // IMPORTANT: fully release ALL file handles (WAV, MP3, LOG) so the user can delete/move files
-        // while the app stays open and ready for another session.
-        public void Stop()
+        public async Task StopAsync()
         {
             if (_disposed) return;
 
@@ -316,31 +315,48 @@ namespace Hearbud
 
             _recording = false;
 
-            // Encode MP3 from the mix WAV (even if it’s mic-only mix).
+            // Signal UI that encoding is starting
+            RaiseStatus(EngineStatusKind.Encoding, "Encoding MP3…");
+
             Exception? encEx = null;
-            try
+            if (okMix && File.Exists(_pathMix))
             {
-                if (okMix && File.Exists(_pathMix))
+                await Task.Run(() =>
                 {
-                    Info($"Encoding MP3: {_pathMix} → {_pathMp3} @ {_kbps}kbps");
-                    using var reader = new WaveFileReader(_pathMix);
-                    using var encoder = MediaFoundationEncoder.CreateMP3Encoder(reader.WaveFormat, _pathMp3, _kbps * 1000);
-                    byte[] buf = new byte[1 << 16];
-                    int read;
-                    while ((read = reader.Read(buf, 0, buf.Length)) > 0)
-                        encoder.Write(buf, 0, read);
-                    okMp3 = File.Exists(_pathMp3) && new FileInfo(_pathMp3).Length > 0;
-                    Info($"MP3 encode ok={okMp3}");
-                }
-                else
-                {
-                    Info("Mix WAV missing or empty; skipping MP3 encode.");
-                }
+                    try
+                    {
+                        Info($"Encoding MP3: {_pathMix} → {_pathMp3} @ {_kbps}kbps");
+                        using var reader = new WaveFileReader(_pathMix);
+                        using var encoder = MediaFoundationEncoder.CreateMP3Encoder(reader.WaveFormat, _pathMp3, _kbps * 1000);
+                        
+                        long totalBytes = reader.Length;
+                        long bytesProcessed = 0;
+                        byte[] buf = new byte[1 << 16]; // 65536 bytes
+                        int read;
+                        
+                        while ((read = reader.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            encoder.Write(buf, 0, read);
+                            bytesProcessed += read;
+                            if (totalBytes > 0)
+                            {
+                                int percent = (int)((double)bytesProcessed * 100 / totalBytes);
+                                EncodingProgress?.Invoke(this, percent);
+                            }
+                        }
+                        okMp3 = File.Exists(_pathMp3) && new FileInfo(_pathMp3).Length > 0;
+                        Info($"MP3 encode ok={okMp3}");
+                    }
+                    catch (Exception ex)
+                    {
+                        encEx = ex;
+                        Error("MP3 encode", ex);
+                    }
+                });
             }
-            catch (Exception ex)
+            else
             {
-                encEx = ex;
-                Error("MP3 encode", ex);
+                Info("Mix WAV missing or empty; skipping MP3 encode.");
             }
 
             // Stop devices & unsubscribe callbacks (releases capture-related handles).

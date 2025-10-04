@@ -144,7 +144,11 @@
             <Separator Grid.Row="3" Grid.ColumnSpan="2" Margin="0,12,0,0"/>
             <DockPanel Grid.Row="4" Grid.ColumnSpan="2" Margin="0,8,0,0">
                 <TextBlock x:Name="VersionText" DockPanel.Dock="Right" Opacity="0.5" VerticalAlignment="Center"/>
-                <TextBlock x:Name="StatusText" Text="Ready to record" Opacity="0.8" />
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock x:Name="StatusText" Text="Ready to record" Opacity="0.8" />
+                    <ProgressBar x:Name="EncodingProgressBar" Width="120" Margin="15,0,0,0" Visibility="Collapsed" Minimum="0" Maximum="100"/>
+                    <TextBlock x:Name="EncodingProgressText" Text="0%" Margin="5,0,0,0" Visibility="Collapsed" FontFamily="Consolas"/>
+                </StackPanel>
             </DockPanel>
         </Grid>
     </DockPanel>

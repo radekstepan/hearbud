@@ -64,6 +64,7 @@ namespace Hearbud
 
                 _engine.LevelChanged += OnEngineLevelChanged;
                 _engine.Status += OnEngineStatus;
+                _engine.EncodingProgress += OnEngineEncodingProgress;
 
                 _uiTimer.Elapsed += (_, __) => Dispatcher.Invoke(UpdateMeters);
                 _uiTimer.Start();
@@ -243,10 +244,19 @@ namespace Hearbud
             }
         }
 
-        private void OnStop(object? sender, RoutedEventArgs? e)
+        private async void OnStop(object? sender, RoutedEventArgs? e)
         {
-            try { _engine.Stop(); }
-            catch (Exception ex) { CrashLog.LogAndShow("OnStop", ex); }
+            StopBtn.IsEnabled = false;
+            try 
+            {
+                await _engine.StopAsync(); 
+            }
+            catch (Exception ex) 
+            { 
+                CrashLog.LogAndShow("OnStop", ex);
+                StartBtn.IsEnabled = true;
+                StopBtn.IsEnabled = false;
+            }
         }
 
         private void OnGainChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -298,13 +308,33 @@ namespace Hearbud
             SysDb.Text = $"{Dbfs.ToDbfs(sp),6:0.0} dBFS";
         }
 
+        private void OnEngineEncodingProgress(object? sender, int percent)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                EncodingProgressBar.Value = percent;
+                EncodingProgressText.Text = $"{percent}%";
+            });
+        }
+
         private void OnEngineStatus(object? sender, EngineStatusEventArgs e)
         {
             Dispatcher.Invoke(() =>
             {
                 StatusText.Text = e.Message;
-                if (e.Kind == EngineStatusKind.Stopped)
+
+                if (e.Kind == EngineStatusKind.Encoding)
                 {
+                    EncodingProgressBar.Visibility = Visibility.Visible;
+                    EncodingProgressText.Visibility = Visibility.Visible;
+                    EncodingProgressBar.Value = 0;
+                    EncodingProgressText.Text = "0%";
+                }
+                else if (e.Kind == EngineStatusKind.Stopped)
+                {
+                    EncodingProgressBar.Visibility = Visibility.Collapsed;
+                    EncodingProgressText.Visibility = Visibility.Collapsed;
+
                     StartBtn.IsEnabled = true;
                     StopBtn.IsEnabled = false;
 
