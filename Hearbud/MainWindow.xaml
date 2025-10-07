@@ -46,17 +46,19 @@
                     <TextBlock Text="Base File Name (no extension)" Margin="0,12,0,0" FontWeight="SemiBold"/>
                     <TextBox x:Name="BaseNameText" Margin="0,4,0,0"/>
 
-                    <!-- MP3 Bitrate selector -->
-                    <TextBlock Text="MP3 Bitrate" Margin="0,12,0,0" FontWeight="SemiBold"/>
-                    <ComboBox x:Name="Mp3BitrateCombo" Margin="0,4,0,0"
+                    <!-- Output Quality selector -->
+                    <TextBlock Text="Output Quality" Margin="0,12,0,0" FontWeight="SemiBold"/>
+                    <ComboBox x:Name="OutputQualityCombo" Margin="0,4,0,0"
                               SelectedValuePath="Tag">
-                        <ComboBoxItem Content="96 kbps"  Tag="96"/>
-                        <ComboBoxItem Content="128 kbps" Tag="128"/>
-                        <ComboBoxItem Content="160 kbps" Tag="160"/>
-                        <ComboBoxItem Content="192 kbps" Tag="192"/>
-                        <ComboBoxItem Content="224 kbps" Tag="224"/>
-                        <ComboBoxItem Content="256 kbps" Tag="256"/>
-                        <ComboBoxItem Content="320 kbps" Tag="320"/>
+                        <ComboBoxItem Content="Original (WAV)" Tag="0"/>
+                        <Separator/>
+                        <ComboBoxItem Content="96 kbps (MP3)"  Tag="96"/>
+                        <ComboBoxItem Content="128 kbps (MP3)" Tag="128"/>
+                        <ComboBoxItem Content="160 kbps (MP3)" Tag="160"/>
+                        <ComboBoxItem Content="192 kbps (MP3)" Tag="192"/>
+                        <ComboBoxItem Content="224 kbps (MP3)" Tag="224"/>
+                        <ComboBoxItem Content="256 kbps (MP3)" Tag="256"/>
+                        <ComboBoxItem Content="320 kbps (MP3)" Tag="320"/>
                     </ComboBox>
                 </StackPanel>
             </GroupBox>

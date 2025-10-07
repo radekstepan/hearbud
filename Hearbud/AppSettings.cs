@@ -12,10 +12,12 @@ namespace Hearbud
         public string OutputDir { get; set; } =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings");
 
-        // Legacy display string kept for backward compat (no longer used directly).
-        public string Mp3Quality { get; set; } = "Good (192kbps)";
+        // Legacy display string kept for backward compat.
+        // When loading an old config, this is used to populate Mp3BitrateKbps.
+        // It is not actively used or saved by new versions.
+        public string? Mp3Quality { get; set; }
 
-        // New: exact bitrate value surfaced in UI.
+        // If 0, means "Original (WAV)". Otherwise, it's the MP3 bitrate.
         public int Mp3BitrateKbps { get; set; } = 192;
 
         public double MicGain { get; set; } = 1.0;
@@ -32,11 +34,17 @@ namespace Hearbud
                 if (File.Exists(ConfigPath))
                 {
                     var json = File.ReadAllText(ConfigPath);
+
+                    bool bitratePropertyExists;
+                    using (var doc = JsonDocument.Parse(json))
+                    {
+                        bitratePropertyExists = doc.RootElement.TryGetProperty(nameof(Mp3BitrateKbps), out _);
+                    }
+
                     var s = JsonSerializer.Deserialize<AppSettings>(json);
                     if (s != null)
                     {
-                        // If old configs only have Mp3Quality, try to parse a number out.
-                        if (s.Mp3BitrateKbps <= 0 && !string.IsNullOrWhiteSpace(s.Mp3Quality))
+                        if (!bitratePropertyExists && !string.IsNullOrWhiteSpace(s.Mp3Quality))
                         {
                             var digits = System.Text.RegularExpressions.Regex.Match(s.Mp3Quality, "(\\d+)");
                             if (digits.Success && int.TryParse(digits.Value, out var kb))
@@ -56,6 +64,8 @@ namespace Hearbud
         {
             try
             {
+                // To avoid confusion with legacy configs, we null out the old field.
+                this.Mp3Quality = null;
                 var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
                 File.WriteAllText(ConfigPath, json);
             }

@@ -6,7 +6,8 @@
 //   1) <base>-system.wav  - the raw system/loopback stream
 //   2) <base>-mic.wav     - the raw microphone stream (converted to match loopback format)
 //   3) <base>-mix.wav     - a simple averaged mix of system + mic (with user-controlled gains)
-// After stopping, it encodes the mix.wav to MP3 (<base>.mp3) using Media Foundation.
+// After stopping, it can optionally encode the mix.wav to MP3 (<base>.mp3) using Media Foundation.
+// If "Original" quality is selected, it skips the MP3 step.
 //
 // DESIGN INTENT
 // - Loopback (system) is the "clock source": whenever loopback provides a chunk, we pull a same-sized
@@ -111,7 +112,7 @@ namespace Hearbud
         public string LoopbackDeviceId { get; set; } = "";
         public string? MicDeviceId { get; set; }
         public bool IncludeMic { get; set; } = true; // mic always included
-        public int Mp3BitrateKbps { get; set; } = 192; // mix->MP3 bitrate
+        public int Mp3BitrateKbps { get; set; } = 192; // mix->MP3 bitrate, 0 for WAV
     }
 
     public sealed class RecorderEngine : IDisposable
@@ -257,7 +258,7 @@ namespace Hearbud
             if (_disposed) throw new ObjectDisposedException(nameof(RecorderEngine));
             Monitor(opts); // opens devices & starts callbacks
 
-            _kbps = Math.Clamp(opts.Mp3BitrateKbps, 64, 320);
+            _kbps = opts.Mp3BitrateKbps;
 
             var basePath = string.IsNullOrWhiteSpace(opts.OutputPath)
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings", $"rec-{DateTime.Now:yyyyMMdd_HHmmss}")
@@ -271,7 +272,14 @@ namespace Hearbud
             _pathSys = UniquePath(Path.Combine(outDir, $"{baseName}-system.wav"));
             _pathMic = UniquePath(Path.Combine(outDir, $"{baseName}-mic.wav"));
             _pathMix = UniquePath(Path.Combine(outDir, $"{baseName}-mix.wav"));
-            _pathMp3 = UniquePath(Path.Combine(outDir, $"{baseName}.mp3"));
+            if (_kbps > 0)
+            {
+                _pathMp3 = UniquePath(Path.Combine(outDir, $"{baseName}.mp3"));
+            }
+            else
+            {
+                _pathMp3 = "";
+            }
 
             _logPath = UniquePath(Path.Combine(outDir, $"{baseName}.txt"));
             OpenLog();
@@ -282,7 +290,14 @@ namespace Hearbud
             Info($"System WAV: {_pathSys}");
             Info($"Mic    WAV: {_pathMic}");
             Info($"Mix    WAV: {_pathMix} ({(_mixUse32Bit ? "32-bit PCM" : "16-bit PCM")})");
-            Info($"Mix   MP3 : {_pathMp3} @ {_kbps}kbps");
+            if (_kbps > 0)
+            {
+                Info($"Mix   MP3 : {_pathMp3} @ {_kbps}kbps");
+            }
+            else
+            {
+                Info("Output: Original WAV files only (no MP3 conversion)");
+            }
             Info($"Loopback fmt: sr={_outRate}, ch={_outChannels}");
 
             _wavSys = new WaveWriter(_pathSys, new CSCore.WaveFormat(_outRate, 16, _outChannels));
@@ -314,49 +329,59 @@ namespace Hearbud
             _wavSys = null; _wavMic = null; _wavMix = null;
 
             _recording = false;
-
-            // Signal UI that encoding is starting
-            RaiseStatus(EngineStatusKind.Encoding, "Encoding MP3…");
-
+            
+            bool doMp3Encoding = _kbps > 0;
             Exception? encEx = null;
-            if (okMix && File.Exists(_pathMix))
+
+            if (doMp3Encoding)
             {
-                await Task.Run(() =>
+                // Signal UI that encoding is starting
+                RaiseStatus(EngineStatusKind.Encoding, "Encoding MP3…");
+
+                if (okMix && File.Exists(_pathMix))
                 {
-                    try
+                    await Task.Run(() =>
                     {
-                        Info($"Encoding MP3: {_pathMix} → {_pathMp3} @ {_kbps}kbps");
-                        using var reader = new WaveFileReader(_pathMix);
-                        using var encoder = MediaFoundationEncoder.CreateMP3Encoder(reader.WaveFormat, _pathMp3, _kbps * 1000);
-                        
-                        long totalBytes = reader.Length;
-                        long bytesProcessed = 0;
-                        byte[] buf = new byte[1 << 16]; // 65536 bytes
-                        int read;
-                        
-                        while ((read = reader.Read(buf, 0, buf.Length)) > 0)
+                        try
                         {
-                            encoder.Write(buf, 0, read);
-                            bytesProcessed += read;
-                            if (totalBytes > 0)
+                            Info($"Encoding MP3: {_pathMix} → {_pathMp3} @ {_kbps}kbps");
+                            using var reader = new WaveFileReader(_pathMix);
+                            using var encoder = MediaFoundationEncoder.CreateMP3Encoder(reader.WaveFormat, _pathMp3, _kbps * 1000);
+                            
+                            long totalBytes = reader.Length;
+                            long bytesProcessed = 0;
+                            byte[] buf = new byte[1 << 16]; // 65536 bytes
+                            int read;
+                            
+                            while ((read = reader.Read(buf, 0, buf.Length)) > 0)
                             {
-                                int percent = (int)((double)bytesProcessed * 100 / totalBytes);
-                                EncodingProgress?.Invoke(this, percent);
+                                encoder.Write(buf, 0, read);
+                                bytesProcessed += read;
+                                if (totalBytes > 0)
+                                {
+                                    int percent = (int)((double)bytesProcessed * 100 / totalBytes);
+                                    EncodingProgress?.Invoke(this, percent);
+                                }
                             }
+                            okMp3 = File.Exists(_pathMp3) && new FileInfo(_pathMp3).Length > 0;
+                            Info($"MP3 encode ok={okMp3}");
                         }
-                        okMp3 = File.Exists(_pathMp3) && new FileInfo(_pathMp3).Length > 0;
-                        Info($"MP3 encode ok={okMp3}");
-                    }
-                    catch (Exception ex)
-                    {
-                        encEx = ex;
-                        Error("MP3 encode", ex);
-                    }
-                });
+                        catch (Exception ex)
+                        {
+                            encEx = ex;
+                            Error("MP3 encode", ex);
+                        }
+                    });
+                }
+                else
+                {
+                    Info("Mix WAV missing or empty; skipping MP3 encode.");
+                }
             }
             else
             {
-                Info("Mix WAV missing or empty; skipping MP3 encode.");
+                Info("Skipping MP3 encoding as per 'Original' quality setting.");
+                _pathMp3 = ""; // No MP3 path to report
             }
 
             // Stop devices & unsubscribe callbacks (releases capture-related handles).

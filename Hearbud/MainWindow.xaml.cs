@@ -411,12 +411,13 @@ namespace Hearbud
                 MicGain.Value  = _settings.MicGain;
                 LoopGain.Value = _settings.LoopGain;
 
-                // Select MP3 bitrate (default 192 if not found)
-                var desired = _settings.Mp3BitrateKbps <= 0 ? 192 : _settings.Mp3BitrateKbps;
-                Mp3BitrateCombo.SelectedValue = desired;
-                // If desired not in the list (custom), fall back to 192
-                if ((Mp3BitrateCombo.SelectedItem as ComboBoxItem) == null)
-                    Mp3BitrateCombo.SelectedValue = 192;
+                // Select Output Quality (0 for WAV, else MP3 bitrate)
+                var desired = _settings.Mp3BitrateKbps < 0 ? 192 : _settings.Mp3BitrateKbps;
+                OutputQualityCombo.SelectedValue = desired;
+                
+                // If desired value isn't in the list, fall back to 192.
+                if (OutputQualityCombo.SelectedItem as ComboBoxItem == null)
+                    OutputQualityCombo.SelectedValue = 192;
             }
             catch (Exception ex)
             {
@@ -428,16 +429,24 @@ namespace Hearbud
         {
             try
             {
-                if (Mp3BitrateCombo.SelectedItem is ComboBoxItem item &&
+                int kb = 192; // default
+                if (OutputQualityCombo.SelectedItem is ComboBoxItem item &&
                     item.Tag is string s &&
-                    int.TryParse(s, out var kb))
+                    int.TryParse(s, out var parsedKb))
                 {
-                    return Math.Clamp(kb, 64, 320);
+                    kb = parsedKb;
                 }
-                if (Mp3BitrateCombo.SelectedValue is int kbpsInt)
-                    return Math.Clamp(kbpsInt, 64, 320);
-                if (Mp3BitrateCombo.SelectedValue is string kbpsStr && int.TryParse(kbpsStr, out var kbpsParsed))
-                    return Math.Clamp(kbpsParsed, 64, 320);
+                else if (OutputQualityCombo.SelectedValue is int kbpsInt)
+                {
+                    kb = kbpsInt;
+                }
+                else if (OutputQualityCombo.SelectedValue is string kbpsStr && int.TryParse(kbpsStr, out var kbpsParsed))
+                {
+                    kb = kbpsParsed;
+                }
+
+                if (kb == 0) return 0; // Original (WAV)
+                return Math.Clamp(kb, 64, 320);
             }
             catch { }
             return 192;
