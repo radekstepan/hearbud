@@ -45,7 +45,30 @@ Record your PC’s **system audio (WASAPI loopback)** and your **microphone** at
 
 ## Build & Run
 
+### Development (run locally)
+
 ```bash
 dotnet restore
 dotnet run --project Hearbud/Hearbud.csproj
 ```
+
+### Production Build (for distribution)
+
+Build standalone executables for both x64 and ARM64 Windows:
+
+```bash
+# Build for x64 Windows (most common)
+dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+
+# Build for ARM64 Windows
+dotnet publish -c Release -r win-arm64 --self-contained -p:PublishSingleFile=true
+```
+
+**Output locations:**
+- x64: `Hearbud/bin/Release/net8.0-windows/win-x64/publish/Hearbud.exe`
+- ARM64: `Hearbud/bin/Release/net8.0-windows/win-arm64/publish/Hearbud.exe`
+
+**Notes:**
+- `--self-contained` includes .NET runtime (no installation required for users)
+- `-p:PublishSingleFile=true` creates a single .exe file
+- Distribute both versions if you want to support all Windows architectures

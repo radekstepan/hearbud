@@ -12,11 +12,18 @@
     <RootNamespace>Hearbud</RootNamespace>
     <NoWarn>NU1701</NoWarn>
     <Version>0.2.6</Version>
+    <ApplicationIcon>hearbud.ico</ApplicationIcon>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
     <PackageReference Include="CSCore" Version="1.2.1.2" />
+    <PackageReference Include="H.NotifyIcon.Wpf" Version="2.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="hearbud.ico" />
   </ItemGroup>
 
 </Project>

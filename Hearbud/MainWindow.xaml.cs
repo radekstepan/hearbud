@@ -12,6 +12,7 @@ using System.Windows.Controls; // ComboBoxItem
 
 using WpfMessageBox = System.Windows.MessageBox;
 using WinFormsFolderBrowserDialog = System.Windows.Forms.FolderBrowserDialog;
+using H.NotifyIcon;
 
 namespace Hearbud
 {
@@ -19,6 +20,7 @@ namespace Hearbud
     {
     private readonly RecorderEngine _engine = new();
     private readonly System.Timers.Timer _uiTimer = new(100);
+    private TaskbarIcon? _trayIcon;
 
     private AppSettings _settings = AppSettings.Load();
         private readonly Dictionary<string, MMDevice> _micDict = new();
@@ -37,6 +39,9 @@ namespace Hearbud
                 InputBindings.Add(new KeyBinding(ApplicationCommands.New, new KeyGesture(Key.R, ModifierKeys.Control)));
                 CommandBindings.Add(new CommandBinding(ApplicationCommands.Stop, (_, __) => OnStop(null, null)));
                 InputBindings.Add(new KeyBinding(ApplicationCommands.Stop, new KeyGesture(Key.S, ModifierKeys.Control)));
+
+                // Setup system tray icon
+                SetupTrayIcon();
 
                 Loaded += (_, __) =>
                 {
@@ -371,10 +376,70 @@ namespace Hearbud
             });
         }
 
+        private void SetupTrayIcon()
+        {
+            try
+            {
+                _trayIcon = new TaskbarIcon
+                {
+                    IconSource = new System.Windows.Media.Imaging.BitmapImage(new Uri("pack://application:,,,/hearbud.ico")),
+                    ToolTipText = "Hearbud - Audio Recorder"
+                };
+
+                // Left-click to show/hide window
+                _trayIcon.TrayLeftMouseUp += (s, e) =>
+                {
+                    if (IsVisible)
+                    {
+                        Hide();
+                    }
+                    else
+                    {
+                        Show();
+                        WindowState = WindowState.Normal;
+                        Activate();
+                    }
+                };
+
+                // Right-click context menu
+                var contextMenu = new System.Windows.Controls.ContextMenu();
+                
+                var showItem = new System.Windows.Controls.MenuItem { Header = "Show Window" };
+                showItem.Click += (s, e) =>
+                {
+                    Show();
+                    WindowState = WindowState.Normal;
+                    Activate();
+                };
+                contextMenu.Items.Add(showItem);
+
+                var exitItem = new System.Windows.Controls.MenuItem { Header = "Exit" };
+                exitItem.Click += (s, e) => System.Windows.Application.Current.Shutdown();
+                contextMenu.Items.Add(exitItem);
+
+                _trayIcon.ContextMenu = contextMenu;
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("SetupTrayIcon", ex);
+            }
+        }
+
+        protected override void OnStateChanged(EventArgs e)
+        {
+            base.OnStateChanged(e);
+            // Hide window when minimized (minimize to tray)
+            if (WindowState == WindowState.Minimized)
+            {
+                Hide();
+            }
+        }
+
         protected override void OnClosed(EventArgs e)
         {
             base.OnClosed(e);
             try { _uiTimer.Stop(); } catch { }
+            try { _trayIcon?.Dispose(); } catch { }
             try
             {
                 // Persist current UI selections
