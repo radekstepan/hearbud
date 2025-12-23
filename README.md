@@ -48,3 +48,4 @@ Record your PC’s **system audio (WASAPI loopback)** and your **microphone** at
 ```bash
 dotnet restore
 dotnet run --project Hearbud/Hearbud.csproj
+```
