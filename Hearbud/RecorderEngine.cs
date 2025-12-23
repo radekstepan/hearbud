@@ -346,23 +346,51 @@ namespace Hearbud
                         {
                             Info($"Encoding MP3: {_pathMix} → {_pathMp3} @ {_kbps}kbps");
                             using var reader = new WaveFileReader(_pathMix);
-                            using var encoder = MediaFoundationEncoder.CreateMP3Encoder(reader.WaveFormat, _pathMp3, _kbps * 1000);
-                            
-                            long totalBytes = reader.Length;
-                            long bytesProcessed = 0;
-                            byte[] buf = new byte[1 << 16]; // 65536 bytes
-                            int read;
-                            
-                            while ((read = reader.Read(buf, 0, buf.Length)) > 0)
+
+                            // Media Foundation MP3 encoder only accepts 16-bit PCM.
+                            // If the mix WAV is 32-bit, we must convert.
+                            IWaveSource source = reader;
+                            bool sourceNeedsDispose = false;
+                            CSCore.WaveFormat targetFormat = reader.WaveFormat;
+
+                            if (reader.WaveFormat.BitsPerSample != 16)
                             {
-                                encoder.Write(buf, 0, read);
-                                bytesProcessed += read;
-                                if (totalBytes > 0)
+                                Info($"Converting {reader.WaveFormat.BitsPerSample}-bit to 16-bit for MP3 encoder");
+                                // Convert to float first (handles any PCM bit depth)
+                                var sampleSrc = reader.ToSampleSource();
+                                // Then back to 16-bit PCM
+                                source = sampleSrc.ToWaveSource(16);
+                                sourceNeedsDispose = true;
+                                targetFormat = source.WaveFormat;
+                            }
+
+                            try
+                            {
+                                using var encoder = MediaFoundationEncoder.CreateMP3Encoder(targetFormat, _pathMp3, _kbps * 1000);
+
+                                long totalBytes = reader.Length;
+                                long bytesProcessed = 0;
+                                byte[] buf = new byte[1 << 16]; // 65536 bytes
+                                int read;
+
+                                while ((read = source.Read(buf, 0, buf.Length)) > 0)
                                 {
-                                    int percent = (int)((double)bytesProcessed * 100 / totalBytes);
-                                    EncodingProgress?.Invoke(this, percent);
+                                    encoder.Write(buf, 0, read);
+                                    bytesProcessed += read;
+                                    if (totalBytes > 0)
+                                    {
+                                        // Adjust progress for bit depth change (32->16 = 2x compression in bytes)
+                                        int percent = Math.Min(100, (int)((double)bytesProcessed * 100 / (totalBytes / (reader.WaveFormat.BitsPerSample / 16))));
+                                        EncodingProgress?.Invoke(this, percent);
+                                    }
                                 }
                             }
+                            finally
+                            {
+                                if (sourceNeedsDispose && source is IDisposable d)
+                                    d.Dispose();
+                            }
+
                             okMp3 = File.Exists(_pathMp3) && new FileInfo(_pathMp3).Length > 0;
                             Info($"MP3 encode ok={okMp3}");
                         }
