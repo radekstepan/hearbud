@@ -57,16 +57,19 @@ dotnet run --project Hearbud/Hearbud.csproj
 Build standalone executables for both x64 and ARM64 Windows:
 
 ```bash
+# Clean previous builds first (recommended)
+dotnet clean -c Release
+
 # Build for x64 Windows (most common)
-dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+dotnet publish Hearbud/Hearbud.csproj -c Release -r win-x64 --self-contained -o ./dist/win-x64
 
 # Build for ARM64 Windows
-dotnet publish -c Release -r win-arm64 --self-contained -p:PublishSingleFile=true
+dotnet publish Hearbud/Hearbud.csproj -c Release -r win-arm64 --self-contained -o ./dist/win-arm64
 ```
 
 **Output locations:**
-- x64: `Hearbud/bin/Release/net8.0-windows/win-x64/publish/Hearbud.exe`
-- ARM64: `Hearbud/bin/Release/net8.0-windows/win-arm64/publish/Hearbud.exe`
+- x64: `dist/win-x64/Hearbud.exe`
+- ARM64: `dist/win-arm64/Hearbud.exe`
 
 **Notes:**
 - `--self-contained` includes .NET runtime (no installation required for users)
