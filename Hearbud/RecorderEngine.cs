@@ -546,7 +546,7 @@ namespace Hearbud
             if (_monitoring)
             {
                 try { _loopIn!.DataAvailable -= OnLoopbackData; } catch { }
-                try { _micIn! .DataAvailable -= OnMicData; }      catch { }
+                try { if (_micIn != null) _micIn.DataAvailable -= OnMicData; } catch { }
                 TryStopDispose(ref _loopCap);
                 TryStopDispose(ref _micCap);
                 TryDispose(ref _loopIn);
@@ -983,7 +983,7 @@ namespace Hearbud
 
             _micRing = newBuf;
             _micR = 0;
-            _micW = _micCount % _micRing.Length;
+            _micW = _micCount;
         }
 
         private void OpenLog()
