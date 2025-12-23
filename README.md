@@ -75,3 +75,16 @@ dotnet publish Hearbud/Hearbud.csproj -c Release -r win-arm64 --self-contained -
 - `--self-contained` includes .NET runtime (no installation required for users)
 - `-p:PublishSingleFile=true` creates a single .exe file
 - Distribute both versions if you want to support all Windows architectures
+
+---
+
+## Documentation
+
+For detailed architecture, contributing guidelines, and troubleshooting, see [docs/](docs/) folder:
+
+- **[ARCHITECTURE](docs/ARCHITECTURE.md)** - System architecture, data flow, design decisions
+- **[WORKING_WITH_AUDIO](docs/WORKING_WITH_AUDIO.md)** - Audio/DSP theory, WASAPI specifics
+- **[CONTRIBUTING](docs/CONTRIBUTING.md)** - Development setup, code conventions
+- **[TROUBLESHOOTING](docs/TROUBLESHOOTING.md)** - Common issues and solutions
+
+---
