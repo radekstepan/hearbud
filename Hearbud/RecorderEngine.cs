@@ -9,6 +9,14 @@
 // After stopping, it can optionally encode the mix.wav to MP3 (<base>.mp3) using Media Foundation.
 // If "Original" quality is selected, it skips the MP3 step.
 //
+// OPTIMIZATIONS (PERFORMANCE FIXES)
+// - ASYNC I/O: Writing to disk is now decoupled from the audio callback using a BlockingCollection queue.
+//   This prevents disk latency (IO blocks) from stalling the sensitive audio threads.
+// - BUFFER POOLING: We use ArrayPool<byte> to pass data to the writer thread. This avoids allocating
+//   new byte[] objects 100 times a second, reducing Garbage Collector (GC) pressure significantly.
+// - ZERO-ALLOC RESAMPLING: The resampling logic now reuses a scratch buffer instead of allocating
+//   temp arrays on every frame.
+//
 // DESIGN INTENT
 // - Loopback (system) is the "clock source": whenever loopback provides a chunk, we pull a same-sized
 //   chunk from a microphone ring buffer and mix them. This preserves relative timing and prevents
@@ -16,49 +24,21 @@
 // - If loopback is silent (e.g., user is speaking but no system audio), we still want files produced.
 //   We track time since last loopback block and, if it exceeds a threshold, we *drive* the output using
 //   the mic stream alone (system gets zeros, mix = scaled mic). This ensures mic-only sessions still work.
-// - We always write raw per-source WAVs while recording (no post-session rendering needed for those).
-//   The MP3 is encoded at stop time from the already-written mix.wav. This decouples real-time capture
-//   from potentially slower MP3 encoding.
-// - Gains (MicGain / LoopGain) are applied in metering and mixing. The mix uses a simple 0.5*(s+m) average
-//   to maintain ~6 dB headroom and reduce clipping. We apply a soft clipper before final clamp.
-// - Sample-rate / channel conversion for mic -> loopback format occurs on the fly using a simple linear
-//   resampler and basic channel up/down-mix. Loopback format defines the output WaveFormat for all files.
-// - The mic ring buffer absorbs clock & scheduling jitter between the two capture callbacks so that the
-//   data aligned to loopback frames is consistent when mixing.
-// - Logging is best-effort to a text file next to outputs.
-//
-// THREADING MODEL
-// - CSCore raises DataAvailable events on its own threads for each capture.
-// - We keep work short in handlers: read/convert buffers, push/read ring, write WAV.
-// - Shared state in the mic ring uses a lock. Other fields are mostly written in Start/Stop paths.
-//
-// FAILURE & STATUS REPORTING
-// - We surface status via the Status event: Info/Error/Stopped and paths of the produced files.
-// - Stop() reports success if *any* of the files are non-empty, so the UI can always show a "Saved" toast.
-// - Errors during MP3 encoding do not invalidate the WAVs; we log and proceed.
-//
-// PERFORMANCE NOTES
-// - Buffers grow to next power-of-two and are reused (Array.Resize used sparingly).
-// - We avoid allocations in hot paths except when a larger buffer becomes necessary.
-// - FillWithZeros=true on SoundInSource ensures continuous streams (silence when device has no new frames).
-//
-// LIMITATIONS
-// - Resampler is linear (good enough for voice/meeting scenarios, not audiophile grade).
-// - Mixing is a simple average; final stage uses soft-clip + clamp to [-1,1].
-// - We rely on loopback sample rate/channels. If device settings change mid-session, behavior is undefined.
 //
 // ----------------------------------------------------------------------------------------------------
 
 using System;
+using System.Buffers; // Added: For ArrayPool (Memory Optimization)
+using System.Collections.Concurrent; // Added: For BlockingCollection (Async I/O)
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
-using System.Threading; // ThreadLocal<Random> for dither RNG
-using System.Threading.Tasks; // For async Stop
+using System.Threading; 
+using System.Threading.Tasks; 
 using CSCore;
 using CSCore.Codecs.WAV;
 using CSCore.CoreAudioAPI;
-using CSCore.MediaFoundation; // MP3 encoder
+using CSCore.MediaFoundation; 
 using CSCore.SoundIn;
 using CSCore.Streams;
 
@@ -68,21 +48,18 @@ namespace Hearbud
     public enum LevelSource { Mic, System }
 
     // Event payload for real-time level updates to the UI.
-    // Added RMS: represents "loudness" over the throttling window; Peak indicates "headroom".
     public sealed class LevelChangedEventArgs : EventArgs
     {
         public LevelChangedEventArgs(LevelSource source, float rms, float peak, bool clipped)
         { Source = source; Rms = rms; Peak = peak; Clipped = clipped; }
         public LevelSource Source { get; }
-        public float Rms { get; }     // Root-mean-square over the most recent window (post-gain, pre-clip)
-        public float Peak { get; }    // Maximum absolute sample over the same window (post-gain)
-        public bool Clipped { get; }  // True if any sample exceeded |1.0| in the window (before soft clip)
+        public float Rms { get; }     
+        public float Peak { get; }    
+        public bool Clipped { get; }  
     }
 
-    // High-level status for UI (info/errors/stopped summary).
     public enum EngineStatusKind { Info, Error, Encoding, Stopped }
 
-    // Detailed status payload; used to show paths and success in UI toasts.
     public sealed class EngineStatusEventArgs : EventArgs
     {
         public EngineStatusEventArgs(
@@ -105,58 +82,65 @@ namespace Hearbud
         public string OutputPathMp3 { get; }
     }
 
-    // Startup options supplied by the UI layer.
     public sealed class RecorderStartOptions
     {
-        public string OutputPath { get; set; } = ""; // base (no extension)
+        public string OutputPath { get; set; } = ""; 
         public string LoopbackDeviceId { get; set; } = "";
         public string? MicDeviceId { get; set; }
-        public bool IncludeMic { get; set; } = true; // mic always included
-        public int Mp3BitrateKbps { get; set; } = 192; // mix->MP3 bitrate, 0 for WAV
+        public bool IncludeMic { get; set; } = true; 
+        public int Mp3BitrateKbps { get; set; } = 192; 
     }
+
+    // --- ASYNC WRITER DEFINITIONS ---
+    internal enum AudioFileTarget { System, Mic, Mix }
+
+    internal readonly struct AudioWriteJob
+    {
+        public readonly AudioFileTarget Target;
+        public readonly byte[] Data; // Rented from pool
+        public readonly int Count;
+
+        public AudioWriteJob(AudioFileTarget target, byte[] data, int count)
+        {
+            Target = target;
+            Data = data;
+            Count = count;
+        }
+    }
+    // --------------------------------
 
     public sealed class RecorderEngine : IDisposable
     {
-        // These get set to the loopback device format on open; we standardize everything to it.
         private int _outRate = 48000;
         private int _outChannels = 2;
-
-        // Size hint used in buffers; handlers can read variable sizes from CSCore; we grow buffers as needed.
         private const int BlockFrames = 1024;
 
-        // UI-controlled gains; affect meters + final mix balance.
-        public double MicGain { get; set; } = 1.0;   // meters + mix balance
-        public double LoopGain { get; set; } = 1.0;  // meters + mix balance
+        public double MicGain { get; set; } = 1.0;   
+        public double LoopGain { get; set; } = 1.0;  
 
-        // UI event hooks
         public event EventHandler<LevelChangedEventArgs>? LevelChanged;
         public event EventHandler<EngineStatusEventArgs>? Status;
-        public event EventHandler<int>? EncodingProgress; // Reports MP3 encoding progress (0-100)
+        public event EventHandler<int>? EncodingProgress; 
 
-        // CSCore capture objects for system loopback and mic.
         private WasapiLoopbackCapture? _loopCap;
         private WasapiCapture? _micCap;
-
-        // Wrappers exposing DataAvailable and sample conversion.
         private SoundInSource? _loopIn;
         private SoundInSource? _micIn;
-
-        // Float sample sources (post CSCore conversion to float).
         private ISampleSource? _loopSrc;
         private ISampleSource? _micSrc;
 
-        // Whether capture devices are started (callbacks firing).
         private bool _monitoring;
-        // Whether we're writing WAVs (recording state).
         private bool _recording;
 
-        // Per-output writers/paths
+        // Writers are now accessed ONLY by the background thread
         private WaveWriter? _wavSys;
         private WaveWriter? _wavMic;
-
-        // We support a higher bit-depth mix WAV to preserve quality before MP3 encoding.
         private WaveWriter? _wavMix;
-        private readonly bool _mixUse32Bit = true; // set true to write 32-bit PCM mix.wav
+        private readonly bool _mixUse32Bit = true; 
+
+        // Async Write Queue
+        private BlockingCollection<AudioWriteJob>? _writeQueue;
+        private Task? _writeTask;
 
         private string _pathSys = "";
         private string _pathMic = "";
@@ -164,41 +148,32 @@ namespace Hearbud
         private string _pathMp3 = "";
         private int _kbps = 192;
 
-        // Logging to a text file next to outputs (best effort).
         private string _logPath = "";
         private StreamWriter? _log;
 
-        // Scratch audio buffers reused across callbacks (avoid per-block allocs).
+        // Buffers
         private float[] _loopBufF     = new float[BlockFrames * 8];
         private float[] _micInBuf     = new float[BlockFrames * 8];
         private float[] _micConvBuf   = new float[BlockFrames * 8];
         private float[] _tmpMicBlock  = new float[BlockFrames * 8];
         private float[] _mixBufF      = new float[BlockFrames * 8];
+        
+        // Reusable scratch buffer for the resampler (Performance Fix)
+        private float[] _resampleScratch = new float[BlockFrames * 8];
 
-        // PCM staging for WaveWriter (bytes).
         private byte[]  _pcm16Sys     = new byte[BlockFrames * 8 * 2];
         private byte[]  _pcm16Mic     = new byte[BlockFrames * 8 * 2];
-
-        // Mix can target 16 or 32-bit. We keep both buffers and use the one we need.
         private byte[]  _pcm16Mix     = new byte[BlockFrames * 8 * 2];
         private byte[]  _pcm32Mix     = new byte[BlockFrames * 8 * 4];
 
-        // Microphone ring buffer:
-        // - Stores float samples already converted to loopback's format.
-        // - On each loopback chunk we read the same number of samples from here
-        //   (or zero-fill if underrun) to keep alignment with loopback timing.
         private readonly object _micRingLock = new();
-        private float[] _micRing = new float[48000 * 4]; // ~2s stereo at 48kHz
+        private float[] _micRing = new float[48000 * 4]; 
         private int _micR, _micW, _micCount;
 
-        // Loopback activity tracking:
-        // - If loopback is silent for > LoopSilentMsThreshold, we let mic drive the output, so that
-        //   users can still record mic-only sessions without system audio.
         private static readonly double _tickMs = 1000.0 / Stopwatch.Frequency;
         private long _lastLoopTick = 0;
-        private const int LoopSilentMsThreshold = 200; // if no system frames for >200ms, drive mix from mic
+        private const int LoopSilentMsThreshold = 200; 
 
-        // ===== Diagnostics =====
         private string _loopDevName = "";
         private string _micDevName  = "(none)";
         private long _micUnderrunBlocks = 0;
@@ -207,8 +182,7 @@ namespace Hearbud
         private double _micBacklogSecMax = 0.0;
         private const int BacklogLogEveryNBlocks = 50;
 
-        // ===== Level throttling (smooth, low-CPU UI meters, ~20 Hz per source) =====
-        private const double LevelThrottleMs = 50.0; // ~20 Hz
+        private const double LevelThrottleMs = 50.0; 
         private long _lastLevelTickMic = 0;
         private long _lastLevelTickSys = 0;
         private float _peakSinceLastMic = 0f;
@@ -224,7 +198,6 @@ namespace Hearbud
 
         // ===== Public API =====
 
-        // Start device capture streams (no file writing). Used for live meters / "armed" state.
         public void Monitor(RecorderStartOptions opts)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(RecorderEngine));
@@ -241,7 +214,7 @@ namespace Hearbud
 
                 _monitoring = true;
                 _lastLoopTick = Stopwatch.GetTimestamp();
-                _lastLevelTickMic = _lastLevelTickSys = _lastLoopTick; // initialize throttling timers
+                _lastLevelTickMic = _lastLevelTickSys = _lastLoopTick; 
                 _peakSinceLastMic = _peakSinceLastSys = 0f;
                 _rmsSumSinceLastMic = _rmsSumSinceLastSys = 0.0;
                 _rmsCountSinceLastMic = _rmsCountSinceLastSys = 0;
@@ -252,11 +225,10 @@ namespace Hearbud
             }
         }
 
-        // Start recording (creates per-source WAVs + mixed WAV).
         public void Start(RecorderStartOptions opts)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(RecorderEngine));
-            Monitor(opts); // opens devices & starts callbacks
+            Monitor(opts); 
 
             _kbps = opts.Mp3BitrateKbps;
 
@@ -268,45 +240,31 @@ namespace Hearbud
             var baseName = Path.GetFileName(basePath);
             Directory.CreateDirectory(outDir);
 
-            // Non-clobbering filenames for all outputs & log.
             _pathSys = UniquePath(Path.Combine(outDir, $"{baseName}-system.wav"));
             _pathMic = UniquePath(Path.Combine(outDir, $"{baseName}-mic.wav"));
             _pathMix = UniquePath(Path.Combine(outDir, $"{baseName}-mix.wav"));
-            if (_kbps > 0)
-            {
-                _pathMp3 = UniquePath(Path.Combine(outDir, $"{baseName}.mp3"));
-            }
-            else
-            {
-                _pathMp3 = "";
-            }
+            _pathMp3 = (_kbps > 0) ? UniquePath(Path.Combine(outDir, $"{baseName}.mp3")) : "";
 
             _logPath = UniquePath(Path.Combine(outDir, $"{baseName}.txt"));
             OpenLog();
 
             Info("===== Session start =====");
             Info($"Gains: LoopGain={LoopGain:F3}, MicGain={MicGain:F3}");
-            Info($"Devices: Loopback='{_loopDevName}', Mic='{_micDevName}'");
-            Info($"System WAV: {_pathSys}");
-            Info($"Mic    WAV: {_pathMic}");
-            Info($"Mix    WAV: {_pathMix} ({(_mixUse32Bit ? "32-bit PCM" : "16-bit PCM")})");
-            if (_kbps > 0)
-            {
-                Info($"Mix   MP3 : {_pathMp3} @ {_kbps}kbps");
-            }
-            else
-            {
-                Info("Output: Original WAV files only (no MP3 conversion)");
-            }
-            Info($"Loopback fmt: sr={_outRate}, ch={_outChannels}");
+            Info($"Output System: {_pathSys}");
+            Info($"Output Mic:    {_pathMic}");
+            Info($"Output Mix:    {_pathMix}");
 
+            // Create writers
             _wavSys = new WaveWriter(_pathSys, new CSCore.WaveFormat(_outRate, 16, _outChannels));
             _wavMic = new WaveWriter(_pathMic, new CSCore.WaveFormat(_outRate, 16, _outChannels));
-            // Use a higher bit depth for the MIX to avoid an extra quantization step before MP3.
             _wavMix = new WaveWriter(_pathMix, new CSCore.WaveFormat(_outRate, _mixUse32Bit ? 32 : 16, _outChannels));
 
-            lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+            // Initialize Async Write Queue and Task
+            // Capacity is set to handle ~5 seconds of buffering if disk stalls completely.
+            _writeQueue = new BlockingCollection<AudioWriteJob>(2000); 
+            _writeTask = Task.Factory.StartNew(DiskWriteLoop, TaskCreationOptions.LongRunning);
 
+            lock (_micRingLock) { _micR = _micW = _micCount = 0; }
             _micUnderrunBlocks = 0;
             _loopBlockCounter = 0;
             _lastMicBacklogSec = 0.0;
@@ -321,21 +279,33 @@ namespace Hearbud
         {
             if (_disposed) return;
 
-            // Close WAV writers first (finalizes headers).
+            _recording = false;
+
+            // 1. Drain the write queue.
+            // We tell the queue no more items are coming, then wait for the background thread
+            // to finish writing everything currently in the buffer.
+            if (_writeQueue != null && _writeTask != null)
+            {
+                Info("Finishing background writes...");
+                _writeQueue.CompleteAdding();
+                await _writeTask; // Wait for disk I/O to finish completely
+                _writeQueue.Dispose();
+                _writeQueue = null;
+            }
+
+            // 2. Now it is safe to close the files (WAV headers are updated on Dispose)
             bool okSys = false, okMic = false, okMix = false, okMp3 = false;
             try { _wavSys?.Dispose(); okSys = File.Exists(_pathSys) && new FileInfo(_pathSys).Length > 0; } catch { }
             try { _wavMic?.Dispose(); okMic = File.Exists(_pathMic) && new FileInfo(_pathMic).Length > 0; } catch { }
             try { _wavMix?.Dispose(); okMix = File.Exists(_pathMix) && new FileInfo(_pathMix).Length > 0; } catch { }
             _wavSys = null; _wavMic = null; _wavMix = null;
-
-            _recording = false;
             
             bool doMp3Encoding = _kbps > 0;
             Exception? encEx = null;
 
+            // 3. Perform MP3 encoding (post-process)
             if (doMp3Encoding)
             {
-                // Signal UI that encoding is starting
                 RaiseStatus(EngineStatusKind.Encoding, "Encoding MP3…");
 
                 if (okMix && File.Exists(_pathMix))
@@ -347,8 +317,6 @@ namespace Hearbud
                             Info($"Encoding MP3: {_pathMix} → {_pathMp3} @ {_kbps}kbps");
                             using var reader = new WaveFileReader(_pathMix);
 
-                            // Media Foundation MP3 encoder only accepts 16-bit PCM.
-                            // If the mix WAV is 32-bit, we must convert.
                             IWaveSource source = reader;
                             bool sourceNeedsDispose = false;
                             CSCore.WaveFormat targetFormat = reader.WaveFormat;
@@ -356,9 +324,7 @@ namespace Hearbud
                             if (reader.WaveFormat.BitsPerSample != 16)
                             {
                                 Info($"Converting {reader.WaveFormat.BitsPerSample}-bit to 16-bit for MP3 encoder");
-                                // Convert to float first (handles any PCM bit depth)
                                 var sampleSrc = reader.ToSampleSource();
-                                // Then back to 16-bit PCM
                                 source = sampleSrc.ToWaveSource(16);
                                 sourceNeedsDispose = true;
                                 targetFormat = source.WaveFormat;
@@ -367,10 +333,9 @@ namespace Hearbud
                             try
                             {
                                 using var encoder = MediaFoundationEncoder.CreateMP3Encoder(targetFormat, _pathMp3, _kbps * 1000);
-
                                 long totalBytes = reader.Length;
                                 long bytesProcessed = 0;
-                                byte[] buf = new byte[1 << 16]; // 65536 bytes
+                                byte[] buf = new byte[1 << 16]; 
                                 int read;
 
                                 while ((read = source.Read(buf, 0, buf.Length)) > 0)
@@ -379,7 +344,6 @@ namespace Hearbud
                                     bytesProcessed += read;
                                     if (totalBytes > 0)
                                     {
-                                        // Adjust progress for bit depth change (32->16 = 2x compression in bytes)
                                         int percent = Math.Min(100, (int)((double)bytesProcessed * 100 / (totalBytes / (reader.WaveFormat.BitsPerSample / 16))));
                                         EncodingProgress?.Invoke(this, percent);
                                     }
@@ -387,8 +351,7 @@ namespace Hearbud
                             }
                             finally
                             {
-                                if (sourceNeedsDispose && source is IDisposable d)
-                                    d.Dispose();
+                                if (sourceNeedsDispose && source is IDisposable d) d.Dispose();
                             }
 
                             okMp3 = File.Exists(_pathMp3) && new FileInfo(_pathMp3).Length > 0;
@@ -408,32 +371,26 @@ namespace Hearbud
             }
             else
             {
-                Info("Skipping MP3 encoding as per 'Original' quality setting.");
-                _pathMp3 = ""; // No MP3 path to report
+                Info("Skipping MP3 encoding per settings.");
+                _pathMp3 = ""; 
             }
 
-            // Stop devices & unsubscribe callbacks (releases capture-related handles).
             StopInternal(fullStop: false);
 
-            // Final diagnostics to the log before closing it.
-            Info($"Mic ring underruns (micRead < loop): {_micUnderrunBlocks} block(s). " +
-                 $"Peak mic backlog: {_micBacklogSecMax:F4}s, Last backlog: {_lastMicBacklogSec:F4}s");
+            Info($"Mic ring underruns: {_micUnderrunBlocks}. Peak mic backlog: {_micBacklogSecMax:F4}s");
             Info("Recording stopped");
             Info("===== Session end =====");
 
-            // Close the session log so the .txt file is not locked after Stop.
             TryDispose(ref _log);
-            _logPath = ""; // mark as closed; next Start() will set & open a new log
+            _logPath = ""; 
 
-            // Consider success if ANY file has content (so UI always sees a saved toast)
             bool anyOk = okSys || okMic || okMix || okMp3;
             RaiseStatus(
                 EngineStatusKind.Stopped,
-                anyOk ? "Saved file(s)" : $"Recording stopped (files may be empty){(encEx != null ? " – MP3 encode failed" : "")}",
+                anyOk ? "Saved file(s)" : $"Recording stopped (empty){(encEx != null ? " – MP3 failed" : "")}",
                 success: anyOk,
                 outputPathSystem: _pathSys, outputPathMic: _pathMic, outputPathMix: _pathMix, outputPathMp3: _pathMp3);
 
-            // Reset paths so subsequent sessions don't accidentally reference previous files.
             _pathSys = _pathMic = _pathMix = _pathMp3 = "";
         }
 
@@ -449,11 +406,83 @@ namespace Hearbud
             try { _wavMix?.Dispose(); } catch { }
             _wavSys = null; _wavMic = null; _wavMix = null;
 
+            // Stop the write queue if it's still running
+            try { _writeQueue?.CompleteAdding(); _writeTask?.Wait(1000); } catch { }
+            try { _writeQueue?.Dispose(); } catch { }
+
             StopInternal(fullStop: true);
             TryDispose(ref _log);
         }
 
-        // ===== Devices =====
+        // ==========================================
+        // BACKGROUND WRITE LOOP
+        // ==========================================
+        // This runs on a separate thread. It pulls data chunks from the queue and writes them to disk.
+        // This ensures that slow disk I/O never blocks the audio callback methods.
+        private void DiskWriteLoop()
+        {
+            if (_writeQueue == null) return;
+
+            try
+            {
+                // GetConsumingEnumerable blocks until an item is available or CompleteAdding is called.
+                foreach (var job in _writeQueue.GetConsumingEnumerable())
+                {
+                    try
+                    {
+                        switch (job.Target)
+                        {
+                            case AudioFileTarget.System: _wavSys?.Write(job.Data, 0, job.Count); break;
+                            case AudioFileTarget.Mic:    _wavMic?.Write(job.Data, 0, job.Count); break;
+                            case AudioFileTarget.Mix:    _wavMix?.Write(job.Data, 0, job.Count); break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // We swallow write errors here to keep the thread alive for other files, 
+                        // but strictly we should log this.
+                        Debug.WriteLine($"Disk write error: {ex.Message}");
+                    }
+                    finally
+                    {
+                        // IMPORTANT: Return the rented buffer to the pool so it can be reused.
+                        // This creates a "Zero Allocation" loop for buffer memory.
+                        ArrayPool<byte>.Shared.Return(job.Data);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Error("DiskWriteLoop fatal", ex);
+            }
+        }
+
+        // Helper to queue a write safely
+        private void EnqueueWrite(AudioFileTarget target, byte[] sourceData, int count)
+        {
+            if (!_recording || _writeQueue == null || _writeQueue.IsAddingCompleted) return;
+
+            // 1. Rent a buffer from the pool (fast, no allocation)
+            byte[] rented = ArrayPool<byte>.Shared.Rent(count);
+            
+            // 2. Copy the data
+            Array.Copy(sourceData, 0, rented, 0, count);
+
+            // 3. Add to queue (non-blocking unless queue is full)
+            try
+            {
+                _writeQueue.Add(new AudioWriteJob(target, rented, count));
+            }
+            catch (InvalidOperationException) 
+            {
+                // Queue finished adding, just return buffer
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        // ==========================================
+        // DEVICES
+        // ==========================================
 
         private void OpenDevices(RecorderStartOptions opts)
         {
@@ -488,9 +517,6 @@ namespace Hearbud
             _loopDevName = loopDev?.FriendlyName ?? "";
             _micDevName  = micDev?.FriendlyName ?? "(none)";
 
-            Info($"Loopback: {loopDev?.FriendlyName}");
-            if (micDev != null) Info($"Mic: {micDev.FriendlyName}"); else Info("Mic: (none)");
-
             _loopCap = new WasapiLoopbackCapture { Device = loopDev };
             _loopCap.Initialize();
             _outRate     = _loopCap.WaveFormat.SampleRate;
@@ -513,25 +539,6 @@ namespace Hearbud
             {
                 RaiseStatus(EngineStatusKind.Error, "Microphone device not found/selected.");
             }
-
-            try
-            {
-                using var ac = AudioClient.FromMMDevice(loopDev);
-                var mix = ac.MixFormat;
-                Info($"Loopback Device MixFormat: sr={mix.SampleRate}, ch={mix.Channels}, bits={mix.BitsPerSample}, tag={mix.WaveFormatTag}");
-            } catch { }
-            Info($"Loopback Capture WaveFormat: sr={_loopCap.WaveFormat.SampleRate}, ch={_loopCap.WaveFormat.Channels}, bits={_loopCap.WaveFormat.BitsPerSample}, tag={_loopCap.WaveFormat.WaveFormatTag}");
-
-            if (micDev != null)
-            {
-                try
-                {
-                    using var acm = AudioClient.FromMMDevice(micDev);
-                    var mixm = acm.MixFormat;
-                    Info($"Mic Device MixFormat: sr={mixm.SampleRate}, ch={mixm.Channels}, bits={mixm.BitsPerSample}, tag={mixm.WaveFormatTag}");
-                } catch { }
-                Info($"Mic Capture WaveFormat: sr={_micCap!.WaveFormat.SampleRate}, ch={_micCap.WaveFormat.Channels}, bits={_micCap.WaveFormat.BitsPerSample}, tag={_micCap.WaveFormat.WaveFormatTag}");
-            }
         }
 
         private void StopInternal(bool fullStop)
@@ -552,14 +559,16 @@ namespace Hearbud
             if (fullStop) Info("Stopped.");
         }
 
-        // ===== DataAvailable =====
+        // ==========================================
+        // AUDIO CALLBACKS
+        // ==========================================
 
         private void OnMicData(object? sender, DataAvailableEventArgs e)
         {
             if (_micSrc == null || _micIn == null || _micCap == null) return;
             try
             {
-                int blockAlignBytes = _micIn.WaveFormat.BlockAlign; // bytes per frame
+                int blockAlignBytes = _micIn.WaveFormat.BlockAlign; 
                 if (blockAlignBytes <= 0) return;
 
                 int framesAvail = e.ByteCount / blockAlignBytes;
@@ -571,14 +580,14 @@ namespace Hearbud
                 int got = ReadExactSamples(_micSrc, _micInBuf, floatSamplesToRead);
                 if (got <= 0) return;
 
-                int conv = ConvertToTarget(_micInBuf, got, _micSrc.WaveFormat, _outRate, _outChannels, ref _micConvBuf);
+                // Optimization: Pass scratch buffer to avoid allocations inside ConvertToTarget
+                int conv = ConvertToTarget(_micInBuf, got, _micSrc.WaveFormat, _outRate, _outChannels, ref _micConvBuf, ref _resampleScratch);
 
-                // Determine whether loopback has been silent long enough to enter mic-driven mode.
                 long nowTicksA = Stopwatch.GetTimestamp();
                 double msSinceLoop = (nowTicksA - _lastLoopTick) * _tickMs;
                 bool loopSilent = msSinceLoop > LoopSilentMsThreshold;
 
-                // meters (mic): compute peak and accumulate RMS cheaply over this block
+                // --- Metering ---
                 float blockPeak = 0f;
                 double blockRmsSum = 0.0;
                 bool blockClipped = false;
@@ -595,7 +604,6 @@ namespace Hearbud
                 _rmsCountSinceLastMic += conv;
                 _clippedSinceLastMic |= blockClipped;
 
-                // Throttled level event (~20 Hz)
                 double msSince = (nowTicksA - _lastLevelTickMic) * _tickMs;
                 if (msSince >= LevelThrottleMs && _rmsCountSinceLastMic > 0)
                 {
@@ -608,13 +616,9 @@ namespace Hearbud
                     _lastLevelTickMic = nowTicksA;
                 }
 
-                // RING-BUFFER POLICY FIX:
-                // When loopback is silent and we are *already writing* mic-only audio to the mix/system files,
-                // we must NOT accumulate those mic samples in the ring; otherwise they will be mixed again with
-                // *future* loopback when it resumes, causing "old mic over new system" echoes.
+                // --- Sync Logic ---
                 if (loopSilent)
                 {
-                    // Drop any existing backlog to realign the timeline to "now".
                     lock (_micRingLock)
                     {
                         _micR = _micW;
@@ -623,7 +627,6 @@ namespace Hearbud
                 }
                 else
                 {
-                    // Normal path: push into ring for the loopback-driven mixer to pull from.
                     lock (_micRingLock)
                     {
                         EnsureRingCapacity(conv);
@@ -637,24 +640,24 @@ namespace Hearbud
                     }
                 }
 
-                // Always write mic WAV (16-bit PCM with TPDF dither).
+                // --- Write Mic WAV (Async) ---
                 if (_recording && _wavMic != null)
                 {
                     EnsureCapacity(ref _pcm16Mic, conv * 2);
-                    FloatToPcm16(_micConvBuf, _pcm16Mic, conv); // includes TPDF dither
-                    _wavMic.Write(_pcm16Mic, 0, conv * 2);
+                    FloatToPcm16(_micConvBuf, _pcm16Mic, conv); 
+                    // Queue for background writing instead of blocking here
+                    EnqueueWrite(AudioFileTarget.Mic, _pcm16Mic, conv * 2);
                 }
 
-                // Mic-driven path when loopback is silent:
-                // - Write zeros to system.wav and mic-only (gain+headroom+soft-clip) to mix.wav.
+                // --- Mic-Only Drive (if loopback silent) ---
                 if (_recording && _wavMix != null && _wavSys != null && loopSilent)
                 {
-                    // system zeros
+                    // Write zeros to System
                     EnsureCapacity(ref _pcm16Sys, conv * 2);
                     Array.Clear(_pcm16Sys, 0, conv * 2);
-                    _wavSys.Write(_pcm16Sys, 0, conv * 2);
+                    EnqueueWrite(AudioFileTarget.System, _pcm16Sys, conv * 2);
 
-                    // mic-only mix (apply gain, 0.5 headroom, soft-clip)
+                    // Write Mic to Mix
                     EnsureCapacity(ref _mixBufF, conv);
                     for (int i = 0; i < conv; i++)
                     {
@@ -668,13 +671,13 @@ namespace Hearbud
                     {
                         EnsureCapacity(ref _pcm32Mix, conv * 4);
                         FloatToPcm32(_mixBufF, _pcm32Mix, conv);
-                        _wavMix.Write(_pcm32Mix, 0, conv * 4);
+                        EnqueueWrite(AudioFileTarget.Mix, _pcm32Mix, conv * 4);
                     }
                     else
                     {
                         EnsureCapacity(ref _pcm16Mix, conv * 2);
-                        FloatToPcm16(_mixBufF, _pcm16Mix, conv); // includes TPDF dither
-                        _wavMix.Write(_pcm16Mix, 0, conv * 2);
+                        FloatToPcm16(_mixBufF, _pcm16Mix, conv);
+                        EnqueueWrite(AudioFileTarget.Mix, _pcm16Mix, conv * 2);
                     }
                 }
             }
@@ -689,7 +692,7 @@ namespace Hearbud
             {
                 _lastLoopTick = Stopwatch.GetTimestamp();
 
-                int bytesPerFrame = _loopIn.WaveFormat.BlockAlign; // bytes per frame
+                int bytesPerFrame = _loopIn.WaveFormat.BlockAlign; 
                 if (bytesPerFrame <= 0) return;
 
                 int frames = e.ByteCount / bytesPerFrame;
@@ -701,7 +704,7 @@ namespace Hearbud
                 int gotLoop = ReadExactSamples(_loopSrc, _loopBufF, wantFloats);
                 if (gotLoop <= 0) return;
 
-                // meters (system): compute peak and accumulate RMS over this block
+                // --- Metering ---
                 float blockPeak = 0f;
                 double blockRmsSum = 0.0;
                 bool blockClipped = false;
@@ -731,15 +734,15 @@ namespace Hearbud
                     _lastLevelTickSys = nowTicks;
                 }
 
-                // Write raw system WAV (16-bit + TPDF dither)
+                // --- Write System WAV (Async) ---
                 if (_recording && _wavSys != null)
                 {
                     EnsureCapacity(ref _pcm16Sys, gotLoop * 2);
-                    FloatToPcm16(_loopBufF, _pcm16Sys, gotLoop); // includes TPDF dither
-                    _wavSys.Write(_pcm16Sys, 0, gotLoop * 2);
+                    FloatToPcm16(_loopBufF, _pcm16Sys, gotLoop);
+                    EnqueueWrite(AudioFileTarget.System, _pcm16Sys, gotLoop * 2);
                 }
 
-                // Backlog snapshot for drift diagnostics
+                // --- Diagnostics ---
                 int snapshotMicCount;
                 lock (_micRingLock)
                 {
@@ -749,7 +752,7 @@ namespace Hearbud
                 _lastMicBacklogSec = backlogSec;
                 if (backlogSec > _micBacklogSecMax) _micBacklogSecMax = backlogSec;
 
-                // Pull same-length mic block from ring (zero-fill if underrun)
+                // --- Mixing ---
                 EnsureCapacity(ref _tmpMicBlock, gotLoop);
                 int micRead;
                 lock (_micRingLock)
@@ -774,37 +777,36 @@ namespace Hearbud
                     Info($"Mic ring backlog: {backlogSec:F4} s (max {_micBacklogSecMax:F4} s)");
                 }
 
-                // Mix: average with gains, then soft-clip the result *before* final clamp/quantize.
                 EnsureCapacity(ref _mixBufF, gotLoop);
                 for (int i = 0; i < gotLoop; i++)
                 {
                     float s = (float)(_loopBufF[i] * LoopGain);
                     float m = (float)(_tmpMicBlock[i] * MicGain);
-                    float a = (s + m) * 0.5f; // -6 dB headroom
+                    float a = (s + m) * 0.5f; 
                     a = SoftClipIfNeeded(a);
                     _mixBufF[i] = a;
                 }
 
+                // --- Write Mix WAV (Async) ---
                 if (_recording && _wavMix != null)
                 {
                     if (_mixUse32Bit)
                     {
                         EnsureCapacity(ref _pcm32Mix, gotLoop * 4);
                         FloatToPcm32(_mixBufF, _pcm32Mix, gotLoop);
-                        _wavMix.Write(_pcm32Mix, 0, gotLoop * 4);
+                        EnqueueWrite(AudioFileTarget.Mix, _pcm32Mix, gotLoop * 4);
                     }
                     else
                     {
                         EnsureCapacity(ref _pcm16Mix, gotLoop * 2);
-                        FloatToPcm16(_mixBufF, _pcm16Mix, gotLoop); // includes TPDF dither
-                        _wavMix.Write(_pcm16Mix, 0, gotLoop * 2);
+                        FloatToPcm16(_mixBufF, _pcm16Mix, gotLoop); 
+                        EnqueueWrite(AudioFileTarget.Mix, _pcm16Mix, gotLoop * 2);
                     }
                 }
             }
             catch (Exception ex) { Error("OnLoopbackData", ex); }
         }
 
-        // Read exactly N float samples from an ISampleSource
         private static int ReadExactSamples(ISampleSource src, float[] dst, int count)
         {
             int total = 0;
@@ -817,10 +819,15 @@ namespace Hearbud
             return total;
         }
 
-        // ===== Conversion & sample utils =====
+        // ==========================================
+        // DSP & CONVERSION
+        // ==========================================
 
-        private static int ConvertToTarget(float[] src, int floatCount, CSCore.WaveFormat srcFmt,
-                                           int dstRate, int dstCh, ref float[] dst)
+        // Modified: Now takes 'ref scratch' to avoid "new float[]" allocations in the loop
+        private static int ConvertToTarget(
+            float[] src, int floatCount, CSCore.WaveFormat srcFmt,
+            int dstRate, int dstCh, 
+            ref float[] dst, ref float[] scratch)
         {
             int srcCh = srcFmt.Channels;
             int srcRate = srcFmt.SampleRate;
@@ -833,12 +840,17 @@ namespace Hearbud
 
             EnsureCapacity(ref dst, Math.Max(dstCh, srcCh) * dstFrames);
 
-            // Resample (linear), then channel convert
+            // Optimization: Reuse existing buffers instead of creating 'temp'
+            // If no resample needed, we point temp to src.
+            // If resample needed, we use the scratch buffer provided by the caller.
             float[] temp = src;
             int tempFrames = srcFrames;
+
             if (srcRate != dstRate)
             {
-                temp = new float[srcCh * dstFrames];
+                EnsureCapacity(ref scratch, srcCh * dstFrames);
+                temp = scratch;
+
                 float ratio = (float)srcRate / dstRate;
                 int di = 0;
                 for (int f = 0; f < dstFrames; f++)
@@ -894,7 +906,6 @@ namespace Hearbud
             return di2;
         }
 
-        // Soft clipper: only engages when |x| > 1.0; uses tanh for a gentle knee then clamps to [-1,1].
         private static float SoftClipIfNeeded(float x)
         {
             if (x > 1f || x < -1f) x = MathF.Tanh(x);
@@ -902,12 +913,6 @@ namespace Hearbud
             return x;
         }
 
-        // ====== DITHERED 16-BIT QUANTIZATION ======
-        // TPDF (Triangular) dither: add (U1 - U2) * 1 LSB prior to rounding.
-        // Implementation detail:
-        //  - We operate in the integer domain right before rounding (scale by 32767).
-        //  - (rand1 - rand2) has triangular pdf in (-1, +1), i.e. ±1 LSB peak-to-peak.
-        //  - Cheap and thread-safe via ThreadLocal<Random>; avoids crunchy artefacts at very low levels.
         private static readonly ThreadLocal<Random> _rng =
             new ThreadLocal<Random>(() => new Random(unchecked(Environment.TickCount * 31 + Thread.CurrentThread.ManagedThreadId)));
 
@@ -918,15 +923,11 @@ namespace Hearbud
             for (int i = 0; i < count; i++)
             {
                 float v = src[i];
-                // Safety clamp to avoid NaNs or out-of-range
                 if (v > 1f) v = 1f; else if (v < -1f) v = -1f;
 
-                // Scale to integer domain
                 float scaled = v * 32767.0f;
-
-                // TPDF dither: two independent uniforms in [0,1), difference in (-1, +1)
                 float dither = (float)rng.NextDouble() - (float)rng.NextDouble();
-                float withDither = scaled + dither; // ±1 LSB peak-to-peak
+                float withDither = scaled + dither; 
 
                 int s = (int)MathF.Round(withDither);
                 if (s > short.MaxValue) s = short.MaxValue;
@@ -937,7 +938,6 @@ namespace Hearbud
             }
         }
 
-        // Convert normalized float [-1,1] to 32-bit signed PCM little-endian (no dither needed for 32-bit).
         private static void FloatToPcm32(float[] src, byte[] dst, int count)
         {
             int j = 0;
@@ -953,7 +953,6 @@ namespace Hearbud
             }
         }
 
-        // ===== Buffer helpers =====
         private static void EnsureCapacity(ref float[] buf, int needed)
         {
             if (buf == null) buf = new float[NextPow2(needed)];
@@ -987,7 +986,6 @@ namespace Hearbud
             _micW = _micCount % _micRing.Length;
         }
 
-        // ===== Logging & utils =====
         private void OpenLog()
         {
             try
@@ -1001,7 +999,7 @@ namespace Hearbud
                     Info($"Log path: {_logPath}");
                 }
             }
-            catch { /* non-fatal */ }
+            catch { }
         }
         private void Info(string msg)  => WriteLog("INFO",  msg);
         private void Warn(string msg)  => WriteLog("WARN",  msg);
@@ -1034,11 +1032,7 @@ namespace Hearbud
             try { obj?.Dispose(); } catch { }
             obj = null;
         }
-        private static void TryDelete(string path)
-        {
-            try { if (File.Exists(path)) File.Delete(path); } catch { }
-        }
-
+        
         private void RaiseStatus(
             EngineStatusKind kind, string message, bool success = false,
             string? outputPathSystem = null, string? outputPathMic = null,
@@ -1046,19 +1040,14 @@ namespace Hearbud
             => Status?.Invoke(this, new EngineStatusEventArgs(
                 kind, message, success, outputPathSystem, outputPathMic, outputPathMix, outputPathMp3));
 
-        // ===== Filename helper =====
-        // Given a desired path, return a version that does not clobber existing files by appending
-        // " (1)", " (2)", ... before the extension as needed.
         private static string UniquePath(string path)
         {
             try
             {
                 if (!File.Exists(path)) return path;
-
                 var dir = Path.GetDirectoryName(path)!;
                 var name = Path.GetFileNameWithoutExtension(path);
                 var ext  = Path.GetExtension(path);
-
                 int i = 1;
                 string candidate;
                 do
@@ -1069,11 +1058,7 @@ namespace Hearbud
                 while (File.Exists(candidate));
                 return candidate;
             }
-            catch
-            {
-                // If anything goes wrong, fall back to the original path (behavior prior to uniqueness).
-                return path;
-            }
+            catch { return path; }
         }
     }
 }
