@@ -29,7 +29,10 @@
             <GroupBox Grid.Row="0" Grid.Column="0" Header="Audio Devices" Margin="0,0,8,4">
                 <StackPanel Margin="6">
                     <TextBlock Text="Microphone (Input)" FontWeight="SemiBold"/>
-                    <ComboBox x:Name="MicCombo" Margin="0,4,0,0"/>
+                    <ComboBox x:Name="MicCombo" 
+                              Margin="0,4,0,0"
+                              AutomationProperties.Name="Microphone Selection"
+                              AutomationProperties.HelpText="Select the microphone to record from"/>
                     <TextBlock Text="Audio Output (to capture)" Margin="0,12,0,0" FontWeight="SemiBold"/>
                     <ComboBox x:Name="SpeakerCombo" Margin="0,4,0,0"/>
                 </StackPanel>
@@ -113,7 +116,9 @@
                             <ColumnDefinition Width="50"/>
                         </Grid.ColumnDefinitions>
                         <TextBlock Grid.Column="0" Text="Mic" VerticalAlignment="Center" FontWeight="SemiBold"/>
-                        <ProgressBar Grid.Column="1" x:Name="MicBar" Minimum="0" Maximum="100" Margin="10,0"/>
+                        <ProgressBar Grid.Column="1" x:Name="MicBar" Minimum="0" Maximum="100" Margin="10,0"
+                                     AutomationProperties.Name="Microphone Level"
+                                     AutomationProperties.LiveSetting="Polite"/>
                         <TextBlock Grid.Column="2" x:Name="MicDb" TextAlignment="Right" FontFamily="Consolas" VerticalAlignment="Center"/>
                         <TextBlock Grid.Column="3" x:Name="MicClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="Center" Margin="8,0,0,0" FontWeight="Bold"/>
                     </Grid>
@@ -138,7 +143,9 @@
             <StackPanel Orientation="Horizontal" Grid.Row="2" Grid.ColumnSpan="2" Margin="0,8,0,0">
                 <Button x:Name="RefreshBtn" Content="Refresh Devices" Click="OnRefreshDevices"/>
                 <Button x:Name="StartBtn" Content="Start Recording (Ctrl+R)" Click="OnStart" Margin="8,0,0,0"
-                        Style="{StaticResource AccentButton}"/>
+                        Style="{StaticResource AccentButton}"
+                        AutomationProperties.Name="Start Recording"
+                        AutomationProperties.AcceleratorKey="Ctrl+R"/>
                 <Button x:Name="StopBtn" Content="Stop (Ctrl+S)" Click="OnStop" IsEnabled="False" Margin="8,0,0,0"
                         Style="{StaticResource AccentButton}"/>
             </StackPanel>
