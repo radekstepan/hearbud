@@ -1046,7 +1046,11 @@ namespace Hearbud
         }
 
         private static readonly ThreadLocal<Random> _rng =
-            new ThreadLocal<Random>(() => new Random(unchecked(Environment.TickCount * 31 + Thread.CurrentThread.ManagedThreadId)));
+            new ThreadLocal<Random>(() => new Random(
+                HashCode.Combine(
+                    Environment.TickCount64,
+                    Thread.CurrentThread.ManagedThreadId,
+                    Guid.NewGuid().GetHashCode())));
 
         private static void FloatToPcm16(float[] src, byte[] dst, int count)
         {

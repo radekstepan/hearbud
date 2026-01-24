@@ -583,7 +583,7 @@ public static string FormatGain(double value)
 
 ---
 
-### 18. RecorderEngine.cs - Random Seeding Has Limited Entropy
+### 18. RecorderEngine.cs - Random Seeding Has Limited Entropy [FIXED]
 **Lines: 746-747**
 ```csharp
 private static readonly ThreadLocal<Random> _rng =
