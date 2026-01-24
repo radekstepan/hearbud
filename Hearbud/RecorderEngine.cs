@@ -14,6 +14,7 @@
 //   This prevents disk latency (IO blocks) from stalling the sensitive audio threads.
 // - BUFFER POOLING: We use ArrayPool<byte> to pass data to the writer thread. This avoids allocating
 //   new byte[] objects 100 times a second, reducing Garbage Collector (GC) pressure significantly.
+//   FIX: EnqueueWrite now uses try/finally to ensure rented buffers are returned even if adding fails.
 // - ZERO-ALLOC RESAMPLING: The resampling logic now reuses a scratch buffer instead of allocating
 //   temp arrays on every frame.
 // - STOP TIMEOUT: StopAsync now includes a 30s timeout when draining the write queue to prevent
@@ -518,21 +519,24 @@ namespace Hearbud
             }
         }
 
-        // Helper to queue a write safely
         private void EnqueueWrite(AudioFileTarget target, byte[] sourceData, int count)
         {
             if (!_recording || _writeQueue == null || _writeQueue.IsAddingCompleted) return;
 
-            // 1. Rent a buffer from the pool (fast, no allocation)
             byte[] rented = ArrayPool<byte>.Shared.Rent(count);
-            
-            // 2. Copy the data
-            Array.Copy(sourceData, 0, rented, 0, count);
-
-            // 3. Try to add to queue non-blocking; drop if full to prevent audio callback stalls
-            if (!_writeQueue.TryAdd(new AudioWriteJob(target, rented, count)))
+            bool added = false;
+            try
             {
-                ArrayPool<byte>.Shared.Return(rented);
+                Array.Copy(sourceData, 0, rented, 0, count);
+                added = _writeQueue.TryAdd(new AudioWriteJob(target, rented, count));
+            }
+            finally
+            {
+                if (!added) ArrayPool<byte>.Shared.Return(rented);
+            }
+
+            if (!added)
+            {
                 long dropped = Interlocked.Increment(ref _droppedBlocks);
                 // Log the first drop immediately, then every 100th drop to avoid log spam.
                 // The first drop is a critical indicator of disk I/O bottlenecks.

@@ -366,6 +366,7 @@ StopAsync() called
 - Zero allocation per audio block (no GC pressure)
 - Previously used `new byte[]` 100+ times/sec = significant heap churn
 - Pooling is a standard .NET optimization for high-frequency buffers
+- **Memory Safety:** `EnqueueWrite` uses a `try/finally` block to ensure rented buffers are always returned to the pool, preventing memory leaks if adding to the queue fails or an exception occurs.
 
 ### 5. Ring Buffer for Mic Synchronization
 **Decision:** Mic audio goes into a ring buffer pulled by loopback ticks.
@@ -420,7 +421,7 @@ StopAsync() called
 ### Memory Management
 
 - **Pre-allocated buffers:** All significant float/byte arrays are pre-allocated and resized only when needed via `EnsureCapacity()` (power-of-2 sizing)
-- **No per-frame allocations:** The audio hot path allocates nothing (ArrayPool recycles buffers)
+- **No per-frame allocations:** The audio hot path allocates nothing (ArrayPool recycles buffers). `EnqueueWrite` ensures pool safety with `try/finally`.
 - **ThreadLocal Random:** `FloatToPcm16` uses thread-local RNG for dither, no lock contention
 
 ### Timing & Sync
