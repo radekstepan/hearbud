@@ -455,8 +455,17 @@ namespace Hearbud
             try { _wavMix?.Dispose(); } catch { }
             _wavSys = null; _wavMic = null; _wavMix = null;
 
-            // Stop the write queue if it's still running
-            try { _writeQueue?.CompleteAdding(); _writeTask?.Wait(1000); } catch { }
+            // Stop the write queue if it's still running. 
+            // We check IsAddingCompleted to avoid InvalidOperationException if StopAsync was already called.
+            try
+            {
+                if (_writeQueue != null && !_writeQueue.IsAddingCompleted)
+                {
+                    _writeQueue.CompleteAdding();
+                }
+                _writeTask?.Wait(1000);
+            }
+            catch { }
             try { _writeQueue?.Dispose(); } catch { }
 
             StopInternal(fullStop: true);
