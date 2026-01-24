@@ -21,6 +21,8 @@
 //   indefinite hangs if disk I/O stalls or the writer thread deadlocks.
 // - ASYNC DEVICE INIT: OpenDevicesAsync now uses Task.Delay instead of Thread.Sleep. This prevents
 //   the UI thread from freezing during audio device initialization or retry attempts.
+// - CANCELLATION SUPPORT: StopAsync now accepts a CancellationToken to allow aborting 
+//   the MP3 encoding process if it takes too long.
 //
 // DESIGN INTENT
 // - Loopback (system) is the "clock source": whenever loopback provides a chunk, we pull a same-sized
@@ -310,7 +312,7 @@ namespace Hearbud
             Info("Recording started");
         }
 
-        public async Task StopAsync()
+        public async Task StopAsync(CancellationToken cancellationToken = default)
         {
             if (_disposed) return;
 
@@ -395,6 +397,7 @@ namespace Hearbud
 
                                 while ((read = source.Read(buf, 0, buf.Length)) > 0)
                                 {
+                                    cancellationToken.ThrowIfCancellationRequested();
                                     encoder.Write(buf, 0, read);
                                     bytesProcessed += read;
                                     if (totalBytes > 0)
@@ -417,7 +420,7 @@ namespace Hearbud
                             encEx = ex;
                             Error("MP3 encode", ex);
                         }
-                    });
+                    }, cancellationToken);
                 }
                 else
                 {
