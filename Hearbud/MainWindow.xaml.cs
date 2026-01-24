@@ -238,6 +238,19 @@ namespace Hearbud
                     BaseNameText.Text = baseName;
                 }
 
+                // Validate total path length to avoid Windows MAX_PATH (260) exceptions.
+                // We check against 240 to leave room for internal suffixes like -system.wav or -mic.wav.
+                var testPath = Path.Combine(outDir, $"{baseName}-system.wav");
+                if (testPath.Length > 240)
+                {
+                    WpfMessageBox.Show(
+                        "Output path is too long. Please use a shorter folder path or file name.",
+                        "Path Too Long",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    return;
+                }
+
                 var micName = MicCombo.SelectedItem as string;
                 var spkName = SpeakerCombo.SelectedItem as string;
 
