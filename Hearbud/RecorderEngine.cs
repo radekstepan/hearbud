@@ -12,6 +12,7 @@
 // OPTIMIZATIONS (PERFORMANCE FIXES)
 // - ASYNC I/O: Writing to disk is now decoupled from the audio callback using a BlockingCollection queue.
 //   This prevents disk latency (IO blocks) from stalling the sensitive audio threads.
+//   The queue capacity is dynamically calculated to provide ~10s of buffer, adapting to the format.
 // - BUFFER POOLING: We use ArrayPool<byte> to pass data to the writer thread. This avoids allocating
 //   new byte[] objects 100 times a second, reducing Garbage Collector (GC) pressure significantly.
 //   FIX: EnqueueWrite now uses try/finally to ensure rented buffers are returned even if adding fails.
@@ -121,6 +122,8 @@ namespace Hearbud
         private int _outRate = 48000;
         private int _outChannels = 2;
         private const int BlockFrames = 1024;
+        private const int DefaultQueueCapacity = 2000;
+        private const int MaxQueueCapacity = 10000;
 
         private double _micGain = 1.0;
         private double _loopGain = 1.0;
@@ -297,8 +300,9 @@ namespace Hearbud
             _wavMix = new WaveWriter(_pathMix, new CSCore.WaveFormat(_outRate, _mixUse32Bit ? 32 : 16, _outChannels));
 
             // Initialize Async Write Queue and Task
-            // Capacity is set to handle ~5 seconds of buffering if disk stalls completely.
-            _writeQueue = new BlockingCollection<AudioWriteJob>(2000); 
+            // Capacity is set to handle ~10 seconds of buffering if disk stalls completely.
+            _writeQueue = new BlockingCollection<AudioWriteJob>(
+                Math.Clamp(CalculateOptimalQueueSize(), DefaultQueueCapacity, MaxQueueCapacity)); 
             _writeTask = Task.Factory.StartNew(DiskWriteLoop, TaskCreationOptions.LongRunning);
 
             lock (_micRingLock) { _micR = _micW = _micCount = 0; }
@@ -527,6 +531,12 @@ namespace Hearbud
                 Error("DiskWriteLoop fatal", ex);
                 RaiseStatus(EngineStatusKind.Error, $"Disk write failed: {ex.Message}");
             }
+        }
+
+        private int CalculateOptimalQueueSize()
+        {
+            // Based on sample rate and block size, calculate ~10 seconds of buffer
+            return Math.Max(DefaultQueueCapacity, (_outRate * _outChannels * 10) / (BlockFrames * _outChannels));
         }
 
         private void EnqueueWrite(AudioFileTarget target, byte[] sourceData, int count)
