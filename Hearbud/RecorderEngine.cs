@@ -1052,6 +1052,10 @@ namespace Hearbud
             }
         }
 
+        /// <summary>
+        /// Converts float samples to 32-bit PCM bytes.
+        /// Uses long for intermediate calculation to avoid overflow on loud signals.
+        /// </summary>
         private static void FloatToPcm32(float[] src, byte[] dst, int count)
         {
             int j = 0;
@@ -1059,7 +1063,12 @@ namespace Hearbud
             {
                 float v = src[i];
                 if (v > 1f) v = 1f; else if (v < -1f) v = -1f;
-                int s = (int)Math.Round(v * int.MaxValue);
+                
+                // Use long for intermediate calculation to avoid overflow
+                long scaled = (long)Math.Round(v * 2147483647.0);
+                scaled = Math.Clamp(scaled, int.MinValue, int.MaxValue);
+                int s = (int)scaled;
+                
                 dst[j++] = (byte)(s & 0xFF);
                 dst[j++] = (byte)((s >> 8) & 0xFF);
                 dst[j++] = (byte)((s >> 16) & 0xFF);
