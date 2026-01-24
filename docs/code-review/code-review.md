@@ -561,7 +561,7 @@ private void WriteLog(string level, string msg, [CallerMemberName] string? where
 
 ---
 
-### 17. Dbfs.cs - Inconsistent String Formatting
+### 17. Dbfs.cs - Inconsistent String Formatting [FIXED]
 **Lines: 8-12**
 ```csharp
 public static string FormatGain(double value)
