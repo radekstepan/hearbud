@@ -4,6 +4,9 @@ using System.Text.Json;
 
 namespace Hearbud
 {
+    /// <summary>
+    /// Represents the application settings, providing methods to load, save, and validate configuration.
+    /// </summary>
     public sealed class AppSettings
     {
         public string MicName { get; set; } = "";
@@ -27,6 +30,10 @@ namespace Hearbud
         private static string ConfigPath =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".hearbud_config.json");
 
+        /// <summary>
+        /// Loads settings from the configuration file, validating values to ensure they are within safe ranges.
+        /// </summary>
+        /// <returns>The loaded <see cref="AppSettings"/> instance, or a new instance if loading fails.</returns>
         public static AppSettings Load()
         {
             try
@@ -34,24 +41,10 @@ namespace Hearbud
                 if (File.Exists(ConfigPath))
                 {
                     var json = File.ReadAllText(ConfigPath);
-
-                    bool bitratePropertyExists;
-                    using (var doc = JsonDocument.Parse(json))
-                    {
-                        bitratePropertyExists = doc.RootElement.TryGetProperty(nameof(Mp3BitrateKbps), out _);
-                    }
-
                     var s = JsonSerializer.Deserialize<AppSettings>(json);
                     if (s != null)
                     {
-                        if (!bitratePropertyExists && !string.IsNullOrWhiteSpace(s.Mp3Quality))
-                        {
-                            var digits = System.Text.RegularExpressions.Regex.Match(s.Mp3Quality, "(\\d+)");
-                            if (digits.Success && int.TryParse(digits.Value, out var kb))
-                                s.Mp3BitrateKbps = Math.Clamp(kb, 64, 320);
-                            else
-                                s.Mp3BitrateKbps = 192;
-                        }
+                        s.Validate();
                         return s;
                     }
                 }
@@ -60,6 +53,22 @@ namespace Hearbud
             return new AppSettings();
         }
 
+        /// <summary>
+        /// Validates setting values and clamps them to valid ranges to prevent crashes or unexpected behavior.
+        /// </summary>
+        private void Validate()
+        {
+            MicGain = Math.Clamp(MicGain, 0.0, 10.0);
+            LoopGain = Math.Clamp(LoopGain, 0.0, 10.0);
+            Mp3BitrateKbps = Mp3BitrateKbps == 0 ? 0 : Math.Clamp(Mp3BitrateKbps, 64, 320);
+
+            if (string.IsNullOrWhiteSpace(OutputDir))
+                OutputDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings");
+        }
+
+        /// <summary>
+        /// Saves the current settings to the configuration file.
+        /// </summary>
         public void Save()
         {
             try
