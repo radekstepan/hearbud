@@ -115,8 +115,30 @@ namespace Hearbud
         private int _outChannels = 2;
         private const int BlockFrames = 1024;
 
-        public double MicGain { get; set; } = 1.0;   
-        public double LoopGain { get; set; } = 1.0;  
+        private double _micGain = 1.0;
+        private double _loopGain = 1.0;
+
+        /// <summary>
+        /// Gets or sets the microphone gain. 
+        /// Thread-safe via Volatile.Read/Write to prevent torn reads on 32-bit systems
+        /// and ensure visibility across UI and audio callback threads.
+        /// </summary>
+        public double MicGain 
+        { 
+            get => Volatile.Read(ref _micGain); 
+            set => Volatile.Write(ref _micGain, value); 
+        }
+
+        /// <summary>
+        /// Gets or sets the loopback (system) gain.
+        /// Thread-safe via Volatile.Read/Write to prevent torn reads on 32-bit systems
+        /// and ensure visibility across UI and audio callback threads.
+        /// </summary>
+        public double LoopGain 
+        { 
+            get => Volatile.Read(ref _loopGain); 
+            set => Volatile.Write(ref _loopGain, value); 
+        }
 
         public event EventHandler<LevelChangedEventArgs>? LevelChanged;
         public event EventHandler<EngineStatusEventArgs>? Status;
