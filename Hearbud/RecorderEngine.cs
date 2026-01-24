@@ -41,6 +41,7 @@ using System.Buffers; // Added: For ArrayPool (Memory Optimization)
 using System.Collections.Concurrent; // Added: For BlockingCollection (Async I/O)
 using System.Diagnostics;
 using System.IO;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading; 
 using System.Threading.Tasks; 
@@ -1110,9 +1111,8 @@ namespace Hearbud
         }
         private static int NextPow2(int n)
         {
-            if (n <= 0) return 256;
-            n--; n |= n >> 1; n |= n >> 2; n |= n >> 4; n |= n >> 8; n |= n >> 16; n++;
-            return n < 256 ? 256 : n;
+            if (n <= 256) return 256;
+            return (int)BitOperations.RoundUpToPowerOf2((uint)n);
         }
 
         private void EnsureRingCapacity(int roomNeeded)
