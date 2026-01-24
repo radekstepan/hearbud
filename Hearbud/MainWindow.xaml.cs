@@ -141,7 +141,7 @@ namespace Hearbud
             }
         }
 
-        private void TryStartAutoMonitor()
+        private async void TryStartAutoMonitor()
         {
             try
             {
@@ -155,7 +155,7 @@ namespace Hearbud
                 _engine.MicGain = MicGain.Value;
                 _engine.LoopGain = LoopGain.Value;
 
-                _engine.Monitor(new RecorderStartOptions
+                await _engine.MonitorAsync(new RecorderStartOptions
                 {
                     LoopbackDeviceId = loopDevice!.DeviceID,
                     MicDeviceId = _micDict[micName].DeviceID
@@ -178,7 +178,7 @@ namespace Hearbud
                     _engine.MicGain = MicGain.Value;
                     _engine.LoopGain = LoopGain.Value;
 
-                    _engine.Monitor(new RecorderStartOptions
+                    await _engine.MonitorAsync(new RecorderStartOptions
                     {
                         LoopbackDeviceId = _spkDict[spkName]!.DeviceID,
                         MicDeviceId = _micDict[micName].DeviceID
@@ -218,7 +218,7 @@ namespace Hearbud
             }
         }
 
-        private void OnStart(object? sender, RoutedEventArgs? e)
+        private async void OnStart(object? sender, RoutedEventArgs? e)
         {
             try
             {
@@ -259,7 +259,7 @@ namespace Hearbud
                 _engine.MicGain = MicGain.Value;   // meters & mix balance
                 _engine.LoopGain = LoopGain.Value; // meters & mix balance
 
-                _engine.Start(new RecorderStartOptions
+                await _engine.StartAsync(new RecorderStartOptions
                 {
                     OutputPath = Path.Combine(outDir, baseName),
                     LoopbackDeviceId = loopDevice!.DeviceID,

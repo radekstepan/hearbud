@@ -19,6 +19,8 @@
 //   temp arrays on every frame.
 // - STOP TIMEOUT: StopAsync now includes a 30s timeout when draining the write queue to prevent
 //   indefinite hangs if disk I/O stalls or the writer thread deadlocks.
+// - ASYNC DEVICE INIT: OpenDevicesAsync now uses Task.Delay instead of Thread.Sleep. This prevents
+//   the UI thread from freezing during audio device initialization or retry attempts.
 //
 // DESIGN INTENT
 // - Loopback (system) is the "clock source": whenever loopback provides a chunk, we pull a same-sized
@@ -231,11 +233,11 @@ namespace Hearbud
 
         // ===== Public API =====
 
-        public void Monitor(RecorderStartOptions opts)
+        public async Task MonitorAsync(RecorderStartOptions opts)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(RecorderEngine));
             StopInternal(fullStop: true);
-            OpenDevices(opts);
+            await OpenDevicesAsync(opts);
 
             if (!_monitoring)
             {
@@ -258,10 +260,10 @@ namespace Hearbud
             }
         }
 
-        public void Start(RecorderStartOptions opts)
+        public async Task StartAsync(RecorderStartOptions opts)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(RecorderEngine));
-            Monitor(opts); 
+            await MonitorAsync(opts); 
 
             _kbps = opts.Mp3BitrateKbps;
 
@@ -556,7 +558,7 @@ namespace Hearbud
         // DEVICES
         // ==========================================
 
-        private void OpenDevices(RecorderStartOptions opts)
+        private async Task OpenDevicesAsync(RecorderStartOptions opts)
         {
             bool needReopen =
                 _loopCap == null ||
@@ -633,7 +635,7 @@ namespace Hearbud
                     if (attempt < maxRetries - 1)
                     {
                         Info($"Device invalidated, retrying in {retryDelayMs}ms...");
-                        System.Threading.Thread.Sleep(retryDelayMs);
+                        await Task.Delay(retryDelayMs);
                     }
                     else
                     {
