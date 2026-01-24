@@ -15,7 +15,18 @@ namespace Hearbud
             DispatcherUnhandledException += (_, args) =>
             {
                 CrashLog.LogAndShow("Application.DispatcherUnhandledException", args.Exception);
-                args.Handled = true; // keep app alive if possible
+                
+                // Only keep alive for non-critical exceptions
+                if (args.Exception is NotImplementedException || 
+                    args.Exception is InvalidOperationException)
+                {
+                    args.Handled = true;
+                }
+                else
+                {
+                    // For serious exceptions (NullRef, AccessViolation, etc.), let app terminate
+                    args.Handled = false;
+                }
             };
 
             TaskScheduler.UnobservedTaskException += (_, args) =>
