@@ -141,6 +141,8 @@ namespace Hearbud
         // Async Write Queue
         private BlockingCollection<AudioWriteJob>? _writeQueue;
         private Task? _writeTask;
+        private long _droppedBlocks = 0;
+        private Exception? _writerException;
 
         private string _pathSys = "";
         private string _pathMic = "";
@@ -167,7 +169,8 @@ namespace Hearbud
         private byte[]  _pcm32Mix     = new byte[BlockFrames * 8 * 4];
 
         private readonly object _micRingLock = new();
-        private float[] _micRing = new float[48000 * 4]; 
+        private readonly object _logLock = new();
+        private float[] _micRing = new float[48000 * 4];
         private int _micR, _micW, _micCount;
 
         private static readonly double _tickMs = 1000.0 / Stopwatch.Frequency;
@@ -281,6 +284,8 @@ namespace Hearbud
 
             _recording = false;
 
+            StopInternal(fullStop: false);
+
             // 1. Drain the write queue.
             // We tell the queue no more items are coming, then wait for the background thread
             // to finish writing everything currently in the buffer.
@@ -291,6 +296,12 @@ namespace Hearbud
                 await _writeTask; // Wait for disk I/O to finish completely
                 _writeQueue.Dispose();
                 _writeQueue = null;
+            }
+
+            // Check for writer exceptions and surface them to the UI
+            if (_writerException != null)
+            {
+                RaiseStatus(EngineStatusKind.Error, $"Disk write failed: {_writerException.Message}");
             }
 
             // 2. Now it is safe to close the files (WAV headers are updated on Dispose)
@@ -372,12 +383,14 @@ namespace Hearbud
             else
             {
                 Info("Skipping MP3 encoding per settings.");
-                _pathMp3 = ""; 
+                _pathMp3 = "";
             }
 
-            StopInternal(fullStop: false);
-
             Info($"Mic ring underruns: {_micUnderrunBlocks}. Peak mic backlog: {_micBacklogSecMax:F4}s");
+            if (_droppedBlocks > 0)
+            {
+                Warn($"Dropped {_droppedBlocks} audio blocks due to disk I/O stall");
+            }
             Info("Recording stopped");
             Info("===== Session end =====");
 
@@ -453,6 +466,7 @@ namespace Hearbud
             }
             catch (Exception ex)
             {
+                _writerException = ex;
                 Error("DiskWriteLoop fatal", ex);
             }
         }
@@ -468,15 +482,16 @@ namespace Hearbud
             // 2. Copy the data
             Array.Copy(sourceData, 0, rented, 0, count);
 
-            // 3. Add to queue (non-blocking unless queue is full)
-            try
+            // 3. Try to add to queue non-blocking; drop if full to prevent audio callback stalls
+            if (!_writeQueue.TryAdd(new AudioWriteJob(target, rented, count)))
             {
-                _writeQueue.Add(new AudioWriteJob(target, rented, count));
-            }
-            catch (InvalidOperationException) 
-            {
-                // Queue finished adding, just return buffer
                 ArrayPool<byte>.Shared.Return(rented);
+                long dropped = Interlocked.Increment(ref _droppedBlocks);
+                // Log once per 100 drops to avoid log spam
+                if (dropped % 100 == 0)
+                {
+                    Warn($"Write queue full, dropped {dropped} blocks");
+                }
             }
         }
 
@@ -505,39 +520,69 @@ namespace Hearbud
             TryDispose(ref _loopSrc);
             TryDispose(ref _micSrc);
 
-            MMDevice loopDev;
-            MMDevice? micDev = null;
-            using (var mmde = new MMDeviceEnumerator())
+            int maxRetries = 3;
+            int retryDelayMs = 250;
+
+            for (int attempt = 0; attempt < maxRetries; attempt++)
             {
-                loopDev = mmde.GetDevice(opts.LoopbackDeviceId);
-                if (!string.IsNullOrWhiteSpace(opts.MicDeviceId))
-                    micDev = mmde.GetDevice(opts.MicDeviceId!);
-            }
+                try
+                {
+                    MMDevice loopDev;
+                    MMDevice? micDev = null;
+                    using (var mmde = new MMDeviceEnumerator())
+                    {
+                        loopDev = mmde.GetDevice(opts.LoopbackDeviceId);
+                        if (!string.IsNullOrWhiteSpace(opts.MicDeviceId))
+                            micDev = mmde.GetDevice(opts.MicDeviceId!);
+                    }
 
-            _loopDevName = loopDev?.FriendlyName ?? "";
-            _micDevName  = micDev?.FriendlyName ?? "(none)";
+                    _loopDevName = loopDev?.FriendlyName ?? "";
+                    _micDevName  = micDev?.FriendlyName ?? "(none)";
 
-            _loopCap = new WasapiLoopbackCapture { Device = loopDev };
-            _loopCap.Initialize();
-            _outRate     = _loopCap.WaveFormat.SampleRate;
-            _outChannels = _loopCap.WaveFormat.Channels;
+                    _loopCap = new WasapiLoopbackCapture { Device = loopDev };
+                    _loopCap.Initialize();
+                    _outRate     = _loopCap.WaveFormat.SampleRate;
+                    _outChannels = _loopCap.WaveFormat.Channels;
 
-            _loopIn  = new SoundInSource(_loopCap) { FillWithZeros = true };
-            _loopSrc = _loopIn.ToSampleSource();
+                    _loopIn  = new SoundInSource(_loopCap) { FillWithZeros = true };
+                    _loopSrc = _loopIn.ToSampleSource();
 
-            if (micDev != null)
-            {
-                _micCap = new WasapiCapture { Device = micDev };
-                _micCap.Initialize();
+                    if (micDev != null)
+                    {
+                        _micCap = new WasapiCapture { Device = micDev };
+                        _micCap.Initialize();
 
-                _micIn  = new SoundInSource(_micCap) { FillWithZeros = true };
-                _micSrc = _micIn.ToSampleSource();
+                        _micIn  = new SoundInSource(_micCap) { FillWithZeros = true };
+                        _micSrc = _micIn.ToSampleSource();
 
-                lock (_micRingLock) { _micR = _micW = _micCount = 0; }
-            }
-            else
-            {
-                RaiseStatus(EngineStatusKind.Error, "Microphone device not found/selected.");
+                        lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                    }
+                    else
+                    {
+                        RaiseStatus(EngineStatusKind.Error, "Microphone device not found/selected.");
+                    }
+
+                    return;
+                }
+                catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex)
+                {
+                    if (ex.HResult != unchecked((int)0x88890004))
+                        throw;
+
+                    // Cleanup failed attempt before retry
+                    TryStopDispose(ref _loopCap);
+                    TryStopDispose(ref _micCap);
+
+                    if (attempt < maxRetries - 1)
+                    {
+                        Info($"Device invalidated, retrying in {retryDelayMs}ms...");
+                        System.Threading.Thread.Sleep(retryDelayMs);
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
             }
         }
 
@@ -547,12 +592,14 @@ namespace Hearbud
             {
                 try { _loopIn!.DataAvailable -= OnLoopbackData; } catch { }
                 try { if (_micIn != null) _micIn.DataAvailable -= OnMicData; } catch { }
-                TryStopDispose(ref _loopCap);
-                TryStopDispose(ref _micCap);
+
                 TryDispose(ref _loopIn);
                 TryDispose(ref _micIn);
                 TryDispose(ref _loopSrc);
                 TryDispose(ref _micSrc);
+
+                TryStopDispose(ref _loopCap);
+                TryStopDispose(ref _micCap);
                 _monitoring = false;
             }
 
@@ -681,6 +728,11 @@ namespace Hearbud
                     }
                 }
             }
+            catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
+            {
+                RaiseStatus(EngineStatusKind.Error, "Audio device disconnected");
+                StopInternal(fullStop: true);
+            }
             catch (Exception ex) { Error("OnMicData", ex); }
         }
 
@@ -803,6 +855,11 @@ namespace Hearbud
                         EnqueueWrite(AudioFileTarget.Mix, _pcm16Mix, gotLoop * 2);
                     }
                 }
+            }
+            catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
+            {
+                RaiseStatus(EngineStatusKind.Error, "Audio device disconnected");
+                StopInternal(fullStop: true);
             }
             catch (Exception ex) { Error("OnLoopbackData", ex); }
         }
@@ -1009,7 +1066,10 @@ namespace Hearbud
         {
             try
             {
-                _log?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {level} {where}: {msg}");
+                lock (_logLock)
+                {
+                    _log?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {level} {where}: {msg}");
+                }
                 Debug.WriteLine($"{level} {where}: {msg}");
             }
             catch { }

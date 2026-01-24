@@ -162,6 +162,33 @@ namespace Hearbud
 
                 StatusText.Text = "Monitoring...";
             }
+            catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex)
+                when (ex.HResult == unchecked((int)0x88890004))
+            {
+                StatusText.Text = "Refreshing devices...";
+                SafeRefreshDevices();
+
+                try
+                {
+                    var micName = MicCombo.SelectedItem as string;
+                    var spkName = SpeakerCombo.SelectedItem as string;
+                    if (spkName == null || micName == null) return;
+
+                    _engine.MicGain = MicGain.Value;
+                    _engine.LoopGain = LoopGain.Value;
+
+                    _engine.Monitor(new RecorderStartOptions
+                    {
+                        LoopbackDeviceId = _spkDict[spkName]!.DeviceID,
+                        MicDeviceId = _micDict[micName].DeviceID
+                    });
+                    StatusText.Text = "Monitoring...";
+                }
+                catch (Exception retryEx)
+                {
+                    CrashLog.LogAndShow("TryStartAutoMonitor (retry)", retryEx);
+                }
+            }
             catch (Exception ex)
             {
                 CrashLog.LogAndShow("TryStartAutoMonitor", ex);
@@ -203,7 +230,7 @@ namespace Hearbud
                     outDir = def;
                 }
 
-                var baseName = BaseNameText.Text.Trim();
+                var baseName = SanitizeFilename(BaseNameText.Text);
                 if (string.IsNullOrWhiteSpace(baseName))
                 {
                     baseName = $"rec-{DateTime.Now:yyyyMMdd_HHmmss}";
@@ -264,6 +291,13 @@ namespace Hearbud
             }
         }
 
+        private static string SanitizeFilename(string name)
+        {
+            var invalid = Path.GetInvalidFileNameChars();
+            var sanitized = new string(name.Where(c => !invalid.Contains(c)).ToArray());
+            return string.IsNullOrWhiteSpace(sanitized) ? "recording" : sanitized.Trim();
+        }
+
         private void OnGainChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
             if (!_uiReady) return;
@@ -281,6 +315,8 @@ namespace Hearbud
 
         private volatile float _micPeak;
         private volatile float _sysPeak;
+        private DateTime _micClipUntil = DateTime.MinValue;
+        private DateTime _sysClipUntil = DateTime.MinValue;
 
         private void OnEngineLevelChanged(object? sender, LevelChangedEventArgs e)
         {
@@ -289,15 +325,8 @@ namespace Hearbud
 
             if (e.Clipped)
             {
-                Dispatcher.Invoke(() =>
-                {
-                    var tb = e.Source == LevelSource.Mic ? MicClip : SysClip;
-                    tb.Foreground = (System.Windows.Media.Brush)FindResource("ClipBrush");
-                    _ = new System.Threading.Timer(_ =>
-                    {
-                        Dispatcher.Invoke(() => tb.Foreground = (System.Windows.Media.Brush)FindResource("ControlDisabled"));
-                    }, null, 1500, System.Threading.Timeout.Infinite);
-                });
+                if (e.Source == LevelSource.Mic) _micClipUntil = DateTime.Now.AddMilliseconds(1500);
+                else _sysClipUntil = DateTime.Now.AddMilliseconds(1500);
             }
         }
 
@@ -311,6 +340,9 @@ namespace Hearbud
 
             MicDb.Text = $"{Dbfs.ToDbfs(mp),6:0.0} dBFS";
             SysDb.Text = $"{Dbfs.ToDbfs(sp),6:0.0} dBFS";
+
+            MicClip.Foreground = DateTime.Now < _micClipUntil ? (System.Windows.Media.Brush)FindResource("ClipBrush") : (System.Windows.Media.Brush)FindResource("ControlDisabled");
+            SysClip.Foreground = DateTime.Now < _sysClipUntil ? (System.Windows.Media.Brush)FindResource("ClipBrush") : (System.Windows.Media.Brush)FindResource("ControlDisabled");
         }
 
         private void OnEngineEncodingProgress(object? sender, int percent)

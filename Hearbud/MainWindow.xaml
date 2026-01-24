@@ -4,11 +4,12 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="Hearbud" Height="510" Width="960"
-        MinHeight="510" MinWidth="900"
+        Title="Hearbud" Height="518" Width="960"
+        MinHeight="518" MinWidth="900"
         ResizeMode="CanMinimize"
         Background="{StaticResource AppBackground}"
-        Foreground="{StaticResource ControlForeground}">
+        Foreground="{StaticResource ControlForeground}"
+        UseLayoutRounding="True">
     <DockPanel LastChildFill="True" Margin="16">
         <!-- Main content -->
         <Grid>
@@ -17,7 +18,7 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto" MinHeight="30"/>
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
