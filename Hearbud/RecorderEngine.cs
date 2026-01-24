@@ -503,7 +503,9 @@ namespace Hearbud
             catch (Exception ex)
             {
                 _writerException = ex;
+                _recording = false; // Stop accepting new data if writer fails
                 Error("DiskWriteLoop fatal", ex);
+                RaiseStatus(EngineStatusKind.Error, $"Disk write failed: {ex.Message}");
             }
         }
 
