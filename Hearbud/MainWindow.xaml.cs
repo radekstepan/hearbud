@@ -143,56 +143,46 @@ namespace Hearbud
 
         private async void TryStartAutoMonitor()
         {
-            try
+            await ExecuteWithDeviceRetryAsync(async () =>
             {
                 var micName = MicCombo.SelectedItem as string;
                 var spkName = SpeakerCombo.SelectedItem as string;
-
                 if (spkName == null || micName == null) return;
-
-                MMDevice? loopDevice = _spkDict[spkName];
 
                 _engine.MicGain = MicGain.Value;
                 _engine.LoopGain = LoopGain.Value;
 
                 await _engine.MonitorAsync(new RecorderStartOptions
                 {
-                    LoopbackDeviceId = loopDevice!.DeviceID,
+                    LoopbackDeviceId = _spkDict[spkName]!.DeviceID,
                     MicDeviceId = _micDict[micName].DeviceID
                 });
-
                 StatusText.Text = "Monitoring...";
+            });
+        }
+
+        private async Task ExecuteWithDeviceRetryAsync(Func<Task> action)
+        {
+            try
+            {
+                await action();
             }
-            catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex)
-                when (ex.HResult == unchecked((int)0x88890004))
+            catch (CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
             {
                 StatusText.Text = "Refreshing devices...";
                 SafeRefreshDevices();
-
                 try
                 {
-                    var micName = MicCombo.SelectedItem as string;
-                    var spkName = SpeakerCombo.SelectedItem as string;
-                    if (spkName == null || micName == null) return;
-
-                    _engine.MicGain = MicGain.Value;
-                    _engine.LoopGain = LoopGain.Value;
-
-                    await _engine.MonitorAsync(new RecorderStartOptions
-                    {
-                        LoopbackDeviceId = _spkDict[spkName]!.DeviceID,
-                        MicDeviceId = _micDict[micName].DeviceID
-                    });
-                    StatusText.Text = "Monitoring...";
+                    await action();
                 }
                 catch (Exception retryEx)
                 {
-                    CrashLog.LogAndShow("TryStartAutoMonitor (retry)", retryEx);
+                    CrashLog.LogAndShow("Device retry", retryEx);
                 }
             }
             catch (Exception ex)
             {
-                CrashLog.LogAndShow("TryStartAutoMonitor", ex);
+                CrashLog.LogAndShow("ExecuteWithDeviceRetry", ex);
             }
         }
 
