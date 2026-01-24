@@ -24,6 +24,7 @@
 //   the UI thread from freezing during audio device initialization or retry attempts.
 // - CANCELLATION SUPPORT: StopAsync now accepts a CancellationToken to allow aborting 
 //   the MP3 encoding process if it takes too long.
+// - LOG LIMITING: The log file is now capped at 10MB to prevent unbounded growth during long sessions.
 //
 // DESIGN INTENT
 // - Loopback (system) is the "clock source": whenever loopback provides a chunk, we pull a same-sized
@@ -189,6 +190,8 @@ namespace Hearbud
 
         private string _logPath = "";
         private StreamWriter? _log;
+        private const long MaxLogSizeBytes = 10 * 1024 * 1024; // 10 MB
+        private long _logBytesWritten = 0;
 
         // Buffers
         private float[] _loopBufF     = new float[BlockFrames * 8];
@@ -1128,6 +1131,7 @@ namespace Hearbud
         {
             try
             {
+                _logBytesWritten = 0;
                 if (!string.IsNullOrEmpty(_logPath))
                 {
                     TryDispose(ref _log);
@@ -1149,7 +1153,19 @@ namespace Hearbud
             {
                 lock (_logLock)
                 {
-                    _log?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {level} {where}: {msg}");
+                    if (_log == null) return;
+
+                    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {level} {where}: {msg}";
+                    _logBytesWritten += line.Length * 2; // Rough estimate
+
+                    if (_logBytesWritten > MaxLogSizeBytes)
+                    {
+                        _log.WriteLine("[LOG TRUNCATED - Maximum size reached]");
+                        TryDispose(ref _log);
+                        return;
+                    }
+
+                    _log.WriteLine(line);
                 }
                 Debug.WriteLine($"{level} {where}: {msg}");
             }
