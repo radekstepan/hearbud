@@ -457,7 +457,7 @@ StopAsync() called
 | Loopback silent >200ms | Mic drives output | Mix = mic-only, system = zeros |
 | Mic underrun (ring empty) | Zero-fill missing samples | Counted in `_micUnderrunBlocks` |
 | Mic overrun (ring full) | Oldest samples dropped | Happens when mic is much faster than loopback |
-| Queue full (disk stall) | Blocks audio callback | Rare; indicates filesystem problem |
+| Queue full (disk stall) | Drops data to avoid callback stall | Logged immediately on first drop, then every 100 drops |
 | Device disappears during record | Exception in callback | Caught, logged, continues if possible |
 | MP3 encode failure | Logs error, WAVs still saved | User gets WAV files even if MP3 fails |
 

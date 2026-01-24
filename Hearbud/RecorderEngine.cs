@@ -523,10 +523,11 @@ namespace Hearbud
             {
                 ArrayPool<byte>.Shared.Return(rented);
                 long dropped = Interlocked.Increment(ref _droppedBlocks);
-                // Log once per 100 drops to avoid log spam
-                if (dropped % 100 == 0)
+                // Log the first drop immediately, then every 100th drop to avoid log spam.
+                // The first drop is a critical indicator of disk I/O bottlenecks.
+                if (dropped == 1 || dropped % 100 == 0)
                 {
-                    Warn($"Write queue full, dropped {dropped} blocks");
+                    Warn($"Write queue full, dropped {dropped} block(s) - disk I/O bottleneck!");
                 }
             }
         }

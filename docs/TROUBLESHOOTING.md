@@ -415,8 +415,10 @@ Get-Service -Name "AudioSrv"
 #### Disk I/O Bottleneck
 
 **Diagnosis:**
-- Session log shows queue-related issues
+- Session log shows queue-related warnings: `WARN Write queue full, dropped X block(s) - disk I/O bottleneck!`
 - Task Manager shows high disk utilization during glitches
+
+**Note:** The first dropped block is logged immediately to alert you of potential data loss. Subsequent drops are logged every 100 blocks to avoid log spam.
 
 **Solution:**
 - Record to SSD instead of HDD
