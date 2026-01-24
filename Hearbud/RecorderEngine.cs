@@ -16,6 +16,8 @@
 //   new byte[] objects 100 times a second, reducing Garbage Collector (GC) pressure significantly.
 // - ZERO-ALLOC RESAMPLING: The resampling logic now reuses a scratch buffer instead of allocating
 //   temp arrays on every frame.
+// - STOP TIMEOUT: StopAsync now includes a 30s timeout when draining the write queue to prevent
+//   indefinite hangs if disk I/O stalls or the writer thread deadlocks.
 //
 // DESIGN INTENT
 // - Loopback (system) is the "clock source": whenever loopback provides a chunk, we pull a same-sized
@@ -315,7 +317,19 @@ namespace Hearbud
             {
                 Info("Finishing background writes...");
                 _writeQueue.CompleteAdding();
-                await _writeTask; // Wait for disk I/O to finish completely
+
+                // Wait for background writes to finish, but with a timeout to prevent hanging
+                // if disk I/O stalls or the writer thread deadlocks.
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                try
+                {
+                    await _writeTask.WaitAsync(cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    Warn("Write queue drain timed out after 30s");
+                }
+
                 _writeQueue.Dispose();
                 _writeQueue = null;
             }
