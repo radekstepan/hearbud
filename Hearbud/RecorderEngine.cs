@@ -143,6 +143,11 @@ namespace Hearbud
             set => Volatile.Write(ref _loopGain, value); 
         }
 
+        /// <summary>
+        /// Gets a value indicating whether the engine is currently recording to disk.
+        /// </summary>
+        public bool IsRecording => _recording;
+
         public event EventHandler<LevelChangedEventArgs>? LevelChanged;
         public event EventHandler<EngineStatusEventArgs>? Status;
         public event EventHandler<int>? EncodingProgress; 

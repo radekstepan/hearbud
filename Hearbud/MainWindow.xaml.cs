@@ -1,6 +1,7 @@
 using CSCore.CoreAudioAPI;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -464,6 +465,33 @@ namespace Hearbud
             if (WindowState == WindowState.Minimized)
             {
                 Hide();
+            }
+        }
+
+        /// <summary>
+        /// Handles the window closing event. If a recording is in progress, 
+        /// prompts the user for confirmation to prevent accidental data loss.
+        /// </summary>
+        protected override async void OnClosing(CancelEventArgs e)
+        {
+            base.OnClosing(e);
+
+            if (_engine.IsRecording)
+            {
+                var result = WpfMessageBox.Show(
+                    "Recording is in progress. Stop recording and exit?",
+                    "Confirm Exit",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+
+                if (result == MessageBoxResult.No)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+
+                // Ensure the engine stops and flushes before the window fully closes
+                await _engine.StopAsync();
             }
         }
 
