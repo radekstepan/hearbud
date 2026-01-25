@@ -1041,9 +1041,9 @@ namespace Hearbud
 
         private static float SoftClipIfNeeded(float x)
         {
-            if (x > 1f || x < -1f) x = MathF.Tanh(x);
-            if (x > 1f) x = 1f; else if (x < -1f) x = -1f;
-            return x;
+            // Apply tanh to the entire signal to ensure a smooth, continuous
+            // "analog" saturation curve without any discontinuities or "pops".
+            return MathF.Tanh(x);
         }
 
         private static readonly ThreadLocal<Random> _rng =

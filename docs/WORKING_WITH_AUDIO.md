@@ -217,9 +217,7 @@ mixed_sample = s * 0.7 + m * 0.3  // System louder than mic
 Tan hyperbolic (tanh) provides natural non-linear limiting:
 
 ```
-if (x > 1.0 || x < -1.0):
-    x = tanh(x)  // Non-linear curve approaching ±1.0
-clamp(x, -1.0, 1.0)
+x = tanh(x)  // Continuous non-linear curve for entire signal
 ```
 
 **Math:**
@@ -232,11 +230,13 @@ tanh(x) = (e^x - e^(-x)) / (e^x + e^(-x))
 - Linear-ish for |x| < 0.5
 - Begins limiting around |x| = 1.0
 - Asymptotically approaches ±1.0 as |x| → ∞
+- **Smooth, continuous transition** at all amplitude levels
 
 **Why Soft Clip?**
 - Hard clipping (clamp) produces harsh, digital distortion
 - tanh is similar to analog tape/electronic limiting (more musical)
 - Preserves transients while controlling peaks
+- **Applied consistently to entire signal** to prevent audible "pops" or clicks caused by discontinuities
 
 ---
 
