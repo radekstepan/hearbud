@@ -464,11 +464,6 @@ namespace Hearbud
         protected override void OnStateChanged(EventArgs e)
         {
             base.OnStateChanged(e);
-            // Hide window when minimized (minimize to tray)
-            if (WindowState == WindowState.Minimized)
-            {
-                Hide();
-            }
         }
 
         /// <summary>
