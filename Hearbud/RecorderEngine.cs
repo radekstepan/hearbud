@@ -220,6 +220,8 @@ namespace Hearbud
 
         private string _loopDevName = "";
         private string _micDevName  = "(none)";
+        private string _activeLoopDeviceId = "";
+        private string _activeMicDeviceId  = "";
         private long _micUnderrunBlocks = 0;
         private long _loopBlockCounter = 0;
         private double _lastMicBacklogSec = 0.0;
@@ -638,6 +640,10 @@ namespace Hearbud
                         RaiseStatus(EngineStatusKind.Error, "Microphone device not found/selected.");
                     }
 
+                    // Record which devices are now active so disconnect detection can check them.
+                    _activeLoopDeviceId = opts.LoopbackDeviceId;
+                    _activeMicDeviceId  = opts.MicDeviceId ?? "";
+
                     return;
                 }
                 catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex)
@@ -677,9 +683,38 @@ namespace Hearbud
                 TryStopDispose(ref _loopCap);
                 TryStopDispose(ref _micCap);
                 _monitoring = false;
+
+                // Clear tracked device IDs when monitoring stops.
+                _activeLoopDeviceId = "";
+                _activeMicDeviceId  = "";
             }
 
             if (fullStop) Info("Stopped.");
+        }
+
+        /// <summary>
+        /// Called by the UI when Windows reports a device removal or state change to Unplugged.
+        /// If the affected device is one currently in use, stops recording safely (draining
+        /// the write queue and finalising WAV headers) then tears down monitoring.
+        /// Safe to call from any thread — all UI work is marshalled inside the engine events.
+        /// </summary>
+        public async Task HandleDeviceDisconnectedAsync(string deviceId)
+        {
+            if (!_monitoring) return;
+            if (deviceId != _activeLoopDeviceId && deviceId != _activeMicDeviceId) return;
+
+            if (_recording)
+            {
+                // StopAsync drains the write queue and closes the WAV files safely before returning.
+                RaiseStatus(EngineStatusKind.Error,
+                    "Audio device disconnected — stopping recording safely…");
+                await StopAsync();
+            }
+            else
+            {
+                StopInternal(fullStop: true);
+                RaiseStatus(EngineStatusKind.Info, "Audio device disconnected.");
+            }
         }
 
         // ==========================================

@@ -17,11 +17,12 @@ using H.NotifyIcon;
 
 namespace Hearbud
 {
-    public partial class MainWindow : Window
+    public partial class MainWindow : Window, IMMNotificationClient
     {
     private readonly RecorderEngine _engine = new();
     private readonly System.Timers.Timer _uiTimer = new(100);
     private TaskbarIcon? _trayIcon;
+    private MMDeviceEnumerator? _notifEnumerator;
 
     private AppSettings _settings = AppSettings.Load();
         private readonly Dictionary<string, MMDevice> _micDict = new();
@@ -66,6 +67,11 @@ namespace Hearbud
 
                     // Auto-start live monitoring so meters show immediately
                     TryStartAutoMonitor();
+
+                    // Register for Windows audio device notifications (plug/unplug).
+                    // Must be done after the window handle exists (i.e. inside Loaded).
+                    _notifEnumerator = new MMDeviceEnumerator();
+                    _notifEnumerator.RegisterEndpointNotificationCallback(this);
                 };
 
                 _engine.LevelChanged += OnEngineLevelChanged;
@@ -273,6 +279,7 @@ namespace Hearbud
                 StartBtn.IsEnabled = false;
                 StopBtn.IsEnabled  = true;
                 StatusText.Text = "Recording...";
+                UpdateTrayTooltip();
             }
             catch (Exception ex)
             {
@@ -293,6 +300,7 @@ namespace Hearbud
                 StartBtn.IsEnabled = true;
                 StopBtn.IsEnabled = false;
             }
+            UpdateTrayTooltip();
         }
 
         private static string SanitizeFilename(string name)
@@ -378,6 +386,7 @@ namespace Hearbud
 
                     StartBtn.IsEnabled = true;
                     StopBtn.IsEnabled = false;
+                    UpdateTrayTooltip();
 
                     WpfMessageBox.Show(
                         $"Saved files to:\n{Path.GetDirectoryName(e.OutputPathSystem)}",
@@ -498,6 +507,12 @@ namespace Hearbud
             base.OnClosed(e);
             try { _uiTimer.Stop(); } catch { }
             try { _trayIcon?.Dispose(); } catch { }
+
+            // Unregister device notifications before disposing the enumerator.
+            try { _notifEnumerator?.UnregisterEndpointNotificationCallback(this); } catch { }
+            try { _notifEnumerator?.Dispose(); } catch { }
+            _notifEnumerator = null;
+
             try
             {
                 // Persist current UI selections
@@ -573,6 +588,76 @@ namespace Hearbud
             }
             catch { }
             return 192;
+        }
+
+        // ==========================================
+        // DEVICE NOTIFICATION (IMMNotificationClient)
+        // ==========================================
+
+        /// <summary>
+        /// Fires when a new audio endpoint device is added to the system (e.g. USB headset plugged in).
+        /// Refreshes device combos and restarts auto-monitoring so meters stay live.
+        /// </summary>
+        public void OnDeviceAdded(string deviceId)
+        {
+            // Callbacks arrive on a COM background thread — marshal everything back to the UI thread.
+            Dispatcher.BeginInvoke(() =>
+            {
+                SafeRefreshDevices();
+                UpdateTrayTooltip();
+                TryStartAutoMonitor();
+            });
+        }
+
+        /// <summary>
+        /// Fires when an audio endpoint device is removed (e.g. USB headset unplugged).
+        /// If the removed device is the one currently being used for recording or monitoring,
+        /// the engine will stop safely before the combos are refreshed.
+        /// </summary>
+        public void OnDeviceRemoved(string deviceId)
+        {
+            Dispatcher.BeginInvoke(async () =>
+            {
+                // Stop the engine first (safe-drains the write queue if recording).
+                await _engine.HandleDeviceDisconnectedAsync(deviceId);
+                SafeRefreshDevices();
+                UpdateTrayTooltip();
+            });
+        }
+
+        /// <summary>
+        /// Fires when an existing device changes state (e.g. headphone jack goes from Active to Unplugged).
+        /// Routes to OnDeviceAdded/Removed so the same logic applies.
+        /// </summary>
+        public void OnDeviceStateChanged(string deviceId, DeviceState newState)
+        {
+            if (newState == DeviceState.Active)
+                OnDeviceAdded(deviceId);
+            else if (newState is DeviceState.Unplugged or DeviceState.NotPresent)
+                OnDeviceRemoved(deviceId);
+        }
+
+        /// <summary>Not used — we don't need to react to default-device changes.</summary>
+        public void OnDefaultDeviceChanged(DataFlow dataFlow, Role role, string defaultDeviceId) { }
+
+        /// <summary>Not used — we don't react to property-value changes on devices.</summary>
+        public void OnPropertyValueChanged(string deviceId, PropertyKey key) { }
+
+        /// <summary>
+        /// Updates the system tray tooltip to reflect whether recording is active
+        /// and which output device is selected.
+        /// </summary>
+        private void UpdateTrayTooltip()
+        {
+            if (_trayIcon == null) return;
+            var spkName = SpeakerCombo.SelectedItem as string;
+            var micName = MicCombo.SelectedItem as string;
+
+            _trayIcon.ToolTipText = _engine.IsRecording
+                ? $"\u25cf Recording \u2014 {spkName ?? "No device"}"
+                : spkName != null
+                    ? $"Hearbud \u2014 {spkName}"
+                    : "Hearbud \u2014 No device connected";
         }
     }
 }
