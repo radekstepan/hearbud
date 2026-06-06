@@ -78,6 +78,37 @@ dotnet publish Hearbud/Hearbud.csproj -c Release -r win-arm64 --self-contained -
 
 ---
 
+## Testing
+
+Tests are written with **xUnit** and live in `Hearbud.Tests/`. They target `net8.0-windows` and must be run on Windows.
+
+```bash
+# Restore dependencies (first time only)
+dotnet restore
+
+# Run the full test suite
+dotnet test
+
+# Run with verbose output
+dotnet test --logger "console;verbosity=detailed"
+
+# Run a single test class (e.g., DbfsTests)
+dotnet test --filter "FullyQualifiedName~DbfsTests"
+
+# Run a single test method
+dotnet test --filter "FullyQualifiedName~Hearbud.Tests.DbfsTests.ToDbfs_ReturnsExpectedValue"
+```
+
+Code coverage is collected via `coverlet.collector`:
+
+```bash
+dotnet test --collect:"XPlat Code Coverage"
+```
+
+For manual/integration testing checklists (audio hardware, gain controls, MP3 encoding, edge cases), see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md#testing-guidelines).
+
+---
+
 ## Documentation
 
 For detailed architecture, contributing guidelines, and troubleshooting, see [docs/](docs/) folder:

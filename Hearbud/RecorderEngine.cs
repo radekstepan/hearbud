@@ -1122,8 +1122,11 @@ namespace Hearbud
                 float v = src[i];
                 if (v > 1f) v = 1f; else if (v < -1f) v = -1f;
                 
-                // Use long for intermediate calculation to avoid overflow
-                long scaled = (long)Math.Round(v * 2147483647.0);
+                // Use long for intermediate calculation to avoid overflow.
+                // Asymmetric scale: +1.0 → +int.MaxValue, -1.0 → int.MinValue (WAVE spec).
+                long scaled = v >= 0
+                    ? (long)Math.Round(v * 2147483647.0)
+                    : (long)Math.Round(v * 2147483648.0);
                 scaled = Math.Clamp(scaled, int.MinValue, int.MaxValue);
                 int s = (int)scaled;
                 

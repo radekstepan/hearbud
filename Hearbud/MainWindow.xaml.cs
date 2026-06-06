@@ -1,4 +1,5 @@
 using CSCore.CoreAudioAPI;
+using CSCore.Win32; // PropertyKey
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -626,14 +627,14 @@ namespace Hearbud
         }
 
         /// <summary>
-        /// Fires when an existing device changes state (e.g. headphone jack goes from Active to Unplugged).
+        /// Fires when an existing device changes state (e.g. headphone jack goes from Active to UnPlugged).
         /// Routes to OnDeviceAdded/Removed so the same logic applies.
         /// </summary>
         public void OnDeviceStateChanged(string deviceId, DeviceState newState)
         {
             if (newState == DeviceState.Active)
                 OnDeviceAdded(deviceId);
-            else if (newState is DeviceState.Unplugged or DeviceState.NotPresent)
+            else if (newState is DeviceState.UnPlugged or DeviceState.NotPresent)
                 OnDeviceRemoved(deviceId);
         }
 
