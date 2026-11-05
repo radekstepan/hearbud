@@ -37,7 +37,18 @@ namespace Hearbud
             lock (_sync)
             {
                 if (_initialized) return;
-                PortAudio.Initialize();
+                try
+                {
+                    PortAudio.Initialize();
+                }
+                catch (Exception ex) when (ex is not InvalidOperationException)
+                {
+                    // Normalize native init failures (missing PortAudio
+                    // library on non-macOS hosts, no audio subsystem, ...)
+                    // into the seam's documented contract exception.
+                    throw new InvalidOperationException(
+                        "PortAudio initialization failed: " + ex.Message, ex);
+                }
                 _initialized = true;
             }
         }

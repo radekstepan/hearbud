@@ -17,12 +17,26 @@ permissions:
 jobs:
   build-windows:
     runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 45
     steps:
       - name: Check out
         uses: actions/checkout@v4
         with:
           clean: true
           fetch-depth: 0
+
+      - name: Preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            throw 'missing: git (install Git for Windows machine-wide)'
+          }
+          $vc = Join-Path $env:SystemRoot 'System32\vcruntime140.dll'
+          if (-not (Test-Path $vc)) {
+            throw 'missing: vcruntime140.dll (install the VC++ Redistributable)'
+          }
+          git --version
 
       - name: Bump patch version
         id: bump
@@ -73,17 +87,34 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 9.0.x
+        env:
+          # The self-hosted runner runs as NETWORK SERVICE: Program Files is
+          # not writable, so install the SDK into the runner tool cache.
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}\dotnet
+
+      - name: Verify .NET
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+            throw 'missing: dotnet after setup-dotnet'
+          }
+          dotnet --list-sdks
 
       - name: Restore
+        shell: pwsh
         run: dotnet restore Hearbud.sln
 
       - name: Test
+        shell: pwsh
         run: dotnet test Hearbud.sln -c Release --no-restore
 
       - name: Publish win-x64
+        shell: pwsh
         run: dotnet publish Hearbud/Hearbud.csproj -c Release -r win-x64 --self-contained -o ./dist/win-x64
 
       - name: Publish win-arm64
+        shell: pwsh
         run: dotnet publish Hearbud/Hearbud.csproj -c Release -r win-arm64 --self-contained -o ./dist/win-arm64
 
       - name: Upload artifact

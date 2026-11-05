@@ -41,6 +41,17 @@ Record your PC’s **system audio (WASAPI loopback)** and your **microphone** at
 - **.NET 9 SDK**
 - **NAudio.Wasapi / NAudio.Core 3.3.0** (NuGet restored automatically)
 
+### Self-hosted CI runner
+
+The [build workflow](.github/workflows/build.yml) runs on a Windows self-hosted runner as `NETWORK SERVICE`. The machine needs:
+
+- **PowerShell 7** (`pwsh`) — every workflow step pins `shell: pwsh`
+- **Git for Windows** installed machine-wide, with `C:\Program Files\Git\cmd` on the system PATH (restart the runner service after changing PATH)
+- **VC++ Redistributable** — ships `vcruntime140.dll`, required by native audio dependencies
+- Outbound HTTPS to `github.com` — with a default-deny firewall, whitelist the runner directory, `git.exe`, and `dotnet.exe`
+
+The .NET 9 SDK needs no machine-wide install: CI installs it into the runner tool cache automatically (`DOTNET_INSTALL_DIR`, SDK pinned via `global.json`). Preflight fails fast with an actionable message if `git` or `vcruntime140.dll` is missing.
+
 ---
 
 ## Build & Run
@@ -84,7 +95,7 @@ dotnet publish Hearbud/Hearbud.csproj -c Release -r win-arm64 --self-contained -
 
 ## Testing
 
-Tests are written with **xUnit** and live in `Hearbud.Tests/`. They target `net9.0` and run on any OS. The whole suite is hardware-free (193 tests).
+Tests are written with **xUnit** and live in `Hearbud.Tests/`. They target `net9.0` and run on any OS. The whole suite is hardware-free (228 tests).
 
 ```bash
 # Restore dependencies (first time only)

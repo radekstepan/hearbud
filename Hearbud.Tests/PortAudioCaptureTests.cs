@@ -1,7 +1,9 @@
 // Guards the macOS PortAudio capture backend seam: construction, device
 // enumeration, and the documented no-notifications behavior. Fully
-// deterministic — enumeration needs no mic permission and never throws, so
-// these are safe headless on any OS. No timing asserts.
+// deterministic — enumeration swallows PortAudio failures (empty list) and
+// init failures surface as InvalidOperationException per the seam contract,
+// so these are safe headless on any OS, including hosts without the native
+// PortAudio library. No timing asserts.
 
 using System;
 using Xunit;
