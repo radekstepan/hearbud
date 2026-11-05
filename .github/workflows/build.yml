@@ -68,8 +68,11 @@ jobs:
               throw "No <Version> found in $props"
             }
             $newVersion = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
-            [IO.File]::WriteAllText($props,
-              $text -replace '<Version>\d+\.\d+\.\d+</Version>', "<Version>$newVersion</Version>")
+            # NOTE: -replace must stay in its own statement. Inside a method
+            # call the comma would split into a third argument and fail with
+            # "Cannot find an overload for WriteAllText and the argument count: 3".
+            $newText = $text -replace '<Version>\d+\.\d+\.\d+</Version>', "<Version>$newVersion</Version>"
+            [IO.File]::WriteAllText($props, $newText)
 
             git add $props
             git commit -m "chore: bump version to $newVersion [skip ci]"
