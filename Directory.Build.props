@@ -2,6 +2,6 @@
   <!-- Single source of truth for the app version. Bumped automatically by
        .github/workflows/build.yml on every push to master. -->
   <PropertyGroup>
-    <Version>0.3.2</Version>
+    <Version>0.3.3</Version>
   </PropertyGroup>
 </Project>
