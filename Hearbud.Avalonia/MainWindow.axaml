@@ -1,0 +1,199 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" x:Class="Hearbud.MainWindow"
+        Title="Hearbud" Height="518" Width="960"
+        MinWidth="900"
+        SizeToContent="Height"
+        FontSize="12"
+        CanResize="False"
+        Background="{StaticResource AppBackground}"
+        Foreground="{StaticResource ControlForeground}"
+        UseLayoutRounding="True">
+    <DockPanel LastChildFill="True" Margin="16">
+        <!-- Main content -->
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto" MinHeight="30"/>
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Devices -->
+            <Border Grid.Row="0" Grid.Column="0" Margin="0,0,8,4" Classes="card">
+                <Grid RowDefinitions="Auto,*">
+                    <Border Classes="card-header">
+                        <TextBlock Text="Audio Devices"/>
+                    </Border>
+                    <Border Grid.Row="1" Classes="card-body">
+                        <StackPanel Margin="6">
+                            <TextBlock Text="Microphone (Input)" FontWeight="SemiBold"/>
+                            <ComboBox x:Name="MicCombo"
+                                      Margin="0,4,0,0"
+                                      AutomationProperties.Name="Microphone Selection"
+                                      AutomationProperties.HelpText="Select the microphone to record from"/>
+                            <TextBlock Text="Audio Output (to capture)" Margin="0,12,0,0" FontWeight="SemiBold"/>
+                            <ComboBox x:Name="SpeakerCombo" Margin="0,4,0,0"/>
+                            <TextBlock x:Name="BlackHoleHint" Margin="0,6,0,0" FontSize="11" Opacity="0.65"
+                                       TextWrapping="Wrap" IsVisible="False"
+                                       Text="Tip: install the free BlackHole driver and select it here to capture system sound."/>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- Output -->
+            <Border Grid.Row="0" Grid.Column="1" Margin="8,0,0,4" Classes="card">
+                <Grid RowDefinitions="Auto,*">
+                    <Border Classes="card-header">
+                        <TextBlock Text="Output Settings"/>
+                    </Border>
+                    <Border Grid.Row="1" Classes="card-body">
+                        <StackPanel Margin="6">
+                            <TextBlock Text="Save Location" FontWeight="SemiBold"/>
+                            <DockPanel Margin="0,4,0,0">
+                                <Button Content="Browse…" Margin="8,0,0,0" Click="OnBrowseFolder" DockPanel.Dock="Right"/>
+                                <TextBox x:Name="OutputFolderText" IsReadOnly="True" VerticalAlignment="Center"
+                                         HorizontalAlignment="Stretch"
+                                         Background="{StaticResource ControlDisabled}"/>
+                            </DockPanel>
+
+                            <TextBlock Text="Base File Name (no extension)" Margin="0,12,0,0" FontWeight="SemiBold"/>
+                            <TextBox x:Name="BaseNameText" Margin="0,4,0,0" HorizontalAlignment="Stretch"/>
+
+                            <!-- Output Quality selector (selection handled in code:
+                                 Avalonia 11.3 ComboBox has no SelectedValuePath) -->
+                            <TextBlock Text="Output Quality" Margin="0,12,0,0" FontWeight="SemiBold"/>
+                            <ComboBox x:Name="OutputQualityCombo" Margin="0,4,0,0">
+                                <ComboBoxItem Content="Original (WAV)" Tag="0"/>
+                                <Separator/>
+                                <ComboBoxItem Content="96 kbps (MP3)"  Tag="96"/>
+                                <ComboBoxItem Content="128 kbps (MP3)" Tag="128"/>
+                                <ComboBoxItem Content="160 kbps (MP3)" Tag="160"/>
+                                <ComboBoxItem Content="192 kbps (MP3)" Tag="192"/>
+                                <ComboBoxItem Content="224 kbps (MP3)" Tag="224"/>
+                                <ComboBoxItem Content="256 kbps (MP3)" Tag="256"/>
+                                <ComboBoxItem Content="320 kbps (MP3)" Tag="320"/>
+                            </ComboBox>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- Gains -->
+            <Border Grid.Row="1" Grid.Column="0" Margin="0,4,8,4" Classes="card">
+                <Grid RowDefinitions="Auto,*">
+                    <Border Classes="card-header">
+                        <TextBlock Text="Live Gain Controls"/>
+                    </Border>
+                    <Border Grid.Row="1" Classes="card-body">
+                        <StackPanel Margin="6">
+                            <!-- Mic row -->
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="100"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="150"/>
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock Grid.Column="0" Text="Mic Gain" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                                <Slider x:Name="MicGain" Grid.Column="1" Minimum="0.0" Maximum="3.0" Value="1.0"
+                                        Height="30" HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                                        ValueChanged="OnGainChanged"/>
+                                <TextBlock x:Name="MicGainLabel" Grid.Column="2" TextAlignment="Right"
+                                           FontFamily="Consolas,Menlo,monospace" VerticalAlignment="Center"/>
+                            </Grid>
+
+                            <!-- Output/System row -->
+                            <Grid Margin="0,10,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="100"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="150"/>
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock Grid.Column="0" Text="Output Gain" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                                <Slider x:Name="LoopGain" Grid.Column="1" Minimum="0.0" Maximum="3.0" Value="1.0"
+                                        Height="30" HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                                        ValueChanged="OnGainChanged"/>
+                                <TextBlock x:Name="LoopGainLabel" Grid.Column="2" TextAlignment="Right"
+                                           FontFamily="Consolas,Menlo,monospace" VerticalAlignment="Center"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- Meters -->
+            <Border Grid.Row="1" Grid.Column="1" Margin="8,4,0,4" Classes="card">
+                <Grid RowDefinitions="Auto,*">
+                    <Border Classes="card-header">
+                        <TextBlock Text="Live Levels"/>
+                    </Border>
+                    <Border Grid.Row="1" Classes="card-body">
+                        <StackPanel Margin="6">
+                            <!-- Mic meter -->
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="70"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="80"/>
+                                    <ColumnDefinition Width="50"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Mic" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                                <ProgressBar Grid.Column="1" x:Name="MicBar" Minimum="0" Maximum="100" Margin="10,0"
+                                             HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                                             AutomationProperties.Name="Microphone Level"/>
+                                <TextBlock Grid.Column="2" x:Name="MicDb" TextAlignment="Right" FontFamily="Consolas,Menlo,monospace" VerticalAlignment="Center"/>
+                                <TextBlock Grid.Column="3" x:Name="MicClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="Center" Margin="8,0,0,0" FontWeight="Bold"/>
+                            </Grid>
+
+                            <!-- System meter -->
+                            <Grid Margin="0,10,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="70"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="80"/>
+                                    <ColumnDefinition Width="50"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="System" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                                <ProgressBar Grid.Column="1" x:Name="SysBar" Minimum="0" Maximum="100" Margin="10,0"
+                                             HorizontalAlignment="Stretch" VerticalAlignment="Center"/>
+                                <TextBlock Grid.Column="2" x:Name="SysDb" TextAlignment="Right" FontFamily="Consolas,Menlo,monospace" VerticalAlignment="Center"/>
+                                <TextBlock Grid.Column="3" x:Name="SysClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="Center" Margin="8,0,0,0" FontWeight="Bold"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- Controls -->
+            <StackPanel Orientation="Horizontal" Grid.Row="2" Grid.ColumnSpan="2" Margin="0,8,0,0">
+                <Button x:Name="RefreshBtn" Content="Refresh Devices" Click="OnRefreshDevices"/>
+                <Button x:Name="StartBtn" Content="Start Recording (Ctrl+R)" Click="OnStart" Margin="8,0,0,0"
+                        Classes="cta"
+                        AutomationProperties.Name="Start Recording"/>
+                <Button x:Name="StopBtn" Content="Stop (Ctrl+S)" Click="OnStop" IsEnabled="False" Margin="8,0,0,0"
+                        Classes="cta"/>
+            </StackPanel>
+
+            <!-- Status bar -->
+            <Separator Grid.Row="3" Grid.ColumnSpan="2" Margin="0,12,0,0"/>
+            <DockPanel Grid.Row="4" Grid.ColumnSpan="2" Margin="0,8,0,0">
+                <TextBlock x:Name="VersionText" DockPanel.Dock="Right" Opacity="0.5" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock x:Name="StatusText" Text="Ready to record" Opacity="0.8" />
+                    <ProgressBar x:Name="EncodingProgressBar" Width="120" Margin="15,0,0,0" IsVisible="False" Minimum="0" Maximum="100"/>
+                    <TextBlock x:Name="EncodingProgressText" Text="0%" Margin="5,0,0,0" IsVisible="False" FontFamily="Consolas,Menlo,monospace"/>
+                </StackPanel>
+            </DockPanel>
+        </Grid>
+    </DockPanel>
+</Window>

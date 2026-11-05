@@ -10,6 +10,7 @@ Welcome to the Hearbud documentation hub. This directory contains comprehensive 
 
 ### For Developers
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** - Development setup, code conventions, testing guidelines, debugging tips, and release process.
+- **[adr/](adr/0001-incremental-hardening-over-rewrite.md)** - Architecture decision records (0001–0012) for the engine's evolution, incl. the v2 migration.
 
 ### For Users and Maintainers
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - Common issues, error messages, and solutions for both users and developers.
@@ -35,18 +36,18 @@ Welcome to the Hearbud documentation hub. This directory contains comprehensive 
 ## Key Concepts to Understand
 
 ### Architecture
-- **Three Parallel WAV Files:** System, mic, and mix are always written separately
+- **Three Parallel WAV Files:** System, mic, and mix are always written separately (RF64 float32)
 - **Loopback as Clock Source:** System audio drives timing; mic is buffered and synchronized
-- **Async I/O with Pooling:** Disk writes offloaded to background thread, buffer pooling prevents GC pressure
+- **Single Mixer Thread:** One loopback-paced thread does DSP + RF64 writes + meters; capture callbacks only copy, stamp, and hand off
 
 ### Audio/DSP
 - **WASAPI Loopback Capture:** Captures what Windows plays to a speaker endpoint
-- **Soft Clipping:** Tanh-based limiting prevents harsh distortion
-- **TPDF Dither:** Reduces quantization noise when converting to 16-bit
-- **Ring Buffer Synchronization:** Handles clock drift between mic/loopback
+- **Kneed Soft-Limiter:** Transparent below the 0.8 knee, ceilinged to ±1 — prevents harsh distortion
+- **Float32 End to End:** No int/PCM conversion, so no dither stage
+- **Timestamp Synchronization:** 1 s horizon + PLL read rate + fractional cursor handle clock drift between mic/loopback
 
 ### Design Patterns
-- **Producer-Consumer:** Audio callbacks produce, background writer thread consumes
+- **Producer-Consumer:** Audio callbacks produce into DropOldest channels, the mixer thread consumes
 - **Idempotent Dispose:** Safe to call multiple times
 - **Throttle-Decouple:** Audio callbacks (~100 Hz) decoupled from UI updates (10 Hz)
 
@@ -55,7 +56,7 @@ Welcome to the Hearbud documentation hub. This directory contains comprehensive 
 - **[Project README](../README.md)** - Project overview, features, and getting started
 - **[GitHub Repository](https://github.com/radekstepan/hearbud)** - Source code and issue tracker
 - **[WASAPI Documentation](https://docs.microsoft.com/en-us/windows/win32/coreaudio/wasapi)** - Windows Audio Session API
-- **[CSCore Library](https://github.com/filoe/cscore)** - Audio processing library used by Hearbud
+- **[NAudio](https://github.com/naudio/NAudio)** - Audio capture and file/MP3 I/O library used by Hearbud
 
 ## Document Structure
 
@@ -64,7 +65,7 @@ Each documentation file serves a specific purpose:
 | File | Audience | Purpose |
 |------|----------|---------|
 | ARCHITECTURE.md | Devs, LLMs, curious users | System architecture, data flow, design decisions, performance |
-| WORKING_WITH_AUDIO.md | Devs, LLMs | Audio/DSP theory, WASAPI specifics, math, sync, metering, dithering |
+| WORKING_WITH_AUDIO.md | Devs, LLMs | Audio/DSP theory, WASAPI specifics, math, sync, metering, limiting |
 | CONTRIBUTING.md | Devs, contributors | Build setup, coding style, testing, releasing |
 | TROUBLESHOOTING.md | Users, devs | Common problems, error meanings, solutions, log analysis |
 

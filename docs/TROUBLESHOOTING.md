@@ -31,7 +31,7 @@ Error: The application to execute does not have a .NET Desktop Runtime installed
 ```
 
 **Solution:**
-- Install .NET 8 Desktop Runtime from [dotnet.microsoft.com](https://dotnet.microsoft.com/download/dotnet/8.0)
+- Install .NET 9 Desktop Runtime from [dotnet.microsoft.com](https://dotnet.microsoft.com/download/dotnet/9.0)
 - Or use the **self-contained** build (includes runtime)
 
 #### Antivirus Blocking
@@ -138,16 +138,21 @@ Get-Service -Name "AudioSrv"
 
 ### Device Disappears During Recording
 
-**Symptom:** Recording stops or gets errors when USB device unplugged
+**Symptom:** USB device unplugged mid-take; the affected leg drops out
 
-**Diagnosis:** Check session log (`*.txt`) for errors:
+**Diagnosis:** Check session log (`*.txt`):
 ```
-[...] ERROR OnLoopbackData: CSCore.CoreAudioAPI.MMDeviceException
+[...] INFO Loopback leg lost — rebuilding…
+[...] INFO Loopback leg recovered
 ```
+
+**Behavior:** Capture legs auto-rebuild with backoff while the mixer coasts on
+zeros, so the session survives short disconnects. If a device never returns,
+the take continues degraded (loopback-only or mic-only) with a loud status error.
 
 **Solution:**
-- Avoid unplugging devices during recording
-- Use robust connections (USB hub with stable power, etc.)
+- Replug promptly; recovery is automatic
+- Prefer robust connections (powered USB hub, etc.) for long takes
 
 ### Virtual Audio Drivers Not Detected
 
@@ -211,7 +216,7 @@ Get-Service -Name "AudioSrv"
 
 **Symptom:**
 ```
-[...] ERROR OpenDevices: CSCore.CoreAudioAPI.MMDeviceException: The audio endpoint cannot be used
+[...] ERROR OpenCaptureAsync: System.Runtime.InteropServices.COMException: The audio endpoint cannot be used
 ```
 
 **Cause:** Another application has exclusive access (e.g., DAW, game)
@@ -253,7 +258,7 @@ Get-Service -Name "AudioSrv"
 
 **Diagnosis:** Session log shows:
 ```
-[...] ERROR DiskWriteLoop fatal: IOException: The process cannot access the file...
+[...] ERROR MixerLoop fatal: IOException: The process cannot access the file...
 ```
 
 **Solution:**
@@ -272,7 +277,7 @@ Get-Service -Name "AudioSrv"
 **Diagnosis:** System audio is stereo, mic is mono
 
 **Solution:**
-- Hearbud automatically copies mono to both stereo channels (code in `ConvertToTarget`)
+- Hearbud captures stereo from every device; the WASAPI shared-mode engine upmixes mono mics automatically (no conversion code)
 - Check driver settings for mic: Ensure it's not misconfigured as stereo with one channel silent
 
 #### Physical Connection Issue
@@ -291,24 +296,94 @@ Get-Service -Name "AudioSrv"
 
 **Cause:** Clock drift between microphone ADC and system DAC
 
-**Normal Behavior:** Small drift (≤50 ms) is expected and compensated by ring buffer.
+**Normal Behavior:** Small drift (≤50 ms) is expected and compensated by the timestamp buffer + PLL.
 
 **If large delay (>100 ms):**
 
 #### Check Session Log
 
 ```text
-[...] INFO OnLoopbackData: Mic ring backlog: 0.1523 s (max 0.2000 s)
+[...] INFO AfterBlock: Mic backlog: 0.1523 s
 ```
 
 - `backlog`: ~0.1s is normal sync
 - `backlog` consistently near 0: Mic is too slow (underruns)
-- `backlog` consistently near max (4s): Mic is too fast (overruns)
+- `backlog` consistently near max (1 s horizon): Mic is too fast (overruns)
 
 **Workarounds:**
 - Record silence-only first to see drift direction
 - Adjust sample rate in driver to be closer to loopback
 - Use devices from same manufacturer if possible (clocks more synchronized)
+
+### Steady Hum or Buzz in the Mic Take
+
+**Symptom:** A faint, steady buzz heard in the headphones *and* present in the mic take.
+
+**Key fact:** 9 times out of 10 this is **upstream of anything Hearbud does**.
+The engine runs one float32 format with ±0.1% drift correction and a kneed
+limiter — its failure modes are warble, clicks, and dropouts, not a constant
+mains tone. A steady tone is the signature of an electrical / acoustic path.
+
+**Triage flowchart (2 minutes):**
+
+1. **Close Hearbud entirely.** Buzz still there at the same pitch?
+   → Yes: electrical or Windows-routing cause (suspects 1–2). Software can't
+   record what's already in the analog chain.
+2. **Unplug the headphones**, record mic-only. Mic buzz gone?
+   → Yes: acoustic crosstalk (suspect 3).
+3. Else → capture path (suspect 4): record the proof takes below.
+
+#### Suspect 1 — "Listen to this device" Loop (most likely, software)
+
+- Symptoms: buzz/hiss with nothing playing; mic meter dances when you tap the
+  desk; mic gain changes headphone noise.
+- Test: Sound settings → mic → Properties → Listen tab. If
+  "Listen to this device" is checked, Windows live-routes mic → headphones.
+  Uncheck it on **every** input (Stereo Mix, Line In too).
+- Note: the engine never enables software monitoring, and mic capture prefers
+  raw mode, which bypasses APO monitoring paths (cooked fallback excepted).
+
+#### Suspect 2 — Ground Loop / USB + GPU Whine (very likely, electrical)
+
+- Symptoms: constant 50/60 Hz hum, or a whine that follows GPU load, mouse
+  movement, or charger state. Persists with Hearbud closed.
+- Tests: unplug the laptop charger (hum drops? ground loop); mute Windows to 0
+  (hum stays? it's downstream of the DAC); stress the GPU (pitch follows? coil
+  whine); try another USB port / a powered hub for the headset.
+- Fix: break the loop — powered hub or USB isolator, one power strip for
+  PC+monitor+speakers, ferrite on the headphone cable, or an optical/USB DAC.
+- Proof: the hum watchdog is live — while mains hum persists the status line
+  shows `Mains hum @ N Hz` and the tray tooltip carries the reading (detector
+  trips above −50 dB, `HumWatch.DetectAboveDb`). If it clears after your fix,
+  you've proven it.
+
+#### Suspect 3 — Acoustic Crosstalk (likely if open-back / loud)
+
+- Symptoms: "buzz carries through the microphone" — the mic file holds a faint
+  copy of headphone output; louder with volume or a lifted earcup.
+- Test: 10 s of silence, headphones ON loud; then 10 s unplugged, same gain.
+  Null-compare the mic WAVs — buzz vanishing in take 2 means it arrived
+  through the air, not the wire.
+- Fix: closed-back cans at sane volume, mic closer (less gain = less room),
+  push-to-mute monitoring. Per-leg meters make it obvious: system-flat +
+  mic-buzzing = acoustic path.
+
+#### Suspect 4 — Capture-Path DSP Artifacts (possible, but sounds different)
+
+- Symptoms of *actual* engine faults: warble, clicks, dull transients,
+  dropouts — from drop/stall paths, **not** a steady mains tone. (The old
+  wholesale resampler, ring underruns, and global tanh are gone; see
+  [ADR-0010](adr/0010-phase2-sync-dsp.md) and
+  [ADR-0012](adr/0012-phase4-naudio-rewrite.md).)
+- Test: record mic-only and check the session log for drop/underrun counts
+  (`HealthReport.DroppedBlocks`, mixer-starved warnings) — those are clicks,
+  not hum.
+
+#### Key Diagnostic Partition
+
+WASAPI loopback taps the mix **before the DAC** — headphone buzz physically
+cannot enter through the system leg. If `*-system.wav` buzzes, the source app
+(or a render-path APO) put it there. Mic-only buzz ⇒ suspects 1–4 above.
 
 ---
 
@@ -373,7 +448,7 @@ Get-Service -Name "AudioSrv"
 
 #### Media Foundation Not Available
 
-**Symptom:** MP3 encoding fails with CSCore error
+**Symptom:** MP3 encoding fails with a Media Foundation error
 
 **Diagnosis:** Windows Media Foundation codecs missing (rare on Windows 10/11)
 
@@ -487,21 +562,20 @@ Get-Service -Name "AudioSrv"
 2. Use "Memory Usage" graph
 3. Take snapshots before/after long recording
 
-#### Large Ring Buffer
+#### Large Sync Buffer
 
-**Normal:** Ring buffer is 4 sec × 48 kHz × 2 ch × 4 bytes ≈ 1.5 MB (normal)
+**Normal:** Mic sync buffer starts at 4 s × 48 kHz × 2 ch × 4 bytes ≈ 1.5 MB and caps at 30 s
 
 **If larger:**
-- Check `EnsureRingCapacity` expansion logic
-- Configured incorrectly (_micRing oversized)
+- Check the session log for overflow warnings (mic much faster than loopback)
 
-#### Temporary Buffers Not Pooled
+#### Temporary Buffers in Callbacks
 
 **Diagnosis:** Frequent allocations in callbacks
 
 **Solution (for developers):**
-- Ensure all temp buffers use `ArrayPool<T>.Shared`
-- No `new byte[]` in `OnLoopbackData`/`OnMicData`
+- One `float[]` per block is by design (~200/sec); do NOT pool at the drop-oldest handoff (evictions would leak)
+- The mixer itself must allocate nothing per tick (preallocated scratch)
 
 ---
 
@@ -526,7 +600,7 @@ Get-Service -Name "AudioSrv"
 **Diagnosis:** Session log shows:
 ```
 [...] INFO Encoding MP3: ... @ 192kbps
-[...] ERROR MP3 encode: CSCore.MediaFoundation.MediaFoundationException
+[...] ERROR MP3 encode: NAudio.MediaFoundation.MediaFoundationException
 ```
 
 **Solution:**
@@ -588,8 +662,8 @@ Get-Service -Name "AudioSrv"
    ```
    [2025-12-23 14:35:10] ERROR AppDomain.UnhandledException:
    System.NullReferenceException: Object reference not set to an instance of an object.
-      at Hearbud.RecorderEngine.OnLoopbackData(Object sender, DataAvailableEventArgs e)
-      at CSCore.SoundInSource..cctor()
+      at Hearbud.RecorderEngine.MixerTick()
+      at Hearbud.RecorderEngine.MixerLoopAsync(CancellationToken ct)
    ```
 
 3. **Analyze Stack Trace:**
@@ -605,8 +679,8 @@ Get-Service -Name "AudioSrv"
 
 | Stack Trace Location | Likely Cause | Workaround |
 |-----------------------|--------------|------------|
-| `OnLoopbackData` or `OnMicData` | Audio callback exception | Check device, lower sample rate |
-| `DiskWriteLoop` | Disk I/O failure | Try different output folder |
+| `OnLoopData` or `OnMicData` | Audio callback exception | Check device; callbacks must never throw |
+| `MixerTick` / `ProcessAndWrite` | DSP or disk I/O failure | Try different output folder; check `HealthReport` drops |
 | `MainWindow` ctor | UI initialization | Check .NET version, corrupted install |
 | `App.xaml.cs` | Global handler | Usually indicates deeper problem, inspect logs |
 
@@ -617,18 +691,18 @@ Session log (`*.txt` in output folder) is invaluable for diagnosing:
 #### Mic Sync Issues
 
 ```text
-[...] INFO OnLoopbackData: Mic ring backlog: 0.1523 s (max 0.2000 s)
-[...] WARN OnLoopbackData: Mic underrun detected
+[...] INFO AfterBlock: Mic backlog: 0.1523 s (max 0.2000 s)
 ```
 
+- Steady ~0.12 s: PLL locked, healthy
 - Consistently low backlog (<0.05 s): Mic slow
-- Consistently high backlog (>0.2 s): Mic fast
+- Growing backlog: Mic fast (overruns) or loopback stalled
 - Frequent underruns: Clock mismatch or device issue
 
-#### Write Queue Issues
+#### Mixer / Disk Issues
 
 ```text
-[...] WARN DiskWriteLoop: Disk write error: The device is not ready
+[...] WARN MixerTick: Disk write error: The device is not ready
 ```
 
 - Disk failure, network drive offline, etc.
@@ -636,7 +710,7 @@ Session log (`*.txt` in output folder) is invaluable for diagnosing:
 #### Encoding Errors
 
 ```text
-[...] ERROR MP3 encode: CSCore.MediaFoundation.MediaFoundationException: HRESULT 0xC00D36E4
+[...] ERROR MP3 encode: NAudio.MediaFoundation.MediaFoundationException: HRESULT 0xC00D36E4
 ```
 
 - Code indicates specific Media Foundation failure
@@ -646,11 +720,11 @@ Session log (`*.txt` in output folder) is invaluable for diagnosing:
 
 ## Developer-Specific Issues
 
-### Building Fails with CSCore Errors
+### Building Fails with NAudio Errors
 
 **Symptom:** Compilation errors like:
 ```
-The type or namespace name 'WasapiLoopbackCapture' could not be found
+The type or namespace name 'WasapiRecorder' could not be found
 ```
 
 **Solution:**
@@ -658,9 +732,9 @@ The type or namespace name 'WasapiLoopbackCapture' could not be found
    ```bash
    dotnet restore
    ```
-2. Check CSCore package installed:
+2. Check NAudio packages installed:
    - Open `Hearbud.csproj`
-   - Verify `<PackageReference Include="CSCore" Version="1.2.1.2" />`
+   - Verify `<PackageReference Include="NAudio.Wasapi" Version="3.3.0" />` and `NAudio.Core`
 3. Clear NuGet cache if corrupted:
    ```bash
    dotnet nuget locals all --clear
@@ -673,21 +747,22 @@ The type or namespace name 'WasapiLoopbackCapture' could not be found
 **Cause:** Debug build optimizations disabled, timing differences cause callback issues
 
 **Diagnosis:**
-- Set breakpoints; see if callbacks actually firing
-- Check `FillWithZeros` on SoundInSource
+- Set breakpoints; see if `DataAvailable` callbacks actually fire
+- Check the session log for rebuild/drop warnings
 
 **Solution:**
 - Usually due to debugging interfering; try `Release` build
-- Check if async I/O works in debug (maybe queue issues)
+- Check `HealthReport.DroppedBlocks` — the mixer may be starved under a debugger
 
 ### Tests Failing Due to No Audio Hardware
 
 **Symptom:** Integration tests fail when run on CI/headless machine
 
 **Solution:**
-- Mock `MMDeviceEnumerator` in tests
-- Use virtual audio drivers on CI
-- Mark tests as integration-only requiring hardware
+- No longer needed: the whole suite is hardware-free (synthesized tones, temp
+  files, reflection seams). It targets `net9.0-windows`, so run it on Windows
+  or cross-check with a raw-`csc` harness (see `CONTRIBUTING.md`
+  § Automated Tests).
 
 ### Profiling Performance Issues
 
@@ -707,9 +782,9 @@ Use WPT (Windows Performance Toolkit) for GPU, disk, DPC analysis.
 2. Monitor CPU usage, memory, GC pauses
 
 **Common Hot Paths:**
-- `OnLoopbackData` / `OnMicData`: Most time spent here, optimize heavily
-- Resampling in `ConvertToTarget`: Linear interpolation is fast, but verify no allocations
-- MP3 encoding: Post-process, can pause UI thread if run directly (but it's on Task.Run)
+- `MixerTick` / `ProcessMixBlock`: Most time spent here — per-sample DSP plus disk writes
+- `TimestampedMicBuffer.Read`: Linear-interp pull; verify no per-tick allocs
+- MP3 encoding: Post-process on `Task.Run` (masters already safe)
 
 ---
 

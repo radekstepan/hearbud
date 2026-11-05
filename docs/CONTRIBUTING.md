@@ -17,7 +17,7 @@ This document provides guidelines for contributing to Hearbud, including setup, 
 ### Prerequisites
 
 - **Windows OS** (Hearbud is Windows-only due to WASAPI dependency)
-- **.NET 8 SDK** - [Download from Microsoft](https://dotnet.microsoft.com/download/dotnet/8.0)
+- **.NET 9 SDK** - [Download from Microsoft](https://dotnet.microsoft.com/download/dotnet/9.0)
 - **Visual Studio 2022** (recommended) or VS Code with C# extension
 - **Git** for version control
 
@@ -176,7 +176,7 @@ Hearbud follows standard .NET conventions with some project-specific rules:
 | Events | PascalCase | `LevelChanged`, `Status`, `EncodingProgress` |
 | Enums | PascalCase | `LevelSource`, `EngineStatusKind` |
 | Interfaces | IPascalCase | (No interfaces currently in Hearbud) |
-| Private methods | camelCase | `OnLoopbackData()`, `ConvertToTarget()` |
+| Private methods | PascalCase | `OnLoopData()`, `MixerTick()` |
 
 ### File Organization
 
@@ -234,13 +234,10 @@ namespace Hearbud
 **Good:**
 ```csharp
 using System;
-using System.Buffers;
-using System.Collections.Concurrent;
 using System.Diagnostics;
-using CSCore;
-using CSCore.CoreAudioAPI;
-using CSCore.SoundIn;
-using CSCore.Streams;
+using System.Threading.Channels;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
 
 namespace Hearbud
 {
@@ -324,11 +321,11 @@ catch (Exception ex)
 
 **Resource Cleanup:**
 ```csharp
-private static void TryStopDispose(ref WasapiCapture? cap)
+private static void StopDisposeRecorder(ref WasapiRecorder? rec)
 {
-    try { cap?.Stop(); } catch { }
-    try { cap?.Dispose(); } catch { }
-    cap = null;
+    try { rec?.StopRecording(); } catch { }
+    try { rec?.Dispose(); } catch { }
+    rec = null;
 }
 ```
 
@@ -346,8 +343,8 @@ public sealed class RecorderEngine : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        try { _loopCap?.Dispose(); } catch { }
-        try { _micCap?.Dispose(); } catch { }
+        try { _mixCts?.Cancel(); } catch { }
+        StopInternal(); // detach callbacks, stop + dispose recorders
         // ...
     }
 }
@@ -388,12 +385,12 @@ public void Start(RecorderStartOptions opts)
 These methods are called ~100 times per second. **Optimize heavily:**
 
 ```csharp
-private void OnLoopbackData(object? sender, DataAvailableEventArgs e)
+private void OnLoopData(ReadOnlySpan<byte> span, AudioClientBufferFlags flags,
+    long devicePosition, long qpcPosition)
 {
-    // ✓ OK: Local calculations, array indexing
-    // ✓ OK: Array.Copy, Math operations
-    // ✗ NO: allocations, I/O, locks (unless quick), exceptions
-    // ✗ NO: LINQ (allocates), reflection, serialization
+    // ✓ OK: span copy, QPC stamp, channel TryWrite
+    // ✗ NO: I/O, locks, throws (a throw kills the capture thread)
+    // ✗ NO: LINQ (allocates), reflection, serialization, pooling (leaks on drop)
 
     // Good
     for (int i = 0; i < count; i++)
@@ -446,6 +443,42 @@ Since Hearbud is a desktop app interacting with audio hardware, testing requires
    - System audio (YouTube Spotify, etc.) for loopback
    - Speaking into mic for microphone capture
    - Mix of both
+
+### Automated Tests
+
+The xUnit suite in `Hearbud.Tests/` targets `net9.0-windows`; on Windows run
+it normally:
+
+```powershell
+dotnet restore
+dotnet test
+```
+
+The whole suite is hardware-free (synthesized tones, temp files, reflection
+seams), so it also runs on CI/headless machines. Coverage by area:
+
+- `EngineHealthTests` — drift math incl. a 50 ppm crystal case, report
+  round-trip, event wiring, hum merge.
+- `CrashSafeFilesTests` — tmp naming, uniqueness, atomic publish (+collision),
+  bitrate estimate, preflight rule, orphan sweep.
+- `GoertzelTests` — synthesized tones: silence floor, on/off separation,
+  50 vs 60 Hz ID, music-tone rejection.
+- `SoftLimiterTests`, `DcBlockerTests` — knee transparency, symmetry,
+  continuity, ceiling, ±∞/NaN, DC convergence.
+- `TimestampedMicBufferTests` — exact-lock passthrough, horizon edges, PLL
+  clamps, 100-ns QPC domain.
+- `StreamingWavWriterTests` — crash simulation (re-patched headers stay
+  playable), RF64 ds64, NAudio round-trips.
+- `CaptureHandoffTests`, `MixerDspTests` — DropOldest channels, mixer DSP.
+- `RecorderEngineDspTests`, `RecorderEnginePublicTests`, `AppSettingsTests`,
+  `ModelTests`, `DbfsTests` — engine seams, settings, models, metering math.
+
+Cross-check note: `dotnet test` cannot execute on macOS (MSBuild out-of-proc
+nodes need denied sockets, and the Windows testhost can't run there), so the
+suite was additionally verified there by compiling the real engine + test
+sources with raw `csc` (net9 SDK) against the real NAudio/xUnit assemblies
+and executing them with a reflection runner ([Fact], [Theory]+[InlineData],
+per-test construction/disposal, async awaited): 193/193 green.
 
 ### Manual Testing Checklist
 
@@ -500,6 +533,21 @@ Since Hearbud is a desktop app interacting with audio hardware, testing requires
 - [ ] Verify partial files exist (useful for recovery)
 - [ ] Verify no file corruption warnings on system
 
+#### Release Verification Gates
+
+Mandatory, in order, before calling an engine change shippable (carried over
+from the v2 migration's exit gates):
+
+- [ ] First Windows build green (WPF shell + device layer compile)
+- [ ] `dotnet test` green on Windows
+- [ ] 1-hour dual capture (loopback + mic), with USB yank/replug and a
+  default-device switch mid-take — session must survive via per-leg rebuild
+- [ ] Physical kill test at minute 30 of 60 — masters playable minus ≤2 s tail
+- [ ] 8-hour soak — drift stays < ±2 ms in the session log
+- [ ] Blind A/B vs the previous engine on identical takes
+- [ ] Threshold tuning from real-session data (0.25 s backlog, 50 ms drift,
+  −50 dB hum); hum watchdog cross-checked against a spectrum analyzer
+
 ### Load Testing
 
 - [ ] Record for 30+ minutes continuously
@@ -522,9 +570,8 @@ Since Hearbud is a desktop app interacting with audio hardware, testing requires
 Hearbud writes session logs alongside output files (e.g., `rec-20250623_143022.txt`):
 
 ```
-[2025-12-23 14:30:22.123] INFO Start: Recording started
-[2025-12-23 14:30:22.456] INFO OnLoopbackData: Mic ring backlog: 0.0523 s (max 0.1200 s)
-[2025-12-23 14:30:25.789] WARN OnMicData: Mic underrun detected
+[2025-12-23 14:30:22.123] INFO StartAsync: Recording started
+[2025-12-23 14:30:22.456] INFO AfterBlock: Mic backlog: 0.0523 s (max 0.1200 s)
 ```
 
 **Log Categories:**
@@ -539,7 +586,7 @@ Crashes are logged to `%LocalAppData%\Hearbud\logs.txt`:
 ```
 [2025-12-23 14:35:10] ERROR AppDomain.UnhandledException:
 System.NullReferenceException: Object reference not set to an instance of an object.
-   at Hearbud.RecorderEngine.OnLoopbackData(Object sender, DataAvailableEventArgs e)
+   at Hearbud.RecorderEngine.MixerTick()
 ```
 
 ### Visual Studio Debugging
@@ -573,7 +620,7 @@ if (_loopDevName == "Realtek") Debugger.Break();
 
 Audio callbacks are on background threads. Use thread-aware debugging:
 
-1. **Break** inside `OnLoopbackData` or `OnMicData`
+1. **Break** inside `OnLoopData`, `OnMicData`, or `MixerTick`
 2. **Threads Window** (Debug → Windows → Threads)
 3. **Freeze** the thread you want to inspect
 4. Use **Immediate Window** (`Debug → Immediate Window`):
@@ -589,7 +636,7 @@ Audio callbacks are on background threads. Use thread-aware debugging:
 #### Mic/Loopback Not Synced
 
 **Check:**
-- `_micRing` buffer depth in session log
+- `_micBuffer` depth (`DepthSec`) in session log
 - `_micUnderrunBlocks` counter
 - `_micBacklogSecMax` peak backlog
 
@@ -699,8 +746,8 @@ git push origin v0.2.7
 - **Architecture Overview:** See `docs/ARCHITECTURE.md`
 - **Audio/DSP Reference:** See `docs/WORKING_WITH_AUDIO.md`
 - **WASAPI Documentation:** [Microsoft Docs](https://docs.microsoft.com/en-us/windows/win32/coreaudio/wasapi)
-- **CSCore Library:** [GitHub Repository](https://github.com/filoe/cscore)
-- **.NET 8 Documentation:** [dotnet.microsoft.com](https://dotnet.microsoft.com/download/dotnet/8.0)
+- **NAudio:** [GitHub Repository](https://github.com/naudio/NAudio)
+- **.NET 9 Documentation:** [dotnet.microsoft.com](https://dotnet.microsoft.com/download/dotnet/9.0)
 
 ---
 

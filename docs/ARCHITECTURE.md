@@ -26,22 +26,22 @@ The app produces three files:
 ## Technology Stack
 
 ### Framework & Language
-- **.NET 8.0** targeting Windows
-- **C# 12** with nullable reference types enabled
+- **.NET 9.0** targeting Windows
+- **C# 13** with nullable reference types enabled
 - **WPF (Windows Presentation Foundation)** for UI
 - **Windows Forms** interop for folder browser dialog
 
 ### Key Dependencies
-- **CSCore** (v1.2.1.2) - Core audio processing library
-  - WASAPI loopback/capture APIs
-  - Wave file I/O
-  - Media Foundation integration for MP3 encoding
+- **NAudio.Wasapi / NAudio.Core** (v3.3.0) - Audio capture and file/MP3 I/O
+  - `WasapiRecorder` capture (loopback + mic, IAudioClient3, MMCSS)
+  - `WaveFileReader` for the MP3 post-step
+  - `MediaFoundationEncoder` for MP3 encoding
 - **H.NotifyIcon.Wpf** (v2.3.0) - System tray icon support
-- **System.Text.Json** (v8.0.5) - Settings serialization
+- **System.Text.Json** (v9.0.0) - Settings serialization
 
 ### Audio APIs
 - **WASAPI (Windows Audio Session API)** - Primary audio capture mechanism
-- **Media Foundation** - MP3 encoding via CSCore wrapper
+- **Media Foundation** - MP3 encoding via NAudio wrapper
 
 ---
 
@@ -59,31 +59,30 @@ The app produces three files:
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   RecorderEngine (Core)                     │
-│  - Audio capture (loopback + mic)                           │
-│  - Real-time mixing and DSP                                 │
-│  - Async disk I/O (background thread)                       │
-│  - Ring buffer synchronization                              │
+│  - NAudio capture (loopback + mic, float32 @ 48 kHz)         │
+│  - Single mixer thread: DSP + disk + meters                 │
+│  - Timestamp sync (1 s horizon + PLL read rate)             │
 └──────────────────────┬──────────────────────────────────────┘
                        │
-                       │ WASAPI Callbacks (OnLoopbackData, OnMicData)
+                       │ Callbacks: copy → stamp QPC → channel
                ┌───────┴────────┐
                │                │
                ▼                ▼
 ┌──────────────────┐  ┌──────────────────┐
 │ Loopback Capture │  │  Mic Capture     │
-│ (WasapiLoopback  │  │ (WasapiCapture)  │
-│  Capture)        │  │                  │
+│ (WasapiRecorder) │  │ (WasapiRecorder, │
+│                  │  │  raw mode)       │
 └──────────────────┘  └──────────────────┘
 ```
 
 ### Threading Model
 
 1. **UI Thread** - WPF main thread, handles user input and timer-based meter updates (100ms interval)
-2. **Audio Threads** - CSCore-managed threads calling `DataAvailable` callbacks (~100-150 times/sec)
-3. **Disk Writer Thread** - Background thread consuming from `BlockingCollection< AudioWriteJob>` queue
-4. **MP3 Encoding Thread** - Thread pool task during post-processing
+2. **Audio Threads** - NAudio MMCSS capture threads firing `DataAvailable` (~100 times/sec). Copy → stamp → `TryWrite`, nothing else.
+3. **Mixer Thread** - Single 10 ms `PeriodicTimer` loop draining both channels: timestamp sync, DSP (gain → DC block → kneed limit), metering, hum tap, and RF64 disk writes
+4. **MP3 Encoding** - Thread pool task during post-processing (masters already safe)
 
-**Critical Design Rule:** Never block the audio callback threads. All disk I/O is offloaded to the background writer thread.
+**Critical Design Rule:** Never block the audio callback threads. They hand blocks to bounded drop-oldest channels; the mixer owns everything downstream.
 
 ---
 
@@ -115,7 +114,7 @@ The app produces three files:
 **UI State Management:**
 - `_uiReady` flag guards UI updates during initialization
 - `_engine` (RecorderEngine) instance lives for window lifetime
-- Device dictionaries (`_micDict`, `_spkDict`) hold `MMDevice` objects for quick access
+- Device dictionaries (`_micDict`, `_spkDict`) hold name→id strings; the engine owns all WASAPI objects and surfaces `DevicesChanged` (see `AudioDeviceInfo` DTOs)
 
 **Timer Behavior:**
 - 100ms timer (`_uiTimer`) updates meters via `Dispatcher.Invoke()`
@@ -137,40 +136,40 @@ public sealed class RecorderEngine : IDisposable
 #### Key Internal State
 | Field | Purpose | Notes |
 |-------|---------|-------|
-| `_loopCap`, `_micCap` | WASAPI capture instances | `WasapiLoopbackCapture` / `WasapiCapture` |
-| `_loopIn`, `_micIn` | CSCore `SoundInSource` wrappers | FillWithZeros = true for safety |
-| `_wavSys`, `_wavMic`, `_wavMix` | Wave file writers | Managed by separate thread |
-| `_writeQueue`, `_writeTask` | Async I/O queue | BlockingCollection with capacity 2000 |
-| `_micRing` | Mic audio ring buffer | Synchronized via `_micRingLock` |
-| `_micGain`, `_loopGain` | Runtime-adjustable gains | Applied before mixing and metering |
-| `_outRate`, `_outChannels` | Output format | Matches loopback device |
+| `_loop`, `_mic` | NAudio `WasapiRecorder` instances | Loopback + raw-mode mic, float32 @ 48 kHz |
+| `_loopDev`, `_micDev` | Retained `MMDevice`s | Recorder holds them — must outlive recording |
+| `_loopQ`, `_micQ` | Bounded drop-oldest channels | 256/512 blocks; full = drop + count, never block |
+| `_loopFifo` | Loopback-side mixer FIFO | Mixer-owned; capped at 2 s with drop counting |
+| `_micBuffer` | `TimestampedMicBuffer` sync | 1 s horizon + PLL read rate (see ADR-0010) |
+| `_wavSys`, `_wavMic`, `_wavMix` | Owned RF64 writers | Mixer thread only; 2 s header re-patch |
+| `_mixTask`, `_mixCts` | Mixer loop lifetime | 10 ms `PeriodicTimer`; cancel + 5 s join on stop |
+| `_micGain`, `_loopGain` | Runtime-adjustable gains | `Volatile`, applied before mixing and metering |
+| `_outRate`, `_outChannels` | Output format | Fixed 48 kHz stereo (capture AT target) |
 
 #### Public API Methods
 
-##### `Monitor(RecorderStartOptions opts)`
-- Opens audio devices (if needed)
-- Starts audio streams (but no file output)
-- Activates level metering
-- Auto-restarts if monitoring already active
+##### `MonitorAsync(RecorderStartOptions opts)`
+- (Re)builds both capture legs at the target format, attaches callbacks, starts recording
+- Starts device notifications and the mixer task (meters live, no file output)
+- Always rebuilds (no stale-state optimization — correctness first)
 
-##### `Start(RecorderStartOptions opts)`
-- Calls `Monitor()` first (ensures devices open)
+##### `StartAsync(RecorderStartOptions opts)`
+- Calls `MonitorAsync()` first (ensures devices open)
+- Disk-space preflight: refuses to start below 20 MB free
 - Generates unique output file paths (handles name collisions like `rec (1).wav`)
-- Opens 3 parallel WAV files and 1 log file
-- Initializes async write queue and background writer thread
-- Resets mic ring buffer and counters
+- Opens 3 RF64 tmp files + 1 log file (final names published atomically on stop)
+- Resets sync buffer, counters, and the session QPC clock
 
 ##### `StopAsync()`
-- Sets `_recording = false`
-- Drains write queue: calls `_writeQueue.CompleteAdding()` and awaits `_writeTask`
-- **Critical:** WAV headers are finalized on `Dispose` after queue drains
-- Encodes MP3 (post-process) on thread pool thread
-- Closes log file
+- Sets `_recording = false`, stops capture; the mixer keeps running to drain
+- Bounded 30 s drain (channels + sync buffer + FIFO), then mixer shutdown
+- Disposes writers (headers already fresh from the 2 s re-patch), publishes tmp → final
+- Encodes MP3 (post-process) on a thread pool thread; masters already safe
+- Closes log file, raises `Stopped` with the published paths
 
 ##### `Dispose()`
-- Disposes all capture devices and file writers
-- Aborts write queue if still running
-- Full cleanup for app shutdown
+- Idempotent: cancels mixer, stops capture, disposes recorders/devices/writers
+- Unregisters device notifications; leaves tmp files recoverable (orphan sweep)
 
 ### 4. AppSettings
 **Purpose:** Persistent application settings
@@ -204,94 +203,54 @@ public sealed class RecorderEngine : IDisposable
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                          Audio Callback Thread                          │
-│                         (WASAPI-managed)                                │
+│                    NAudio MMCSS Capture Threads                         │
+│              (one per leg: loopback + mic, ~100 Hz)                     │
 └─────────────────────────┬───────────────────────────────────────────────┘
                           │
-                          │ DataAvailableEventArgs (PCM bytes)
-                          │
+                          │ DataAvailable: float32 span + 100-ns QPC stamp
+                          │ (copy → stamp → TryWrite; nothing else)
                           ▼
                  ┌───────────────────┐
-                 │ ReadExactSamples  │  ← Converts PCM to float samples
-                 │       ↓           │
-                 │   float[] buffer  │
+                 │ Bounded channels  │  ← DropOldest: full = drop + count
+                 │ _loopQ / _micQ    │     (256 / 512 blocks)
                  └─────────┬─────────┘
                            │
-                           │ [Mic only path]
-                           │
-                    ┌──────┴───────┐
-                    │ ConvertToTarget │  ← Resample/remix to match loopback format
-                    │       ↓        │
-                    │ _micConvBuf[]   │
-                    └──────┬─────────┘
-                           │
-                 ┌─────────▼─────────┐
-                 │ Mic Ring Buffer    │  ← Synchronized ring buffer
-                 │ (_micRing[])       │
-                 └─────────┬──────────┘
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-          ▼                ▼                ▼
-    ┌──────────┐    ┌──────────┐    ┌──────────┐
-    │ Metering │    │ Write Mic │    │ Queue to │
-    │ (accum)  │    │ WAV       │    │ Writer   │
-    └──────────┘    └──────────┘    └──────────┘
-                           │
-          [Loopback path]  │         [Mixing path]
-                           │
-          ┌────────────────▼────────────────┐
-          │     OnLoopbackData callback     │
-          │  (on same or separate thread)   │
-          └────────────────┬────────────────┘
-                           │
-                  ┌────────▼────────┐
-                  │ Read loopback   │
-                  │ to float[]      │
-                  └────────┬────────┘
-                           │
-                 ┌─────────▼──────────┐
-                 │ Pull same-sized    │  ← Clock source synchronization
-                 │ chunk from ring    │
-                 │ (zero-fill if late) │
-                 └─────────┬──────────┘
-                           │
-                 ┌─────────▼──────────┐
-                 │ Mix: s + m * 0.5   │  ← Apply gains in both loops
-                 │ + SoftClipIfNeeded │
-                 └─────────┬──────────┘
-                           │
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-    ┌──────────┐    ┌──────────┐    ┌──────────┐
-    │ Write Sys│    │ Write Mix│    │ Queue to │
-    │ WAV      │    │ WAV      │    │ Writer   │
-    └──────────┘    └──────────┘    └──────────┘
+                           │ drained by the mixer, never awaited
+                           ▼
+                 ┌─────────────────────────────┐
+                 │ Mixer tick (10 ms)          │
+                 │  loopback → FIFO (paced)    │
+                 │  mic → TimestampedMicBuffer │
+                 │  (1 s horizon + PLL rate)   │
+                 └──────────────┬──────────────┘
+                                │
+                 ┌──────────────▼──────────────┐
+                 │ ProcessMixBlock: gains →    │
+                 │ DC block → avg → kneed limit│
+                 │ + per-leg RMS/peak meters   │
+                 │ + hum tap on the mix        │
+                 └──────────────┬──────────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          ▼                     ▼                     ▼
+    ┌──────────┐          ┌──────────┐          ┌──────────┐
+    │ Write Sys│          │ Write Mic│          │ Write Mix│
+    │ RF64 WAV │          │ RF64 WAV │          │ RF64 WAV │
+    └──────────┘          └──────────┘          └──────────┘
 ```
 
-### Async Disk I/O Flow
+### Mixer & Disk I/O Flow
 
-```
-┌──────────────────────┐         ┌────────────────────────────────┐
-│ Audio Callbacks      │         │  Background Writer Thread      │
-│ (OnLoopbackData,     │         │  (DiskWriteLoop method)        │
-│  OnMicData)          │         └─────────────┬──────────────────┘
-│                      │                       │
-│ EnqueueWrite()       │   BlockingCollection │   For each job:
-│ + ArrayPool.Rent()   │◄──────────────────────────────────────────���►
-│ + Array.Copy()       │    _writeQueue        │   Switch(Target)
-│   _writeQueue.Add()  │                       │     wavSys?.Write()
-│                      │   (Capacity: 2000)    │     wavMic?.Write()
-│ [Non-blocking unless │   (~5 sec buffer)     │     wavMix?.Write()
-│  queue full]         │                       │   Finally:
-│                      │                       │     ArrayPool.Return()
-└──────────────────────┘                       └──────────────────────┘
-```
+The mixer thread owns DSP **and** disk: each 10 ms tick drains the channels,
+processes one block, and writes all three legs straight to the RF64 writers
+(2 s header re-patch + `WriteThrough`, so a kill loses ≤2 s of tail).
 
 **Key Points:**
-- `BlockingCollection` blocks producer if queue is full (rare, only on extreme disk stalls)
-- `_writeQueue.CompleteAdding()` signals end of data during stop
-- `ArrayPool<byte>.Shared` recycles buffers, zero per-block allocation overhead
+- Channels are the only cross-thread handoff; everything downstream is one thread
+- A disk stall slows the mixer, channels fill, oldest blocks drop **counted**
+  (`_droppedBlocks` → `HealthReport`) — capture threads never stall
+- Stop: capture halts, the mixer drains (bounded 30 s), then writers close and
+  tmp files publish atomically
 
 ### MP3 Encoding Flow (Post-Process)
 
@@ -300,20 +259,20 @@ StopAsync() called
           │
           ▼
 ┌─────────────────────┐
-│ Drain write queue   │  ← Await _writeTask completion
-│ Close WAV files     │  ← Headers finalized on Dispose
+│ Drain mixer         │  ← Bounded 30 s (channels + buffer + FIFO)
+│ Close WAV files     │  ← Headers already fresh from the 2 s re-patch
+│ Publish tmp → final │  ← Atomic rename, renumbered on collision
 └─────────────────────┘
           │
           ▼
    if Mp3BitrateKbps > 0
           │
           ▼
-┌─────────────────────┐   Task.Run on thread pool
+┌─────────────────────┐   Task.Run on thread pool (masters already safe)
 │ Task.Run {          │◄────────────────────────────────►
-│   WaveFileReader   │   Read mix.wav in chunks (64KB)
-│   Convert to 16-bit│   (if mix is 32-bit)
-│   MediaFoundation  │   encoder.Write(chunk)
-│   encoder.Write()  │   Report progress via event
+│   WaveFileReader   │   Read RF64 float mix
+│   → 16-bit PCM     │   Via WaveToSampleProvider + SampleToWaveProvider16
+│   MediaFoundation  │   EncodeToMp3 (synchronous; coarse 0/100 % progress)
 │ }                  │
 └─────────────────────┘
           │
@@ -325,8 +284,8 @@ StopAsync() called
 
 ## Design Decisions
 
-### 1. Loopback as Clock Source
-**Decision:** System/loopback audio is the timing master. Mic audio is buffered and pulled to match loopback chunks.
+### 1. Loopback-Paced Mixer
+**Decision:** System/loopback audio paces the session; the mixer pulls everything available each tick, and mic is pulled to match by timestamp.
 
 **Rationale:**
 - Keeps system and mic perfectly synced in the mix
@@ -334,75 +293,71 @@ StopAsync() called
 - Mimics what happens in reality: mic hears what the speaker outputs
 
 **Implications:**
-- If mic is late, gaps are zero-filled (silence preserved)
-- If loopback goes silent, mic can drive output to support mic-only sessions
-- **Watch out:** Stale mic data is dropped when loopback resumes, preventing echo artifacts
+- If mic is late, gaps are zero-filled (silence preserved, counted as underruns)
+- If loopback goes idle, steady mic-only pulls keep the session rolling
+- If both idle, the session pauses (no unbounded silence files)
+- Stale mic is dropped by timestamp horizon — no "old mic over new system" echo
 
-### 2. Three Parallel WAV Files
-**Decision:** Always write separate `*-system.wav`, `*-mic.wav`, and `*-mix.wav` files.
+### 2. Three Parallel RF64 Float WAV Files
+**Decision:** Always write separate `*-system.wav`, `*-mic.wav`, and `*-mix.wav` — all 48 kHz float32 stereo RF64.
 
 **Rationale:**
-- Users can later remix or edit individual tracks in DAW/audacity
-- System/mic WAVs are 16-bit (standard, widely compatible)
-- Mix WAV is 32-bit (headroom for before MP3 encoding)
+- Users can later remix or edit individual tracks in DAW/Audacity
+- One format everywhere: no conversion, no quantization, no 4 GB wall
 - Avoids lossy capture step even if final output is MP3
+- Headers re-patched every 2 s: a kill loses ≤2 s of tail, never the take
 
-### 3. Async I/O with BlockingCollection
-**Decision:** All disk writes happen on a background thread via a job queue.
+### 3. Single Mixer Thread + Drop-Oldest Channels
+**Decision:** Capture hands blocks to bounded channels; one mixer thread owns DSP and disk.
 
 **Rationale:**
 - Audio callback threads must never block (WASAPI is unforgiving)
-- Disk latency spikes (anti-virus scans, network drives, etc.) could cause glitches
-- Producer-consumer pattern cleanly separates concerns
+- One downstream thread means no lock pyramids and a single place to reason about backpressure
+- Disk stalls slow the mixer; channels fill and drop oldest **counted** (`HealthReport`)
 
-**Capacity Choice (2000 jobs):**
-- At 48kHz stereo, ~5 seconds of audio buffering
-- Queue full only during catastrophic disk failures (not typical)
+**Capacity Choice (256/512 blocks):**
+- Seconds of absorb at typical packet rates; drops only under real stalls
+- Every drop is visible in health instead of failing silently
 
-### 4. Buffer Pooling with ArrayPool
-**Decision:** Use `ArrayPool<byte>.Shared` to manage per-block buffers for disk writes.
-
-**Rationale:**
-- Zero allocation per audio block (no GC pressure)
-- Previously used `new byte[]` 100+ times/sec = significant heap churn
-- Pooling is a standard .NET optimization for high-frequency buffers
-- **Memory Safety:** `EnqueueWrite` uses a `try/finally` block to ensure rented buffers are always returned to the pool, preventing memory leaks if adding to the queue fails or an exception occurs.
-
-### 5. Ring Buffer for Mic Synchronization
-**Decision:** Mic audio goes into a ring buffer pulled by loopback ticks.
+### 4. Fresh Capture Arrays per Block (No Pooling at the Handoff)
+**Decision:** Callbacks allocate one `float[]` per block instead of renting from a pool.
 
 **Rationale:**
-- Handles mic/loopback sample rate differences (resampling in ConvertToTarget)
-- Mic typically arrives at slightly different rate or chunk sizes
-- Ring buffer natural overruns/underruns handled gracefully
+- ~200 small Gen0 arrays/sec is negligible for the GC
+- Pooling would leak on every DropOldest eviction (evicted arrays are never returned)
+- Simplicity + leak-proofing beats theoretical zero-alloc here
 
-**Sync Edge Case:** When loopback resumes after silence, existing mic backlog is dropped. This prevents "old mic over new system" echo effect.
-
-### 6. Soft Clipping (tanh) vs Hard Clipping
-**Decision:** Apply `Math.Tanh()` on samples exceeding ±1.0 before clamp.
+### 5. Timestamped Sync with PLL Read Rate
+**Decision:** Mic blocks carry 100-ns QPC stamps; a 1 s horizon drops stale mic and a PLL servos depth to 120 ms by bending the read rate in [0.999, 1.001].
 
 **Rationale:**
-- Tanh provides natural limiting curve (sounds better than hard clip)
-- Prevents harsh digital distortion when gains are pushed
-- Still clamps to [-1, 1] final range for PCM conversion
+- Independent device crystals drift ~±50 ppm — chunk counting creeps apart
+- Timestamps align by wall clock, not by counting; the servo absorbs drift continuously
+- Fractional cursor applies the ratio with no per-block rounding jitter
 
-### 7. TPDF Dither on 16-bit Conversion
-**Decision:** Add triangular probability density function (TPDF) dither when converting float to 16-bit PCM.
+**Sync Edge Case:** When loopback resumes after silence, mic older than 1 s is dropped by timestamp. This prevents "old mic over new system" echo effect.
 
-**Rationale:**
-- Reduces quantization noise (low-level "crunch" on quiet passages)
-- Two random samples subtracted creates triangular distribution (~-1.0 to +1.0)
-- Applied before rounding, results in more natural decay tails
-
-**Note:** Only applied to system/mic 16-bit WAVs, not 32-bit mix.
-
-### 8. 32-bit Mix for MP3 Quality
-**Decision:** Mix WAV is written as 32-bit PCM (configurable).
+### 6. Kneed Soft-Limiter (No Global tanh)
+**Decision:** The mix passes through `SoftLimiter`: bit-transparent below the 0.8 knee, smoothly ceilinged to ±1.
 
 **Rationale:**
-- Avoids extra 16-bit quantization step before MP3 encoding
+- Global tanh dulled even quiet transients; the knee only touches hot signals
+- Rounds off peaks instead of hard-clipping (no harsh digital distortion)
+
+### 7. DC Blocking on Mix Legs Only
+**Decision:** A ~8 Hz 1-pole high-pass runs on each mix leg before limiting; raw recordings stay bit-raw.
+
+**Rationale:**
+- Kills DC offset and subsonic rumble that eat headroom and confuse meters
+- Voice and music pass essentially untouched
+
+### 8. Float32 Masters for MP3 Quality
+**Decision:** MP3 encodes from the RF64 float32 mix via float → samples → clipped 16-bit.
+
+**Rationale:**
 - MP3 encoder's own quantization (psychoacoustic) is the only loss
-- 16-bit → MP3 would have two quantization steps, more perceptible
+- No intermediate 16-bit file quantization step
+- Masters are finalized and published before encoding starts, so encode failure only loses the `.mp3`
 
 ---
 
@@ -412,23 +367,23 @@ StopAsync() called
 
 | Optimization | Location | Impact |
 |-------------|----------|--------|
-| **Async I/O queue** | `DiskWriteLoop()`, `EnqueueWrite()` | Eliminates audio glitches from disk stalls |
-| **Buffer pooling** | `EnqueueWrite()`, `ArrayPool` | Zero GC pressure on per-block allocations |
-| **Reusable resampling scratch buffer** | `ConvertToTarget()` ref scratch | No allocations per resampling operation |
+| **Single mixer thread** | `MixerLoopAsync()` / `MixerTick()` | No locks on DSP/disk; one backpressure point |
+| **Drop-oldest channels** | `CaptureHandoff` | Stalls drop counted, never block capture |
+| **Preallocated mixer scratch** | `_sysBlock`/`_micBlock`/`_mixBlock`/`_ioBytes` | Power-of-2 growth, no per-tick allocs |
 | **Throttled level updates** | `_lastLevelTick*` fields | ~50ms throttle reduces UI cross-thread calls |
-| **Block-sized ring buffer** | `_micRing` with power-of-2 sizing | O(1) ring operations, efficient read/write |
+| **Bounded FIFOs** | `_loopFifo` cap, 30 s mic cap | Unbounded growth impossible by construction |
 
 ### Memory Management
 
 - **Pre-allocated buffers:** All significant float/byte arrays are pre-allocated and resized only when needed via `EnsureCapacity()` (power-of-2 sizing)
-- **No per-frame allocations:** The audio hot path allocates nothing (ArrayPool recycles buffers). `EnqueueWrite` ensures pool safety with `try/finally`.
-- **ThreadLocal Random:** `FloatToPcm16` uses thread-local RNG for dither, no lock contention
+- **Small per-block allocs:** Capture allocates one `float[]` per block (~200/sec, negligible Gen0); the mixer itself allocates nothing per tick
+- **No per-frame RNG/locks:** Float pipeline needs no dither and no conversion scratch
 
 ### Timing & Sync
 
-- **High-resolution timers:** `Stopwatch.GetTimestamp()` for precise timing calculations
+- **High-resolution timers:** `Stopwatch.GetTimestamp()` for throttle/health timing
 - **Tick conversion:** `_tickMs = 1000.0 / Stopwatch.Frequency` constant for tick-to-ms conversion
-- **Loopback silence detection:** `_lastLoopTick` + `LoopSilentMsThreshold` (200ms) detects when loopback is idle
+- **Audio timestamps:** NAudio 100-ns QPC stamps flow end to end into `TimestampedMicBuffer` (10 MHz domain, zero conversion)
 
 ---
 
@@ -436,15 +391,14 @@ StopAsync() called
 
 ### Critical Paths
 
-1. **Audio Callbacks (`OnLoopbackData`, `OnMicData`)**
-   - **DO NOT** allocate, block, or throw extensively
-   - All disk I/O via `EnqueueWrite()` (which can block only if queue is full)
-   - Metering accumulates locally, throttled events sent at ~50ms intervals
+1. **Audio Callbacks (`OnLoopData`, `OnMicData`)**
+   - Copy → stamp → `TryWrite`, then return; never block, touch disk, or throw (a throw kills the capture thread)
+   - ~200 small `float[]`/sec is fine; do NOT pool here (DropOldest would leak rents)
+   - Metering happens on the mixer; throttled level events sent at ~50ms intervals
 
-2. **Mic Ring Buffer Lock Contention**
-   - Brief critical sections via `lock (_micRingLock)`
-   - Keep lock duration minimal (just ring read/write operations)
-   - Two writers: `OnMicData` adds, `OnLoopbackData` consumes
+2. **Mixer Backpressure**
+   - If the mixer stalls (slow disk), channels drop oldest **counted** — watch `HealthReport.DroppedBlocks`
+   - `TimestampedMicBuffer` holds its own short lock (mic drain vs read are both mixer-side, so it never contends)
 
 3. **Dispose Pattern Safety**
    - `RecorderEngine.Dispose()` must be idempotent
@@ -455,11 +409,12 @@ StopAsync() called
 
 | Situation | Handling | Comment |
 |-----------|----------|---------|
-| Loopback silent >200ms | Mic drives output | Mix = mic-only, system = zeros |
-| Mic underrun (ring empty) | Zero-fill missing samples | Counted in `_micUnderrunBlocks` |
-| Mic overrun (ring full) | Oldest samples dropped | Happens when mic is much faster than loopback |
-| Queue full (disk stall) | Drops data to avoid callback stall | Logged immediately on first drop, then every 100 drops |
-| Device disappears during record | Exception in callback | Caught, logged, continues if possible |
+| Loopback idle, mic live | Steady 10 ms mic-only pulls | Mix = mic-only, system = zeros |
+| Both idle | Session pauses | No unbounded silence files (same as v1) |
+| Mic underrun (buffer short) | Zero-fill missing samples | Counted in `_micUnderrunBlocks` |
+| Mic overrun (>30 s buffered) | Oldest frames dropped, counted | Only if loopback stalls while mic runs |
+| Channel full (mixer stall) | Oldest block dropped, counted | Surfaced live in `HealthReport` |
+| Device disappears during record | Per-leg auto-rebuild with backoff | Mixer coasts on zeros; session survives |
 | MP3 encode failure | Logs error, WAVs still saved | User gets WAV files even if MP3 fails |
 
 ### Configuration Gotchas
@@ -478,22 +433,22 @@ StopAsync() called
    - Gains applied **before** metering and **before** mixing
    - `MicGain` affects mic WAV, meter, and mix contribution
    - `LoopGain` affects system WAV, meter, and mix contribution
-   - Mix formula: `(s * LoopGain + m * MicGain) * 0.5`
+   - Mix chain per sample: gain → DC block → average → kneed limit (see `MixerDsp`)
 
 ### Build/Distribution Notes
 
 - **Self-contained builds:** Include .NET runtime (no user install needed)
 - **Single-file publishing:** All resources extracted to temp at runtime
 - **Architecture support:** Both `win-x64` and `win-arm64` targets for cross-architecture support
-- **Version:** Assembly version in `Hearbud.csproj` (currently 0.2.7)
+- **Version:** Single source of truth in `Directory.Build.props`, auto-bumped (patch) by CI on every push to master
 
 ### Known Limitations
 
 1. **Windows-only** (WASAPI loopback is Windows-specific)
 2. **Max of 1 simultaneous recording** (single RecorderEngine instance per MainWindow)
-3. **No real-time effects** beyond gain/soft clip (plugins not supported)
-4. **Fixed block size** (1024 frames) - not configurable
-5. **Ring buffer capacity** is dynamic but may drop data if mic/loopback drifts severely
+3. **No real-time effects** beyond gain/DC/limit (plugins not supported)
+4. **Fixed 10 ms mixer tick** (loopback-driven pulls are variable-sized by design)
+5. **MP3 encode is synchronous** (no mid-encode progress/cancel; masters are safe first)
 
 ---
 

@@ -1,0 +1,301 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Hearbud.App"
+             RequestedThemeVariant="Dark">
+  <Application.Resources>
+    <!-- Palette: single source of truth, ported from the WPF original. -->
+    <Color x:Key="PaletteBackground">#FF2D2D30</Color>
+    <Color x:Key="PaletteControl">#FF3F3F41</Color>
+    <Color x:Key="PaletteBorder">#FF555555</Color>
+    <Color x:Key="PaletteText">#FFF1F1F1</Color>
+    <Color x:Key="PaletteDisabled">#FF4F4F4F</Color>
+    <Color x:Key="PaletteMutedText">#FF999999</Color>
+    <Color x:Key="PaletteAccent">#FFEA7D24</Color>
+    <Color x:Key="PaletteAccentHover">#FFD46E1F</Color>
+    <Color x:Key="PaletteDanger">#FFD13438</Color>
+
+    <!-- App brushes (referenced by windows and code-behind). -->
+    <SolidColorBrush x:Key="AppBackground" Color="{StaticResource PaletteBackground}"/>
+    <SolidColorBrush x:Key="ControlBackground" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="ControlBorder" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="ControlForeground" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ControlDisabled" Color="{StaticResource PaletteDisabled}"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="AccentForeground" Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="ClipBrush" Color="{StaticResource PaletteDanger}"/>
+
+    <!-- Fluent theme overrides. The stock control themes read these keys via
+         DynamicResource, so redefining them here re-skins every state
+         (pointerover/pressed/disabled/...) without re-templating. The
+         explicit styles below backstop the same colors. -->
+    <!-- Buttons -->
+    <SolidColorBrush x:Key="ButtonBackground" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="ButtonForeground" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ButtonBorderBrush" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="ButtonBackgroundPointerOver" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="ButtonForegroundPointerOver" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ButtonBorderBrushPointerOver" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="ButtonBackgroundPressed" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="ButtonForegroundPressed" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ButtonBorderBrushPressed" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="ButtonBackgroundDisabled" Color="{StaticResource PaletteDisabled}"/>
+    <SolidColorBrush x:Key="ButtonForegroundDisabled" Color="{StaticResource PaletteMutedText}"/>
+    <SolidColorBrush x:Key="ButtonBorderBrushDisabled" Color="{StaticResource PaletteDisabled}"/>
+
+    <!-- TextBox -->
+    <SolidColorBrush x:Key="TextControlBackground" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="TextControlForeground" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="TextControlBorderBrush" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="TextControlForegroundPointerOver" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="TextControlBorderBrushPointerOver" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="TextControlForegroundFocused" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="TextControlBackgroundDisabled" Color="{StaticResource PaletteDisabled}"/>
+    <SolidColorBrush x:Key="TextControlForegroundDisabled" Color="{StaticResource PaletteMutedText}"/>
+    <SolidColorBrush x:Key="TextControlBorderBrushDisabled" Color="{StaticResource PaletteDisabled}"/>
+
+    <!-- ComboBox -->
+    <SolidColorBrush x:Key="ComboBoxBackground" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="ComboBoxForeground" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ComboBoxBorderBrush" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="ComboBoxBackgroundPointerOver" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="ComboBoxBorderBrushPointerOver" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="ComboBoxBackgroundPressed" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="ComboBoxBorderBrushPressed" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="ComboBoxBackgroundDisabled" Color="{StaticResource PaletteDisabled}"/>
+    <SolidColorBrush x:Key="ComboBoxBorderBrushDisabled" Color="{StaticResource PaletteDisabled}"/>
+    <SolidColorBrush x:Key="ComboBoxForegroundDisabled" Color="{StaticResource PaletteMutedText}"/>
+    <SolidColorBrush x:Key="ComboBoxForegroundFocused" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ComboBoxForegroundFocusedPressed" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ComboBoxBackgroundBorderBrushFocused" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="{StaticResource PaletteControl}"/>
+    <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="ComboBoxDropDownGlyphForeground" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ComboBoxDropDownGlyphForegroundDisabled" Color="{StaticResource PaletteMutedText}"/>
+    <SolidColorBrush x:Key="ComboBoxDropDownGlyphForegroundFocused" Color="{StaticResource PaletteText}"/>
+    <SolidColorBrush x:Key="ComboBoxDropDownGlyphForegroundFocusedPressed" Color="{StaticResource PaletteText}"/>
+
+    <!-- ComboBox dropdown items: orange highlight like the original. -->
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundPointerOver" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="ComboBoxItemForegroundPointerOver" Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundPressed" Color="{StaticResource PaletteAccentHover}"/>
+    <SolidColorBrush x:Key="ComboBoxItemForegroundPressed" Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelected" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="ComboBoxItemForegroundSelected" Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPointerOver" Color="{StaticResource PaletteAccentHover}"/>
+    <SolidColorBrush x:Key="ComboBoxItemForegroundSelectedPointerOver" Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPressed" Color="{StaticResource PaletteAccentHover}"/>
+    <SolidColorBrush x:Key="ComboBoxItemForegroundSelectedPressed" Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundDisabled" Color="Transparent"/>
+    <SolidColorBrush x:Key="ComboBoxItemForegroundDisabled" Color="{StaticResource PaletteMutedText}"/>
+    <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedDisabled" Color="{StaticResource PaletteDisabled}"/>
+    <SolidColorBrush x:Key="ComboBoxItemForegroundSelectedDisabled" Color="{StaticResource PaletteMutedText}"/>
+
+    <!-- Slider: uniform gray track + orange thumb like the original. -->
+    <SolidColorBrush x:Key="SliderTrackFill" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="SliderTrackValueFill" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="SliderTrackFillPointerOver" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="SliderTrackValueFillPointerOver" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="SliderTrackFillPressed" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="SliderTrackValueFillPressed" Color="{StaticResource PaletteBorder}"/>
+    <SolidColorBrush x:Key="SliderTrackFillDisabled" Color="{StaticResource PaletteDisabled}"/>
+    <SolidColorBrush x:Key="SliderTrackValueFillDisabled" Color="{StaticResource PaletteDisabled}"/>
+    <SolidColorBrush x:Key="SliderThumbBackground" Color="{StaticResource PaletteAccent}"/>
+    <SolidColorBrush x:Key="SliderThumbBackgroundPointerOver" Color="{StaticResource PaletteAccentHover}"/>
+    <SolidColorBrush x:Key="SliderThumbBackgroundPressed" Color="{StaticResource PaletteAccentHover}"/>
+    <SolidColorBrush x:Key="SliderThumbBackgroundDisabled" Color="{StaticResource PaletteDisabled}"/>
+
+    <!-- Slider dimensions (30px tall, 4px track, 16px round thumb). -->
+    <GridLength x:Key="SliderPreContentMargin">13</GridLength>
+    <GridLength x:Key="SliderPostContentMargin">13</GridLength>
+    <x:Double x:Key="SliderHorizontalHeight">30</x:Double>
+    <x:Double x:Key="SliderHorizontalThumbWidth">16</x:Double>
+    <x:Double x:Key="SliderHorizontalThumbHeight">16</x:Double>
+    <CornerRadius x:Key="SliderThumbCornerRadius">8</CornerRadius>
+    <x:Double x:Key="SliderTrackThemeHeight">4</x:Double>
+  </Application.Resources>
+  <Application.Styles>
+    <FluentTheme />
+
+    <Style Selector="TextBlock">
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="LineHeight" Value="15"/>
+    </Style>
+
+    <Style Selector="Separator">
+      <Setter Property="Background" Value="{StaticResource ControlBorder}"/>
+      <Setter Property="Height" Value="1"/>
+    </Style>
+
+    <!-- GroupBox look (Avalonia has none built in): bordered card with a
+         filled header strip and a padded body. -->
+    <Style Selector="Border.card">
+      <Setter Property="BorderBrush" Value="{StaticResource ControlBorder}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="4"/>
+    </Style>
+    <Style Selector="Border.card-header">
+      <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+      <Setter Property="CornerRadius" Value="4,4,0,0"/>
+      <Setter Property="Padding" Value="8,4"/>
+    </Style>
+    <Style Selector="Border.card-header TextBlock">
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="Border.card-body">
+      <Setter Property="Padding" Value="10"/>
+    </Style>
+
+    <!-- Buttons (29px: 15 line + 12 padding + 2 border, like the original) -->
+    <Style Selector="Button">
+      <Setter Property="Padding" Value="10,6"/>
+      <Setter Property="CornerRadius" Value="4"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="MinHeight" Value="0"/>
+    </Style>
+    <Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+      <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+    </Style>
+    <Style Selector="Button:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+      <Setter Property="Foreground" Value="{StaticResource ControlForeground}"/>
+    </Style>
+    <Style Selector="Button:disabled /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlDisabled}"/>
+      <Setter Property="Foreground" Value="#FF999999"/>
+    </Style>
+
+    <!-- Call-to-action buttons (Start/Stop). Custom class so the Fluent
+         blue ".accent" styling never competes. -->
+    <Style Selector="Button.cta">
+      <Setter Property="FontWeight" Value="Bold"/>
+    </Style>
+    <Style Selector="Button.cta /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+      <Setter Property="Foreground" Value="{StaticResource AccentForeground}"/>
+    </Style>
+    <Style Selector="Button.cta:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#FFD46E1F"/>
+      <Setter Property="BorderBrush" Value="#FFD46E1F"/>
+      <Setter Property="Foreground" Value="{StaticResource AccentForeground}"/>
+    </Style>
+    <Style Selector="Button.cta:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#FFD46E1F"/>
+      <Setter Property="BorderBrush" Value="#FFD46E1F"/>
+      <Setter Property="Foreground" Value="{StaticResource AccentForeground}"/>
+    </Style>
+    <Style Selector="Button.cta:disabled">
+      <Setter Property="FontWeight" Value="Normal"/>
+    </Style>
+    <Style Selector="Button.cta:disabled /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlDisabled}"/>
+      <Setter Property="Foreground" Value="#FF999999"/>
+    </Style>
+
+    <!-- TextBox (27px: 15 line + 10 padding + 2 border, like the original) -->
+    <Style Selector="TextBox">
+      <Setter Property="Padding" Value="5"/>
+      <Setter Property="CornerRadius" Value="3"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="LineHeight" Value="15"/>
+      <Setter Property="MinHeight" Value="0"/>
+    </Style>
+    <Style Selector="TextBox:pointerover /template/ Border#PART_BorderElement">
+      <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+    </Style>
+    <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+      <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+    </Style>
+    <Style Selector="TextBox:disabled /template/ Border#PART_BorderElement">
+      <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlDisabled}"/>
+    </Style>
+
+    <!-- ComboBox (27px tall, like the original) -->
+    <Style Selector="ComboBox">
+      <Setter Property="CornerRadius" Value="3"/>
+      <Setter Property="HorizontalAlignment" Value="Stretch"/>
+      <Setter Property="Padding" Value="5"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="MinHeight" Value="0"/>
+    </Style>
+    <Style Selector="ComboBoxItem">
+      <Setter Property="FontSize" Value="12"/>
+    </Style>
+    <Style Selector="ComboBox:pointerover /template/ Border#Background">
+      <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+    </Style>
+    <Style Selector="ComboBox:pressed /template/ Border#Background">
+      <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+    </Style>
+    <Style Selector="ComboBox:disabled /template/ Border#Background">
+      <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlDisabled}"/>
+    </Style>
+
+    <!-- ComboBox dropdown items -->
+    <Style Selector="ComboBoxItem:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="ComboBoxItem:selected /template/ ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="ComboBoxItem:pressed /template/ ContentPresenter">
+      <Setter Property="Background" Value="#FFD46E1F"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+
+    <!-- Level meters: orange fill on a dark track. -->
+    <Style Selector="ProgressBar">
+      <Setter Property="Height" Value="18"/>
+      <Setter Property="MinHeight" Value="18"/>
+      <Setter Property="Background" Value="{StaticResource ControlBackground}"/>
+      <Setter Property="Foreground" Value="{StaticResource AccentBrush}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlBorder}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="3"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <!-- Gain sliders: gray track, orange thumb. -->
+    <Style Selector="Slider">
+      <Setter Property="Background" Value="{StaticResource ControlBorder}"/>
+      <Setter Property="Foreground" Value="{StaticResource ControlBorder}"/>
+    </Style>
+    <Style Selector="Slider /template/ Thumb">
+      <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+    </Style>
+    <Style Selector="Slider:pointerover /template/ Thumb, Slider:pressed /template/ Thumb">
+      <Setter Property="Background" Value="#FFD46E1F"/>
+    </Style>
+    <Style Selector="Slider:disabled /template/ Thumb">
+      <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+    </Style>
+    <Style Selector="Slider:pointerover /template/ RepeatButton#PART_DecreaseButton, Slider:pointerover /template/ RepeatButton#PART_IncreaseButton">
+      <Setter Property="Background" Value="{StaticResource ControlBorder}"/>
+    </Style>
+    <Style Selector="Slider:pressed /template/ RepeatButton#PART_DecreaseButton, Slider:pressed /template/ RepeatButton#PART_IncreaseButton">
+      <Setter Property="Background" Value="{StaticResource ControlBorder}"/>
+    </Style>
+    <Style Selector="Slider:disabled /template/ RepeatButton#PART_DecreaseButton, Slider:disabled /template/ RepeatButton#PART_IncreaseButton">
+      <Setter Property="Background" Value="{StaticResource ControlDisabled}"/>
+    </Style>
+  </Application.Styles>
+</Application>

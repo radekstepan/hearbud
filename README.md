@@ -15,7 +15,7 @@ Record your PC’s **system audio (WASAPI loopback)** and your **microphone** at
 
 - **Quality-focused pipeline**
   - Mix WAV is **32-bit PCM** (configurable) to avoid an extra 16-bit quantization step before MP3.
-  - **Soft clipping** (tanh) on the mix prevents harsh distortion if gains are pushed.
+  - **Kneed soft-limiting** on the mix (transparent below 0.8) prevents harsh distortion if gains are pushed.
   - **TPDF dither** applied when writing 16-bit PCM (mic/system WAVs) to reduce low-level crunch.
 
 - **Smart alignment**
@@ -37,9 +37,9 @@ Record your PC’s **system audio (WASAPI loopback)** and your **microphone** at
 
 ## Requirements
 
-- **Windows** (WASAPI loopback)
-- **.NET 8 SDK**
-- **CSCore** (NuGet restored automatically)
+- **Windows** for the WASAPI backend, **macOS** for the PortAudio backend (system capture via BlackHole)
+- **.NET 9 SDK**
+- **NAudio.Wasapi / NAudio.Core 3.3.0** (NuGet restored automatically)
 
 ---
 
@@ -51,6 +51,10 @@ Record your PC’s **system audio (WASAPI loopback)** and your **microphone** at
 dotnet restore
 dotnet run --project Hearbud/Hearbud.csproj
 ```
+
+### Avalonia UI (Windows + macOS)
+- Run: `dotnet run --project Hearbud.Avalonia/Hearbud.Avalonia.csproj`
+- Publish macOS arm64: `dotnet publish Hearbud.Avalonia/Hearbud.Avalonia.csproj -c Release -r osx-arm64 --self-contained`
 
 ### Production Build (for distribution)
 
@@ -80,7 +84,7 @@ dotnet publish Hearbud/Hearbud.csproj -c Release -r win-arm64 --self-contained -
 
 ## Testing
 
-Tests are written with **xUnit** and live in `Hearbud.Tests/`. They target `net8.0-windows` and must be run on Windows.
+Tests are written with **xUnit** and live in `Hearbud.Tests/`. They target `net9.0` and run on any OS. The whole suite is hardware-free (193 tests).
 
 ```bash
 # Restore dependencies (first time only)

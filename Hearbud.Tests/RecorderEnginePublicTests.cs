@@ -118,20 +118,10 @@ public class RecorderEnginePublicTests : IDisposable
         _engine.EncodingProgress -= handler;
     }
 
-    // ── HandleDeviceDisconnectedAsync (non-monitoring state) ──────────────────
-
-    [Fact]
-    public async Task HandleDeviceDisconnectedAsync_WhenNotMonitoring_ReturnsImmediately()
-    {
-        // Engine never started → _monitoring = false → should return without touching hardware
-        await _engine.HandleDeviceDisconnectedAsync("fake-device-id");
-    }
-
-    [Fact]
-    public async Task HandleDeviceDisconnectedAsync_UnknownDevice_ReturnsImmediately()
-    {
-        await _engine.HandleDeviceDisconnectedAsync("device-that-doesnt-exist-xyz");
-    }
+    // ── HandleDeviceDisconnectedAsync — REMOVED in Phase 4 ─────────────────────
+    // Capture legs now auto-rebuild (RecoverAsync) instead of stopping the
+    // session; device add/remove surfaces as RecorderEngine.DevicesChanged.
+    // See ADR-0012.
 
     // ── StopMonitor on idle engine ────────────────────────────────────────────
 

@@ -1,5 +1,3 @@
-using CSCore.CoreAudioAPI;
-using CSCore.Win32; // PropertyKey
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -18,18 +16,22 @@ using H.NotifyIcon;
 
 namespace Hearbud
 {
-    public partial class MainWindow : Window, IMMNotificationClient
+    public partial class MainWindow : Window
     {
     private readonly RecorderEngine _engine = new();
     private readonly System.Timers.Timer _uiTimer = new(100);
     private TaskbarIcon? _trayIcon;
-    private MMDeviceEnumerator? _notifEnumerator;
 
     private AppSettings _settings = AppSettings.Load();
-        private readonly Dictionary<string, MMDevice> _micDict = new();
-        private readonly Dictionary<string, MMDevice> _spkDict = new();
+        // Phase 4: the engine owns all WASAPI objects; the UI only holds name→id maps.
+        private readonly Dictionary<string, string> _micDict = new();
+        private readonly Dictionary<string, string> _spkDict = new();
 
         private bool _uiReady;
+
+        // Phase 1 (v2 supervise): latest 1 Hz engine health, for tray/meters.
+        private HealthReport? _latestHealth;
+        private bool _humShown;
 
         public MainWindow()
         {
@@ -66,18 +68,45 @@ namespace Hearbud
                         VersionText.Text = $"v{version.Major}.{version.Minor}.{version.Build}";
                     }
 
+                    // Phase 1: recover unfinished takes (*.tmp) left by a crash/kill.
+                    // Auto-publishes with unique names — a rare info dialog, never silent.
+                    try
+                    {
+                        var sweepDir = OutputFolderText.Text;
+                        if (string.IsNullOrWhiteSpace(sweepDir))
+                            sweepDir = _settings.OutputDir;
+                        if (string.IsNullOrWhiteSpace(sweepDir))
+                            sweepDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings");
+                        var recovered = CrashSafeFiles.RecoverOrphanedTmp(sweepDir);
+                        if (recovered.Length > 0)
+                        {
+                            StatusText.Text = $"Recovered {recovered.Length} unfinished take(s)";
+                            WpfMessageBox.Show(
+                                $"Recovered {recovered.Length} unfinished take(s) to:\n{sweepDir}",
+                                "Recovered recordings",
+                                MessageBoxButton.OK, MessageBoxImage.Information);
+                        }
+                    }
+                    catch { /* the sweep must never break startup */ }
+
                     // Auto-start live monitoring so meters show immediately
                     TryStartAutoMonitor();
 
-                    // Register for Windows audio device notifications (plug/unplug).
-                    // Must be done after the window handle exists (i.e. inside Loaded).
-                    _notifEnumerator = new MMDeviceEnumerator();
-                    _notifEnumerator.RegisterEndpointNotificationCallback(this);
+                    // Phase 4: device notifications are engine-owned (it also
+                    // auto-recovers capture legs); the UI just refreshes lists.
+                    // Engine events arrive on a COM thread — marshal to the UI.
+                    _engine.DevicesChanged += (_, __) => Dispatcher.BeginInvoke(() =>
+                    {
+                        SafeRefreshDevices();
+                        UpdateTrayTooltip();
+                        if (!_engine.IsRecording) TryStartAutoMonitor();
+                    });
                 };
 
                 _engine.LevelChanged += OnEngineLevelChanged;
                 _engine.Status += OnEngineStatus;
                 _engine.EncodingProgress += OnEngineEncodingProgress;
+                _engine.Health += OnEngineHealth;
 
                 _uiTimer.Elapsed += (_, __) => Dispatcher.Invoke(UpdateMeters);
                 _uiTimer.Start();
@@ -103,36 +132,25 @@ namespace Hearbud
             {
                 _micDict.Clear(); _spkDict.Clear();
 
-                using var enumerator = new MMDeviceEnumerator();
-
-                foreach (var dev in enumerator.EnumAudioEndpoints(DataFlow.Capture, DeviceState.Active))
-                    _micDict[dev.FriendlyName] = dev;
-
-                foreach (var dev in enumerator.EnumAudioEndpoints(DataFlow.Render, DeviceState.Active))
+                string? defMic = null, defSpk = null;
+                foreach (var d in RecorderEngine.GetMicrophoneDevices())
                 {
-                    _spkDict[dev.FriendlyName] = dev;
+                    _micDict[d.Name] = d.Id;
+                    if (d.IsDefault) defMic = d.Name;
+                }
+                foreach (var d in RecorderEngine.GetLoopbackDevices())
+                {
+                    _spkDict[d.Name] = d.Id;
+                    if (d.IsDefault) defSpk = d.Name;
                 }
 
                 MicCombo.ItemsSource = _micDict.Keys.ToList();
                 SpeakerCombo.ItemsSource = _spkDict.Keys.ToList();
 
-                try
-                {
-                    using var e2 = new MMDeviceEnumerator();
-                    var defIn = e2.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
-                    if (defIn != null && _micDict.ContainsKey(defIn.FriendlyName))
-                        MicCombo.SelectedItem = defIn.FriendlyName;
-                }
-                catch { }
-
-                try
-                {
-                    using var e3 = new MMDeviceEnumerator();
-                    var defOut = e3.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                    if (defOut != null && _spkDict.ContainsKey(defOut.FriendlyName))
-                        SpeakerCombo.SelectedItem = defOut.FriendlyName;
-                }
-                catch { }
+                if (defMic != null && _micDict.ContainsKey(defMic))
+                    MicCombo.SelectedItem = defMic;
+                if (defSpk != null && _spkDict.ContainsKey(defSpk))
+                    SpeakerCombo.SelectedItem = defSpk;
 
                 if (MicCombo.SelectedItem == null && _micDict.Count > 0)
                     MicCombo.SelectedItem = _micDict.Keys.First();
@@ -161,8 +179,8 @@ namespace Hearbud
 
                 await _engine.MonitorAsync(new RecorderStartOptions
                 {
-                    LoopbackDeviceId = _spkDict[spkName]!.DeviceID,
-                    MicDeviceId = _micDict[micName].DeviceID
+                    LoopbackDeviceId = _spkDict[spkName],
+                    MicDeviceId = _micDict[micName]
                 });
                 StatusText.Text = "Monitoring...";
             });
@@ -174,7 +192,7 @@ namespace Hearbud
             {
                 await action();
             }
-            catch (CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
+            catch (Exception ex) when (ex.HResult == unchecked((int)0x88890004)) // AUDCLNT_E_DEVICE_INVALIDATED
             {
                 StatusText.Text = "Refreshing devices...";
                 SafeRefreshDevices();
@@ -264,7 +282,7 @@ namespace Hearbud
                     return;
                 }
 
-                MMDevice? loopDevice = _spkDict[spkName];
+                string loopId = _spkDict[spkName];
 
                 _engine.MicGain = MicGain.Value;   // meters & mix balance
                 _engine.LoopGain = LoopGain.Value; // meters & mix balance
@@ -272,8 +290,8 @@ namespace Hearbud
                 await _engine.StartAsync(new RecorderStartOptions
                 {
                     OutputPath = Path.Combine(outDir, baseName),
-                    LoopbackDeviceId = loopDevice!.DeviceID,
-                    MicDeviceId = _micDict[micName].DeviceID,
+                    LoopbackDeviceId = loopId,
+                    MicDeviceId = _micDict[micName],
                     Mp3BitrateKbps = GetSelectedBitrateKbps()
                 });
 
@@ -356,6 +374,31 @@ namespace Hearbud
 
             MicClip.Foreground = DateTime.Now < _micClipUntil ? (System.Windows.Media.Brush)FindResource("ClipBrush") : (System.Windows.Media.Brush)FindResource("ControlDisabled");
             SysClip.Foreground = DateTime.Now < _sysClipUntil ? (System.Windows.Media.Brush)FindResource("ClipBrush") : (System.Windows.Media.Brush)FindResource("ControlDisabled");
+        }
+
+        // Phase 1 (v2 supervise): stash the 1 Hz health report for the tray tooltip
+        // and surface mains hum in the status line while it persists.
+        private void OnEngineHealth(object? sender, HealthReport e)
+        {
+            _latestHealth = e;
+            Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    if (e.HumDetected)
+                    {
+                        StatusText.Text = $"Mains hum @ {e.HumFreqHz} Hz — check grounding / Listen loop (Troubleshooting Guide: hum triage)";
+                        _humShown = true;
+                    }
+                    else if (_humShown)
+                    {
+                        _humShown = false;
+                        StatusText.Text = _engine.IsRecording ? "Recording..." : "Monitoring...";
+                    }
+                    UpdateTrayTooltip();
+                }
+                catch { }
+            });
         }
 
         private void OnEngineEncodingProgress(object? sender, int percent)
@@ -509,10 +552,7 @@ namespace Hearbud
             try { _uiTimer.Stop(); } catch { }
             try { _trayIcon?.Dispose(); } catch { }
 
-            // Unregister device notifications before disposing the enumerator.
-            try { _notifEnumerator?.UnregisterEndpointNotificationCallback(this); } catch { }
-            try { _notifEnumerator?.Dispose(); } catch { }
-            _notifEnumerator = null;
+            // (Phase 4: device notifications are engine-owned; _engine.Dispose() stops them.)
 
             try
             {
@@ -591,58 +631,9 @@ namespace Hearbud
             return 192;
         }
 
-        // ==========================================
-        // DEVICE NOTIFICATION (IMMNotificationClient)
-        // ==========================================
-
-        /// <summary>
-        /// Fires when a new audio endpoint device is added to the system (e.g. USB headset plugged in).
-        /// Refreshes device combos and restarts auto-monitoring so meters stay live.
-        /// </summary>
-        public void OnDeviceAdded(string deviceId)
-        {
-            // Callbacks arrive on a COM background thread — marshal everything back to the UI thread.
-            Dispatcher.BeginInvoke(() =>
-            {
-                SafeRefreshDevices();
-                UpdateTrayTooltip();
-                TryStartAutoMonitor();
-            });
-        }
-
-        /// <summary>
-        /// Fires when an audio endpoint device is removed (e.g. USB headset unplugged).
-        /// If the removed device is the one currently being used for recording or monitoring,
-        /// the engine will stop safely before the combos are refreshed.
-        /// </summary>
-        public void OnDeviceRemoved(string deviceId)
-        {
-            Dispatcher.BeginInvoke(async () =>
-            {
-                // Stop the engine first (safe-drains the write queue if recording).
-                await _engine.HandleDeviceDisconnectedAsync(deviceId);
-                SafeRefreshDevices();
-                UpdateTrayTooltip();
-            });
-        }
-
-        /// <summary>
-        /// Fires when an existing device changes state (e.g. headphone jack goes from Active to UnPlugged).
-        /// Routes to OnDeviceAdded/Removed so the same logic applies.
-        /// </summary>
-        public void OnDeviceStateChanged(string deviceId, DeviceState newState)
-        {
-            if (newState == DeviceState.Active)
-                OnDeviceAdded(deviceId);
-            else if (newState is DeviceState.UnPlugged or DeviceState.NotPresent)
-                OnDeviceRemoved(deviceId);
-        }
-
-        /// <summary>Not used — we don't need to react to default-device changes.</summary>
-        public void OnDefaultDeviceChanged(DataFlow dataFlow, Role role, string defaultDeviceId) { }
-
-        /// <summary>Not used — we don't react to property-value changes on devices.</summary>
-        public void OnPropertyValueChanged(string deviceId, PropertyKey key) { }
+        // (Phase 4: device notifications moved into the engine — the UI subscribes
+        // to RecorderEngine.DevicesChanged in Loaded. Capture legs now auto-rebuild
+        // instead of stopping the session. See ADR-0012.)
 
         /// <summary>
         /// Updates the system tray tooltip to reflect whether recording is active
@@ -654,11 +645,17 @@ namespace Hearbud
             var spkName = SpeakerCombo.SelectedItem as string;
             var micName = MicCombo.SelectedItem as string;
 
-            _trayIcon.ToolTipText = _engine.IsRecording
+            var health = _latestHealth;
+            string suffix = health == null ? ""
+                : health.HumDetected ? $" \u00b7 hum @{health.HumFreqHz}Hz"
+                : health.DroppedBlocks > 0 ? $" \u00b7 {health.DroppedBlocks} dropped"
+                : "";
+
+            _trayIcon.ToolTipText = (_engine.IsRecording
                 ? $"\u25cf Recording \u2014 {spkName ?? "No device"}"
                 : spkName != null
                     ? $"Hearbud \u2014 {spkName}"
-                    : "Hearbud \u2014 No device connected";
+                    : "Hearbud \u2014 No device connected") + suffix;
         }
     }
 }

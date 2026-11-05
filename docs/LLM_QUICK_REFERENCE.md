@@ -6,7 +6,7 @@ This document provides a condensed overview of the Hearbud codebase, optimized f
 
 ## Project Overview
 
-**Hearbud** is a Windows desktop application that captures system audio (WASAPI loopback) and microphone simultaneously, writes WAVs, and optionally encodes MP3. Built with .NET 8, WPF, and CSCore audio library.
+**Hearbud** is a Windows desktop application that captures system audio (WASAPI loopback) and microphone simultaneously, writes RF64 float WAVs, and optionally encodes MP3. Built with .NET 9, WPF, and the NAudio audio library.
 
 **Key Output Files:**
 - `*-system.wav` - 16-bit PCM, raw system audio
@@ -36,7 +36,7 @@ Hearbud/
 
 | Class | Lines | Purpose | Important Members |
 |-------|-------|---------|------------------|
-| `RecorderEngine` | ~1065 | Core audio engine | `Monitor()`, `Start()`, `StopAsync()`, `OnLoopbackData()`, `OnMicData()` |
+| `RecorderEngine` | ~1000 | Core audio engine | `MonitorAsync()`, `StartAsync()`, `StopAsync()`, `MixerTick()` |
 | `MainWindow` | ~521 | UI, events, controls | `OnStart()`, `OnStop()`, `UpdateMeters()`, device selection |
 | `AppSettings` | ~90 | Settings persistence | `Load()`, `Save()`, properties: `MicGain`, `LoopGain`, `Mp3BitrateKbps` |
 | `Dbfs` | ~15 | Conversions | `FormatGain()`, `ToDbfs()` |
@@ -49,70 +49,62 @@ Hearbud/
 | Thread | Purpose | Code Location |
 |--------|---------|--------------|
 | UI Thread | WPF, user input, timer (100ms) | `MainWindow` |
-| Audio Loopback Thread | WASAPI callback `OnLoopbackData` | CSCore-managed, ~100 Hz |
-| Audio Mic Thread | WASAPI callback `OnMicData` | CSCore-managed, ~100 Hz |
-| Disk Writer Thread | Consumer of `_writeQueue` | `DiskWriteLoop()` (Task) |
+| Audio Loopback Thread | NAudio callback `OnLoopData` | MMCSS capture thread, ~100 Hz |
+| Audio Mic Thread | NAudio callback `OnMicData` | MMCSS capture thread, ~100 Hz |
+| Mixer Thread | DSP + disk + meters | `MixerTick()` on a 10 ms `PeriodicTimer` |
 | MP3 Encoding Thread | Post-process encode | `Task.Run` in `StopAsync()` |
 
 **ALWAYS Keep Audio Callbacks Non-Blocking:**
-- ❌ NO allocations, I/O, locks (except quick ones), throws
-- ✅ OK: Math, array indexing, atomic operations
-- ✅ Offload I/O via `_writeQueue` (BlockingCollection)
+- ❌ NO I/O, locks, or throws (a throw kills the capture thread)
+- ✅ OK: one `float[]` alloc, span copy, QPC stamp, channel `TryWrite`
+- ✅ Everything else happens on the mixer thread
 
 ---
 
 ## Audio Signal Flow (Simplified)
 
 ```
-WASAPI Loopback → OnLoopbackData() → ReadExactSamples() → Convert to float
-                          ↓
-                  Metering (RMS/Peak) accumulators
-                          ↓
-               EnqueueWrite() → _writeQueue (bg thread writes WAV)
-
-WASAPI Mic       → OnMicData() → ReadExactSamples() → ConvertToTarget()
-                                              ↓ (resample/remix if needed)
-                                      _micRing[] (ring buffer)
-                                              ↓
-                                      Mixed by OnLoopbackData
+WASAPI Loopback → OnLoopData() → float32 span → _loopQ (channel)
+                                                      ↓
+WASAPI Mic      → OnMicData()  → float32 span → _micQ (channel)
+                                                      ↓
+                                              MixerTick (10 ms):
+                                              FIFO + TimestampedMicBuffer
+                                                      ↓
+                                              MixerDsp + meters + hum
+                                                      ↓
+                                              RF64 float32 disk write
 ```
 
-**Synchronization:** Loopback (system) is clock source. Mik pulled from ring buffer to match loopback chunks.
+**Synchronization:** Loopback paces the mixer; mic aligns by QPC timestamp (120 ms target, 1 s horizon, PLL read rate).
 
 ---
 
 ## Critical Design Contracts
 
-### 1. Async I/O Pattern
+### 1. Capture Handoff Pattern
 ```csharp
-// Producer (audio callback)
-byte[] rented = ArrayPool<byte>.Shared.Rent(count);  // Rent
-Array.Copy(source, 0, rented, 0, count);         // Copy
-_writeQueue.Add(new AudioWriteJob(target, rented, count));  // Queue
-
-// Consumer (DiskWriteLoop)
-foreach (var job in _writeQueue.GetConsumingEnumerable()) {
-    wavWriter?.Write(job.Data, 0, job.Count);
-    ArrayPool<byte>.Shared.Return(job.Data);  // Return to pool
-}
+// Producer (audio callback): copy → stamp → hand off
+var f = new float[frames * TargetCh];
+span.Slice(0, f.Length * 4).CopyTo(MemoryMarshal.AsBytes(f.AsSpan()));
+CaptureHandoff.TryWrite(q, new TimedBlock(f, qpc, frames), cap, ref _droppedBlocks);
+// Consumer: the mixer thread drains both channels every 10 ms tick
 ```
 
 ### 2. Clock Source Contract
-- Loopback drives timing: when loopback fires, pull same-sized mic chunk from ring
-- If mic ring empty: zero-fill gap (silence preserved)
-- If mic ring overflow: drop oldest samples (newest kept)
-- When loopback silent >200ms: mic drives output alone
-- When loopback resumes: ring buffer CLEARED (old mic dropped)
+- Loopback paces the mixer: each tick pulls everything available
+- Mic aligns by QPC timestamp to (loopNow − 120 ms); shortfalls zero-fill (counted)
+- Mic older than 1 s is dropped by timestamp horizon (no stale echo)
+- Loopback idle + mic live: steady 10 ms mic-only pulls; both idle: session pauses
 
 ### 3. Gain Application Order
 ```csharp
-// Applied BEFORE metering AND mixing
-float systemSample = loopBufF[i] * LoopGain;
-float micSample = micBufF[i] * MicGain;
-
-// Mix formula (preserve headroom)
-float mix = (systemSample + micSample) * 0.5;
-float mixClipped = SoftClipIfNeeded(mix);  // tanh + clamp
+// Applied BEFORE metering AND mixing (see MixerDsp.ProcessMixBlock)
+float s = sys[i] * sysGain;   // metered post-gain
+float m = mic[i] * micGain;   // metered post-gain
+s = dcSys.Filter(s, ch);      // mix legs only; raws stay raw
+m = dcMic.Filter(m, ch);
+float mix = SoftLimiter.Limit((s + m) * 0.5f);  // knee at 0.8
 ```
 
 ### 4. Dispose Idempotence Pattern
@@ -123,8 +115,8 @@ public void Dispose() {
     if (_disposed) return;  // Early exit
     _disposed = true;
 
-    try { _loopCap?.Dispose(); } catch { }  // Guard each
-    try { _micCap?.Dispose(); } catch { }
+    try { _mixCts?.Cancel(); } catch { }  // Guard each
+    StopInternal();  // detach, stop + dispose recorders/devices
     // ...
 }
 ```
@@ -134,19 +126,18 @@ public void Dispose() {
 ## Methods to Watch (Hot Path)
 
 ### Audio Callbacks (Don't Break These!)
-- `OnLoopbackData(object, DataAvailableEventArgs)` - Called ~100 Hz, MUST NOT block
-- `OnMicData(object, DataAvailableEventArgs)` - Same, watch for underruns
+- `OnLoopData(ReadOnlySpan<byte>, ...)` - Called ~100 Hz: copy → stamp → hand off
+- `OnMicData(ReadOnlySpan<byte>, ...)` - Same; silence arrives as zero blocks
 
 **Safe Operations:**
-- `ReadExactSamples()` - CSCore read, O(N)
-- `EnsureCapacity()` - Array resize (rarely)
-- `ConvertToTarget()` - Resample/remix, minimal allocations
-- `FloatToPcm16/Pcm32()` - Convert output buffers
+- Span copy via `MemoryMarshal.AsBytes()` - O(N), no locks
+- `CaptureHandoff.TryWrite()` - drop-oldest channel, never blocks
+- `MixerDsp.ProcessMixBlock()` - mixer-side DSP (gain → DC → limit + meters)
 
 **Unsafe Operations (Don't Do):**
-- ❌ `new ...[]` allocations (use pooling)
-- ❌ File I/O (use `_writeQueue`)
-- ❌ `Thread.Sleep()`, `await Task.Delay()`, blocking calls
+- ❌ Pooling at the handoff (DropOldest would leak rents — one `float[]` per block is fine)
+- ❌ File I/O (the mixer thread owns all disk writes)
+- ❌ `Thread.Sleep()`, `await Task.Delay()`, blocking calls, throws
 - ❌ Complex LINQ (allocates)
 
 ---
@@ -156,15 +147,11 @@ public void Dispose() {
 ### Pre-allocated Buffers (instance fields)
 | Buffer | Type | Size | Purpose |
 |--------|------|------|---------|
-| `_micRing` | `float[]` | 4 sec @ 48kHz × 2ch ≈ 384 KB | Mic sync ring |
-| `_loopBufF` | `float[]` | 8 × 1024 frames × 2ch ≈ 64 KB | Loopback temp |
-| `_micConvBuf` | `float[]` | Same as above | Mic converted |
-| `_tmpMicBlock` | `float[]` | Same | Pulled from ring |
-| `_mixBufF` | `float[]` | Same | Mixed output |
-| `_pcm16Sys` | `byte[]` | 2× above | System WAV bytes |
-| `_pcm16Mix` | `byte[]` | 2× above | Mix WAV bytes |
-| `_pcm32Mix` | `byte[]` | 4× above | 32-bit mix bytes |
-| `_resampleScratch` | `float[]` | Same | Reusable for resampling |
+| `_micBuffer` | `TimestampedMicBuffer` | 4 s growable, 30 s cap | Timestamped mic sync |
+| `_loopFifo` | `List<float>` | 2 s cap, drop-counted | Loopback-side mixer FIFO |
+| `_sysBlock` / `_micBlock` | `float[]` | Block-sized, power-of-2 | Mixer leg scratch |
+| `_mixBlock` | `float[]` | Block-sized, power-of-2 | Mixed output scratch |
+| `_ioBytes` | `byte[]` | 4× float scratch | Float→byte staging for disk |
 
 **Resizing:** `EnsureCapacity()` resizes to next power-of-2, but rarely needed if initial sizes sufficient.
 
@@ -211,7 +198,7 @@ public void Dispose() {
 
 **Key Diagnostics:**
 ```text
-[...] INFO OnLoopbackData: Mic ring backlog: 0.0523 s (max 0.1500 s)
+[...] INFO AfterBlock: Mic backlog: 0.0523 s (max 0.1500 s)
 ```
 - `backlog ≈ 0.1s` → Healthy sync
 - `backlog ≈ 0.0s` → Underruns (mic too slow)
@@ -223,23 +210,23 @@ public void Dispose() {
 
 ### 1. Audio Callback Blocking
 **Symptom:** Dropouts, glitches, UI freeze
-**Check:** No `new`, `File.Write()`, `Thread.Sleep()` in callbacks
-**Fix:** Use `_writeQueue`, `ArrayPool`, pre-allocated buffers
+**Check:** Callbacks do copy → stamp → handoff only (no I/O, locks, throws)
+**Fix:** Move everything downstream; the mixer owns DSP + disk
 
-### 2. Ring Buffer Lock Contention
-**Symptom:** Audio gaps, underruns
-**Check:** `lock(_micRingLock)` held too long
-**Fix:** Keep lock minimal, avoid I/O/allocations inside
+### 2. Mixer Stall
+**Symptom:** Audio gaps, rising `HealthReport.DroppedBlocks`
+**Check:** Slow disk or oversized catch-up blocks after a stall
+**Fix:** Keep `MixerTick()` fast; drops are counted, never silent
 
 ### 3. Dispose Race Condition
 **Symptom:** `ObjectDisposedException` after StopAsync
 **Check:** Callbacks still firing during dispose
-**Fix:** Stop callbacks before disposing (`TryStopDispose`)
+**Fix:** Detach callbacks before disposing (`StopInternal` sets `_stopping` first)
 
-### 4. Memory Leak (Forgotten Returns)
-**Symptom:** Memory grows, GC pressure
-**Check:** Missing `ArrayPool.Return()` in `DiskWriteLoop`
-**Fix:** `finally { ArrayPool<byte>.Shared.Return(job.Data); }`
+### 4. Early MMDevice Disposal
+**Symptom:** Crash in capture teardown/rebuild
+**Check:** `MMDevice` disposed while its recorder is alive (the recorder retains it)
+**Fix:** Dispose devices only on teardown/rebuild, after the recorder
 
 ### 5. Clock Drift (Mic/Loopback Mismatch)
 **Symptom:** Delayed mic, sync issues
@@ -255,11 +242,12 @@ public void Dispose() {
 
 ## Key Algorithms (Reference)
 
-### Linear Resampling
+### PLL Drift Bending (TimestampedMicBuffer)
 ```csharp
-int srcIndex = (int)(dstFrame * (srcRate / dstRate));
-float frac = (dstFrame * (srcRate / dstRate)) - srcIndex;
-interpolated = src[srcIndex] * (1 - frac) + src[srcIndex + 1] * frac;
+filtered += (depthMs - 120 - filtered) * 0.002;
+ratio = Math.Clamp(1 + filtered * 0.00002, 0.999, 1.001);
+pos = cursor + frame * ratio;  // fractional cursor persists across blocks
+interpolated = src[i0] * (1 - t) + src[i0 + 1] * t;
 ```
 
 ### RMS Calculation
@@ -269,36 +257,22 @@ for (int i = 0; i < count; i++) sumSq += samples[i] * samples[i];
 rms = Math.Sqrt(sumSq / count);
 ```
 
-### Soft Clip (tanh)
+### Kneed Limit (SoftLimiter)
 ```csharp
-float SoftClip(float x) {
-    if (x > 1.0 || x < -1.0) x = MathF.Tanh(x);
-    return Math.Clamp(x, -1.0f, 1.0f);
-}
+if (MathF.Abs(x) < 0.8f) return x;  // transparent below the knee
+float over = MathF.Abs(x) - 0.8f;
+return MathF.CopySign(MathF.Min(0.8f + over / (1 + over * 2.2f), 1f), x);
 ```
 
-### TPDF Dither
+### DC Block (1-pole HPF)
 ```csharp
-float dither = (float)rng.NextDouble() - (float)rng.NextDouble();  // -1.0 to +1.0
-float dithered = value * 32767.0f + dither;
-short sample = (short)Math.Clamp(MathF.Round(dithered), short.MinValue, short.MaxValue);
+y = x - prevIn + 0.999f * prevOut;  // ~8 Hz @ 48 kHz, per channel
 ```
 
-### Ring Buffer Index Math
+### Timestamp Horizon (mic sync)
 ```csharp
-// Write
-_micRing[_micW] = value;
-_micW = (_micW + 1) % _micRing.Length;
-if (_micCount < _micRing.Length) _micCount++;
-else _micR = (_micR + 1) % _micRing.Length;  // Overwrite oldest
-
-// Read (pull multiple)
-int read = Math.Min(count, _micCount);
-for (int i = 0; i < read; i++) {
-    dest[i] = _micRing[_micR];
-    _micR = (_micR + 1) % _micRing.Length;
-}
-_micCount -= read;
+// On every read: drop mic older than loopNow - 1000 ms (by QPC stamp)
+while (segment.EndQpc <= loopQpcNow - horizonQpc) DropOldest(segment);
 ```
 
 ---
@@ -323,22 +297,23 @@ _micCount -= read;
 
 | Package | Version | Usage |
 |---------|---------|-------|
-| CSCore | 1.2.1.2 | Audio capture, APIs, WAV, MP3 |
+| NAudio.Wasapi | 3.3.0 | Capture, devices, MP3 encode |
+| NAudio.Core | 3.3.0 | WaveFormat, WaveFileReader, DSP |
 | H.NotifyIcon.Wpf | 2.3.0 | System tray icon |
-| System.Text.Json | 8.0.5 | Settings JSON |
+| System.Text.Json | 9.0.0 | Settings JSON |
 
 ---
 
 ## Build Configuration
 
-**Framework:** `net8.0-windows`
+**Framework:** `net9.0-windows`
 **Runtime Identifiers:** `win-x64`, `win-arm64`
 **Publish Mode:** Self-contained, single file, compressed
 **Assembly Name:** Hearbud
 
 **Targeted Versions:**
 - Requires Windows 10/11 (WASAPI loopback)
-- .NET 8 Desktop Runtime (or self-contained)
+- .NET 9 Desktop Runtime (or self-contained)
 
 ---
 
@@ -357,12 +332,12 @@ When modifying specific functionality, look here:
 
 | Task | File | Line Range (approx) | Key Methods |
 |------|------|---------------------|-------------|
-| Change mixing formula | RecorderEngine.cs | ~700-720 | `OnLoopbackData` mix loop |
-| Add metering metrics | RecorderEngine.cs | ~560-620 | Metering accumulators in callbacks |
-| Modify gain application | RecorderEngine.cs | ~580, 660 | Multipliers in metering and mix |
-| Change dither algorithm | RecorderEngine.cs | ~870-890 | `FloatToPcm16()` |
-| Adjust resampling | RecorderEngine.cs | ~830-860 | `ConvertToTarget()` |
-| Add diagnostic logging | RecorderEngine.cs | ~970-990 | `Info()`, `Warn()`, `Error()` |
+| Change mixing formula | MixerDsp.cs | `ProcessMixBlock` | Gain → DC → avg → limit |
+| Add metering metrics | MixerDsp.cs / RecorderEngine.cs | `ProcessMixBlock` + throttle | Per-leg RMS/peak/clip |
+| Modify gain application | MixerDsp.cs | `ProcessMixBlock` head | `Volatile` gain properties |
+| Adjust drift servo | TimestampedMicBuffer.cs | `Read` (PLL block) | Target/horizon/ratio consts |
+| Adjust hum detection | Goertzel.cs | `HumWatch` | Bins + threshold |
+| Add diagnostic logging | RecorderEngine.cs | `Info()`, `Warn()`, `Error()` | 10 MB cap, `AfterBlock` cadence |
 | Change UI layout | MainWindow.xaml | Entire file | XAML markup |
 | Add UI events | MainWindow.xsl.cs | ~200-450 | Event handlers |
 | Persist new setting | AppSettings.cs | Property + Load/Save | Add property, handle migration |

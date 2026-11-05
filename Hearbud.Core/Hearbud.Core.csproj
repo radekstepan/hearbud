@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Hearbud</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- NAudio targets plain net9.0 so Core compiles on any OS, but the
+         WASAPI capture and Media Foundation MP3 backends only run on Windows. -->
+    <PackageReference Include="NAudio.Core" Version="3.3.0" />
+    <PackageReference Include="NAudio.Wasapi" Version="3.3.0" />
+    <PackageReference Include="System.Text.Json" Version="9.0.0" />
+  </ItemGroup>
+
+  <!-- LAME slices for the macOS MP3 backend (see LameMp3Encoder.cs): shipped
+       into the standard runtimes/<rid>/native/ layout of every app output.
+       Regenerate with tools/lame/build-lame.sh. -->
+  <ItemGroup>
+    <Content Include="runtimes/osx-arm64/native/libmp3lame.dylib">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="runtimes/osx-x64/native/libmp3lame.dylib">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

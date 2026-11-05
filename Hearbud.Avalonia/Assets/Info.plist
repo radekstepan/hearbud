@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Hearbud</string>
+  <key>CFBundleDisplayName</key>
+  <string>Hearbud</string>
+  <!-- Reverse-DNS identity. Replace with your own before Developer-ID
+       distribution (must match the App ID / provisioning). -->
+  <key>CFBundleIdentifier</key>
+  <string>dev.hearbud.Hearbud</string>
+  <key>CFBundleExecutable</key>
+  <string>Hearbud.Avalonia</string>
+  <key>CFBundleIconFile</key>
+  <string>hearbud</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleVersion</key>
+  <string>0.3.2</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.3.2</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <!-- Required: without a microphone usage description the OS kills the
+       app when it first touches a capture device. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Hearbud records your microphone together with system audio.</string>
+</dict>
+</plist>

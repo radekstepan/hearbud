@@ -1,0 +1,96 @@
+name: build
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+# Serialize runs per branch so concurrent master pushes can't race the version bump.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# The version-bump step pushes a commit back to master.
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Bump patch version
+        id: bump
+        if: github.ref == 'refs/heads/master'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          $pushed = $false
+          $newVersion = ''
+          for ($attempt = 1; $attempt -le 3 -and -not $pushed; $attempt++) {
+            git fetch origin master
+            if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+            git reset --hard origin/master
+            if ($LASTEXITCODE -ne 0) { throw 'git reset failed' }
+
+            # Source of truth: Directory.Build.props (<Version>X.Y.Z</Version>).
+            $props = 'Directory.Build.props'
+            $text = [IO.File]::ReadAllText($props)
+            if ($text -notmatch '<Version>(\d+)\.(\d+)\.(\d+)</Version>') {
+              throw "No <Version> found in $props"
+            }
+            $newVersion = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+            [IO.File]::WriteAllText($props,
+              $text -replace '<Version>\d+\.\d+\.\d+</Version>', "<Version>$newVersion</Version>")
+
+            # Keep the macOS bundle version in sync (best effort).
+            $plist = 'Hearbud.Avalonia/Assets/Info.plist'
+            $plistText = [IO.File]::ReadAllText($plist)
+            $plistText = $plistText -replace '(<key>CFBundleVersion</key>\s*<string>)\d+\.\d+\.\d+(</string>)', ('$1' + $newVersion + '$2')
+            $plistText = $plistText -replace '(<key>CFBundleShortVersionString</key>\s*<string>)\d+\.\d+\.\d+(</string>)', ('$1' + $newVersion + '$2')
+            [IO.File]::WriteAllText($plist, $plistText)
+
+            git add $props $plist
+            git commit -m "chore: bump version to $newVersion [skip ci]"
+            if ($LASTEXITCODE -ne 0) { throw 'git commit failed' }
+            git push origin HEAD:master
+            if ($LASTEXITCODE -eq 0) { $pushed = $true }
+            else { Start-Sleep -Seconds 5 }
+          }
+          if (-not $pushed) { throw 'Failed to push version bump after 3 attempts' }
+          "version=$newVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Restore
+        run: dotnet restore Hearbud.sln
+
+      - name: Test
+        run: dotnet test Hearbud.sln -c Release --no-restore
+
+      - name: Publish win-x64
+        run: dotnet publish Hearbud/Hearbud.csproj -c Release -r win-x64 --self-contained -o ./dist/win-x64
+
+      - name: Publish win-arm64
+        run: dotnet publish Hearbud/Hearbud.csproj -c Release -r win-arm64 --self-contained -o ./dist/win-arm64
+
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hearbud-${{ steps.bump.outputs.version }}-windows
+          path: |
+            dist/win-x64
+            dist/win-arm64

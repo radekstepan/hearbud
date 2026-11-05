@@ -2,3 +2,14 @@ repomix-output.xml
 *.mp3
 .DS_Store
 dist/
+
+# Build output
+[Bb]in/
+[Oo]bj/
+TestResults/
+*.user
+
+# IDE / editor
+.idea/
+.vs/
+.vscode/

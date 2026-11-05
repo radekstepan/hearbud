@@ -1,0 +1,10 @@
+# Hearbud.Core targets plain net9.0 so it compiles on any OS, but the WASAPI
+# capture and Media Foundation MP3 backends are Windows-only at runtime by
+# design (NAudio annotates them [SupportedOSPlatform("windows")]); hosts pick
+# backends by OS. CA1416 is silenced ONLY in those two backend files — new
+# platform-compat warnings anywhere else in Core still fire.
+[WasapiAudioCapture.cs]
+dotnet_diagnostic.CA1416.severity = none
+
+[MediaFoundationMp3Encoder.cs]
+dotnet_diagnostic.CA1416.severity = none
