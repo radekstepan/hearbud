@@ -36,6 +36,11 @@ jobs:
           if (-not (Test-Path $vc)) {
             throw 'missing: vcruntime140.dll (install the VC++ Redistributable)'
           }
+          try {
+            [Net.Dns]::GetHostEntry('api.nuget.org') | Out-Null
+          } catch {
+            throw 'no usable network: cannot resolve api.nuget.org'
+          }
           git --version
 
       - name: Bump patch version
@@ -103,7 +108,19 @@ jobs:
 
       - name: Restore
         shell: pwsh
-        run: dotnet restore Hearbud.sln
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            if ($attempt -gt 1) {
+              # Drop possibly truncated downloads before retrying.
+              dotnet nuget locals http-cache --clear | Out-Null
+              Start-Sleep -Seconds 30
+            }
+            dotnet restore Hearbud.sln
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw 'dotnet restore failed after 3 attempts' }
+          }
 
       - name: Test
         shell: pwsh
