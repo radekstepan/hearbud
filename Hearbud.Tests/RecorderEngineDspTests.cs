@@ -93,10 +93,24 @@ public class RecorderEngineDspTests
         => Assert.Equal(-SoftClip(0.5f), SoftClip(-0.5f), precision: 6);
 
     [Fact]
-    public void SoftClip_MatchesTanh()
+    public void SoftClip_MatchesTanh_OnlyAboveOne()
     {
-        float x = 0.7f;
-        Assert.Equal(MathF.Tanh(x), SoftClip(x), precision: 6);
+        // Inside [-1,1] the limiter is bit-transparent (no tanh coloration).
+        Assert.Equal(0.7f, SoftClip(0.7f), precision: 6);
+        Assert.Equal(-0.7f, SoftClip(-0.7f), precision: 6);
+        // Above 1 the tanh soft-knee engages.
+        float x = 1.5f;
+        Assert.Equal(MathF.Sign(x) * MathF.Tanh(MathF.Abs(x)), SoftClip(x), precision: 6);
+    }
+
+    [Fact]
+    public void ComputeMixScale_NormalizesOnlyOnOvers()
+    {
+        var m = GetStatic("ComputeMixScale", new[] { typeof(float) });
+        float scale(float peak) => (float)m.Invoke(null, new object[] { peak })!;
+        Assert.Equal(1f, scale(0.5f), precision: 6);
+        Assert.Equal(1f, scale(1f), precision: 6);
+        Assert.Equal(0.5f, scale(2f), precision: 6);
     }
 
     [Fact]
@@ -627,8 +641,8 @@ public class RecorderEngineDspTests
     // ─────────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void SoftClip_NaN_ReturnsNaN()
-        => Assert.True(float.IsNaN(SoftClip(float.NaN)));
+    public void SoftClip_NaN_ReturnsZero()
+        => Assert.Equal(0f, SoftClip(float.NaN));
 
     [Fact]
     public void SoftClip_PositiveInfinity_ReturnsOne()

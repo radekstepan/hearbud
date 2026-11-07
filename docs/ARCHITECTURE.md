@@ -378,8 +378,8 @@ StopAsync() called
 
 **Sync Edge Case:** When loopback resumes after silence, existing mic backlog is dropped. This prevents "old mic over new system" echo effect.
 
-### 6. Soft Clipping (tanh) vs Hard Clipping
-**Decision:** Apply `Math.Tanh()` on samples exceeding ±1.0 before clamp.
+### 6. Conditional limiter (tanh only on overs) + peak normalize
+**Decision:** Sum `s*gL + m*gM` at full level, peak-normalize the block only if peak>1, then apply `tanh` soft-knee only to samples with `|x|>1` before clamp.
 
 **Rationale:**
 - Tanh provides natural limiting curve (sounds better than hard clip)
@@ -478,7 +478,7 @@ StopAsync() called
    - Gains applied **before** metering and **before** mixing
    - `MicGain` affects mic WAV, meter, and mix contribution
    - `LoopGain` affects system WAV, meter, and mix contribution
-   - Mix formula: `(s * LoopGain + m * MicGain) * 0.5`
+   - Mix formula: `sum = s*LoopGain + m*MicGain; scale = peak>1 ? 1/peak : 1; mix = limiter(sum*scale)` (no -6 dB penalty)
 
 ### Build/Distribution Notes
 

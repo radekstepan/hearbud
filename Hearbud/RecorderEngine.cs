@@ -5,7 +5,8 @@
 // It writes three WAV files during capture:
 //   1) <base>-system.wav  - the raw system/loopback stream
 //   2) <base>-mic.wav     - the raw microphone stream (converted to match loopback format)
-//   3) <base>-mix.wav     - a simple averaged mix of system + mic (with user-controlled gains)
+//   3) <base>-mix.wav     - summed mix of system + mic with user-controlled gains,
+//                          peak-normalized only on overs (amix-style) + conditional limiter
 // After stopping, it can optionally encode the mix.wav to MP3 (<base>.mp3) using Media Foundation.
 // If "Original" quality is selected, it skips the MP3 step.
 //
@@ -815,15 +816,19 @@ namespace Hearbud
                     Array.Clear(_pcm16Sys, 0, conv * 2);
                     EnqueueWrite(AudioFileTarget.System, _pcm16Sys, conv * 2);
 
-                    // Write Mic to Mix
+                    // Write Mic to Mix (full level; peak-normalize only on overs, like amix)
                     EnsureCapacity(ref _mixBufF, conv);
+                    float micPeak = 0f;
                     for (int i = 0; i < conv; i++)
                     {
                         float m = (float)(_micConvBuf[i] * MicGain);
-                        float a = m * 0.5f;
-                        a = SoftClipIfNeeded(a);
-                        _mixBufF[i] = a;
+                        _mixBufF[i] = m;
+                        float abs = MathF.Abs(m);
+                        if (abs > micPeak) micPeak = abs;
                     }
+                    float micScale = ComputeMixScale(micPeak);
+                    for (int i = 0; i < conv; i++)
+                        _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i] * micScale);
 
                     if (_mixUse32Bit)
                     {
@@ -941,14 +946,24 @@ namespace Hearbud
                 }
 
                 EnsureCapacity(ref _mixBufF, gotLoop);
+                float peak = 0f;
                 for (int i = 0; i < gotLoop; i++)
                 {
                     float s = (float)(_loopBufF[i] * LoopGain);
                     float m = (float)(_tmpMicBlock[i] * MicGain);
-                    float a = (s + m) * 0.5f; 
-                    a = SoftClipIfNeeded(a);
+                    float a = s + m;
                     _mixBufF[i] = a;
+                    float abs = MathF.Abs(a);
+                    if (abs > peak) peak = abs;
                 }
+                float scale = ComputeMixScale(peak);
+                if (scale != 1f)
+                {
+                    for (int i = 0; i < gotLoop; i++)
+                        _mixBufF[i] *= scale;
+                }
+                for (int i = 0; i < gotLoop; i++)
+                    _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i]);
 
                 // --- Write Mix WAV (Async) ---
                 if (_recording && _wavMix != null)
@@ -1074,11 +1089,21 @@ namespace Hearbud
             return di2;
         }
 
+        private static float ComputeMixScale(float peak)
+        {
+            // amix-style: normalize only when overshooting 0 dBFS, otherwise bit-transparent.
+            return peak > 1f ? 1f / peak : 1f;
+        }
+
         private static float SoftClipIfNeeded(float x)
         {
-            // Apply tanh to the entire signal to ensure a smooth, continuous
-            // "analog" saturation curve without any discontinuities or "pops".
-            return MathF.Tanh(x);
+            // Conditional limiter: passthrough inside [-1,1] so quiet passages
+            // stay untouched; tanh soft-knee only on true overs (post-normalize
+            // this is a safety net, e.g. NaN/Inf or rounding slightly over 1).
+            if (float.IsNaN(x)) return 0f;
+            float abs = MathF.Abs(x);
+            if (abs <= 1f) return x;
+            return MathF.Sign(x) * MathF.Tanh(abs);
         }
 
         private static readonly ThreadLocal<Random> _rng =
