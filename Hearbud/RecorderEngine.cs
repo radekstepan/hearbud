@@ -99,7 +99,9 @@ namespace Hearbud
         public string LoopbackDeviceId { get; set; } = "";
         public string? MicDeviceId { get; set; }
         public bool IncludeMic { get; set; } = true; 
-        public int Mp3BitrateKbps { get; set; } = 192; 
+        public int Mp3BitrateKbps { get; set; } = 192;
+        /// <summary>Optional hidden diagnostics: when set, raw float32 microphoneIn/speakerIn/mixOut dumps are written here.</summary>
+        public string DumpDir { get; set; } = "";
     }
 
     // --- ASYNC WRITER DEFINITIONS ---
@@ -224,10 +226,18 @@ namespace Hearbud
         private string _activeLoopDeviceId = "";
         private string _activeMicDeviceId  = "";
         private long _micUnderrunBlocks = 0;
+        private long _micOverrunBlocks = 0;
+        private long _silencedSamples = 0;
         private long _loopBlockCounter = 0;
+        private long _lastLagLogTick = 0;
         private double _lastMicBacklogSec = 0.0;
         private double _micBacklogSecMax = 0.0;
+        private bool _logTruncated = false;
         private const int BacklogLogEveryNBlocks = 50;
+        private readonly object _dumpLock = new();
+        private FileStream? _dumpMic;
+        private FileStream? _dumpSys;
+        private FileStream? _dumpMix;
 
         private const double LevelThrottleMs = 50.0; 
         private long _lastLevelTickMic = 0;
@@ -314,9 +324,14 @@ namespace Hearbud
 
             lock (_micRingLock) { _micR = _micW = _micCount = 0; }
             _micUnderrunBlocks = 0;
+            _micOverrunBlocks = 0;
+            _silencedSamples = 0;
             _loopBlockCounter = 0;
+            _lastLagLogTick = 0;
             _lastMicBacklogSec = 0.0;
             _micBacklogSecMax = 0.0;
+            _logTruncated = false;
+            OpenDumpStreams(opts.DumpDir, outDir, baseName);
 
             _recording = true;
             RaiseStatus(EngineStatusKind.Info, "Recording to WAV…");
@@ -444,7 +459,7 @@ namespace Hearbud
                 _pathMp3 = "";
             }
 
-            Info($"Mic ring underruns: {_micUnderrunBlocks}. Peak mic backlog: {_micBacklogSecMax:F4}s");
+            Info($"Mic ring underruns: {_micUnderrunBlocks}. Overruns: {_micOverrunBlocks}. Silenced samples: {_silencedSamples}. Peak mic backlog: {_micBacklogSecMax:F4}s");
             if (_droppedBlocks > 0)
             {
                 Warn($"Dropped {_droppedBlocks} audio blocks due to disk I/O stall");
@@ -452,6 +467,7 @@ namespace Hearbud
             Info("Recording stopped");
             Info("===== Session end =====");
 
+            CloseDumpStreams();
             TryDispose(ref _log);
             _logPath = ""; 
 
@@ -491,7 +507,50 @@ namespace Hearbud
             try { _writeQueue?.Dispose(); } catch { }
 
             StopInternal(fullStop: true);
+            CloseDumpStreams();
             TryDispose(ref _log);
+        }
+
+        private void OpenDumpStreams(string dumpDir, string outDir, string baseName)
+        {
+            CloseDumpStreams();
+            if (string.IsNullOrWhiteSpace(dumpDir)) return;
+            try
+            {
+                Directory.CreateDirectory(dumpDir);
+                _dumpMic = new FileStream(Path.Combine(dumpDir, $"{baseName}-microphoneIn.pcm"), FileMode.Create, FileAccess.Write, FileShare.Read);
+                _dumpSys = new FileStream(Path.Combine(dumpDir, $"{baseName}-speakerIn.pcm"), FileMode.Create, FileAccess.Write, FileShare.Read);
+                _dumpMix = new FileStream(Path.Combine(dumpDir, $"{baseName}-mixOut.pcm"), FileMode.Create, FileAccess.Write, FileShare.Read);
+                Info($"Dump dir: {dumpDir}");
+            }
+            catch (Exception ex)
+            {
+                Warn($"Dump dir unavailable, continuing without dumps: {ex.Message}");
+                CloseDumpStreams();
+            }
+        }
+
+        private void CloseDumpStreams()
+        {
+            lock (_dumpLock)
+            {
+                try { _dumpMic?.Dispose(); } catch { }
+                try { _dumpSys?.Dispose(); } catch { }
+                try { _dumpMix?.Dispose(); } catch { }
+                _dumpMic = _dumpSys = _dumpMix = null;
+            }
+        }
+
+        private void WriteDump(FileStream? stream, float[] data, int count)
+        {
+            if (stream == null || count <= 0) return;
+            try
+            {
+                byte[] tmp = new byte[count * 4];
+                Buffer.BlockCopy(data, 0, tmp, 0, count * 4);
+                lock (_dumpLock) { stream.Write(tmp, 0, tmp.Length); }
+            }
+            catch { }
         }
 
         // ==========================================
@@ -519,8 +578,9 @@ namespace Hearbud
                     }
                     catch (Exception ex)
                     {
-                        // We swallow write errors here to keep the thread alive for other files, 
-                        // but strictly we should log this.
+                        // Keep the writer thread alive for other files, but surface in session log
+                        // (previously Debug-only, invisible in field reports).
+                        Warn($"Disk write failed ({job.Target}): {ex.Message}");
                         Debug.WriteLine($"Disk write error: {ex.Message}");
                     }
                     finally
@@ -741,6 +801,7 @@ namespace Hearbud
 
                 // Optimization: Pass scratch buffer to avoid allocations inside ConvertToTarget
                 int conv = ConvertToTarget(_micInBuf, got, _micSrc.WaveFormat, _outRate, _outChannels, ref _micConvBuf, ref _resampleScratch);
+                WriteDump(_dumpMic, _micConvBuf, conv);
 
                 long nowTicksA = Stopwatch.GetTimestamp();
                 double msSinceLoop = (nowTicksA - _lastLoopTick) * _tickMs;
@@ -786,6 +847,7 @@ namespace Hearbud
                 }
                 else
                 {
+                    int overruns = 0;
                     lock (_micRingLock)
                     {
                         EnsureRingCapacity(conv);
@@ -794,8 +856,14 @@ namespace Hearbud
                             _micRing[_micW] = _micConvBuf[i];
                             _micW = (_micW + 1) % _micRing.Length;
                             if (_micCount < _micRing.Length) _micCount++;
-                            else _micR = (_micR + 1) % _micRing.Length;
+                            else { _micR = (_micR + 1) % _micRing.Length; overruns++; }
                         }
+                    }
+                    if (overruns > 0)
+                    {
+                        long total = Interlocked.Add(ref _micOverrunBlocks, overruns);
+                        if (total <= 10 || total % 48000 == 0)
+                            Warn($"Mic ring full: dropped {overruns} oldest samples (total {total})");
                     }
                 }
 
@@ -829,6 +897,7 @@ namespace Hearbud
                     float micScale = ComputeMixScale(micPeak);
                     for (int i = 0; i < conv; i++)
                         _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i] * micScale);
+                    WriteDump(_dumpMix, _mixBufF, conv);
 
                     if (_mixUse32Bit)
                     {
@@ -909,6 +978,7 @@ namespace Hearbud
                     FloatToPcm16(_loopBufF, _pcm16Sys, gotLoop);
                     EnqueueWrite(AudioFileTarget.System, _pcm16Sys, gotLoop * 2);
                 }
+                WriteDump(_dumpSys, _loopBufF, gotLoop);
 
                 // --- Diagnostics ---
                 int snapshotMicCount;
@@ -937,10 +1007,24 @@ namespace Hearbud
                 {
                     Array.Clear(_tmpMicBlock, micRead, gotLoop - micRead);
                     _micUnderrunBlocks++;
+                    Interlocked.Add(ref _silencedSamples, gotLoop - micRead);
                 }
 
                 _loopBlockCounter++;
-                if (_loopBlockCounter % BacklogLogEveryNBlocks == 0)
+                // lagTime-equivalent: wall-clock 1 Hz line (RecExperts style), not callback-count anchored.
+                // Includes FIFO depth, over/under counters, backlog max. Sustained lag >80 ms is the
+                // future resync trigger (GAP-01); today we observe + log.
+                long nowLagTick = Stopwatch.GetTimestamp();
+                if (_lastLagLogTick == 0) _lastLagLogTick = nowLagTick;
+                double secSinceLag = (nowLagTick - _lastLagLogTick) * _tickMs / 1000.0;
+                if (secSinceLag >= 1.0)
+                {
+                    _lastLagLogTick = nowLagTick;
+                    long over = Interlocked.Read(ref _micOverrunBlocks);
+                    long under = Interlocked.Read(ref _micUnderrunBlocks);
+                    Info($"lagTime={backlogSec:F3}s micDepth={snapshotMicCount} over={over} under={under} silenced={_silencedSamples} backlogMax={_micBacklogSecMax:F3}s lagWatch={(backlogSec > 0.08 ? "LAG" : "ok")}");
+                }
+                else if (_loopBlockCounter % BacklogLogEveryNBlocks == 0)
                 {
                     Info($"Mic ring backlog: {backlogSec:F4} s (max {_micBacklogSecMax:F4} s)");
                 }
@@ -964,6 +1048,7 @@ namespace Hearbud
                 }
                 for (int i = 0; i < gotLoop; i++)
                     _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i]);
+                WriteDump(_dumpMix, _mixBufF, gotLoop);
 
                 // --- Write Mix WAV (Async) ---
                 if (_recording && _wavMix != null)
@@ -1182,16 +1267,33 @@ namespace Hearbud
         {
             if (_micRing.Length - _micCount >= roomNeeded) return;
 
-            int newLen = NextPow2(_micCount + roomNeeded);
-            if (newLen <= _micRing.Length) return;
+            // Bounded FIFO (~2 s at current rate): grow up to cap, then drop-oldest + count.
+            // Prevents unbounded growth when mic clock runs faster than loopback (drift).
+            int cap = Math.Max(_micRing.Length, _outRate * _outChannels * 2);
+            int want = _micCount + roomNeeded;
+            if (want <= cap)
+            {
+                int newLen = Math.Min(cap, NextPow2(want));
+                if (newLen <= _micRing.Length) return;
+                var newBuf = new float[newLen];
+                for (int i = 0; i < _micCount; i++)
+                    newBuf[i] = _micRing[(_micR + i) % _micRing.Length];
+                _micRing = newBuf;
+                _micR = 0;
+                _micW = _micCount;
+                return;
+            }
 
-            var newBuf = new float[newLen];
-            for (int i = 0; i < _micCount; i++)
-                newBuf[i] = _micRing[(_micR + i) % _micRing.Length];
-
-            _micRing = newBuf;
-            _micR = 0;
-            _micW = _micCount;
+            int drop = want - cap;
+            drop = Math.Min(drop, _micCount);
+            if (drop > 0)
+            {
+                _micR = (_micR + drop) % _micRing.Length;
+                _micCount -= drop;
+            }
+            long over = Interlocked.Add(ref _micOverrunBlocks, want - cap);
+            if (over <= 10 || over % 48000 == 0)
+                Warn($"Mic ring overrun: dropped {drop} buffered + {want - cap - drop} incoming samples (total {over}) - mic faster than loopback");
         }
 
         private void OpenLog()
@@ -1199,6 +1301,7 @@ namespace Hearbud
             try
             {
                 _logBytesWritten = 0;
+                _logTruncated = false;
                 if (!string.IsNullOrEmpty(_logPath))
                 {
                     TryDispose(ref _log);
@@ -1222,13 +1325,23 @@ namespace Hearbud
                 {
                     if (_log == null) return;
 
+                    // After cap: suppress routine INFO but keep WARN/ERROR and session-end summary
+                    // so the tail (underrun/overrun counts) is never lost.
+                    if (_logTruncated && level == "INFO" &&
+                        msg.IndexOf("Session end", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        msg.IndexOf("Recording stopped", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        msg.IndexOf("underrun", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        msg.IndexOf("Overrun", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        msg.IndexOf("Silenced", StringComparison.OrdinalIgnoreCase) < 0)
+                        return;
+
                     var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {level} {where}: {msg}";
                     _logBytesWritten += line.Length * 2; // Rough estimate
 
-                    if (_logBytesWritten > MaxLogSizeBytes)
+                    if (_logBytesWritten > MaxLogSizeBytes && !_logTruncated)
                     {
-                        _log.WriteLine("[LOG TRUNCATED - Maximum size reached]");
-                        TryDispose(ref _log);
+                        _log.WriteLine("[LOG TRUNCATED - Maximum size reached, INFO suppressed, WARN/ERROR retained]");
+                        _logTruncated = true;
                         return;
                     }
 

@@ -560,22 +560,26 @@ public class RecorderEngineDspTests
     // ─────────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void EnsureRingCapacity_GrowsWhenFull()
+    public void EnsureRingCapacity_Bounded_DropsOldestAndCounts()
     {
         using var engine = new RecorderEngine();
         var method = GetInstance("EnsureRingCapacity");
         var ringField = EngineType.GetField("_micRing",
             BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var overField = EngineType.GetField("_micOverrunBlocks",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
         var ring = (float[])ringField.GetValue(engine)!;
         int initialLen = ring.Length;
 
-        // Request far more room than the buffer currently has
+        // Request far more room than the bounded cap allows: must not grow unbounded,
+        // must count an overrun instead.
         method.Invoke(engine, new object[] { initialLen * 10 });
 
         var newRing = (float[])ringField.GetValue(engine)!;
-        Assert.NotSame(ring, newRing);
-        Assert.True(newRing.Length >= initialLen * 10,
-            $"Expected >= {initialLen * 10}, got {newRing.Length}");
+        Assert.True(newRing.Length <= initialLen * 2,
+            $"Bounded FIFO must not grow 10x; got {newRing.Length} from {initialLen}");
+        Assert.True((long)overField.GetValue(engine)! > 0,
+            "Overrun counter must increment when demand exceeds cap");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -657,7 +661,7 @@ public class RecorderEngineDspTests
     // ─────────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void WriteLog_TruncatesAtMaxSize()
+    public void WriteLog_TruncatesAtMaxSize_KeepsWarnAndSummary()
     {
         using var engine = new RecorderEngine();
         var tempLog = Path.GetTempFileName();
@@ -677,13 +681,19 @@ public class RecorderEngineDspTests
 
             var writeLog = GetInstance("WriteLog");
             writeLog.Invoke(engine, new object?[] { "INFO", "trigger truncation", null });
+            writeLog.Invoke(engine, new object?[] { "INFO", "routine noise after cap", null });
+            writeLog.Invoke(engine, new object?[] { "WARN", "still visible after cap", null });
+            writeLog.Invoke(engine, new object?[] { "INFO", "Mic ring underruns: 3. Overruns: 1", null });
 
             var content = File.ReadAllText(tempLog);
             Assert.Contains("LOG TRUNCATED", content);
+            Assert.Contains("still visible after cap", content);
+            Assert.DoesNotContain("routine noise after cap", content);
+            Assert.Contains("underruns", content);
 
             var logField = EngineType.GetField("_log",
                 BindingFlags.NonPublic | BindingFlags.Instance)!;
-            Assert.Null(logField.GetValue(engine));
+            Assert.NotNull(logField.GetValue(engine));
         }
         finally
         {
