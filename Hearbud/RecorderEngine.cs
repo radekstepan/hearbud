@@ -102,6 +102,8 @@ namespace Hearbud
         public int Mp3BitrateKbps { get; set; } = 192;
         /// <summary>Optional hidden diagnostics: when set, raw float32 microphoneIn/speakerIn/mixOut dumps are written here.</summary>
         public string DumpDir { get; set; } = "";
+        /// <summary>GAP-07: when false, only mix (+MP3) is written; skips *-system/-mic stems (1x I/O). Default true for compat.</summary>
+        public bool WriteStems { get; set; } = true;
     }
 
     // --- ASYNC WRITER DEFINITIONS ---
@@ -191,6 +193,7 @@ namespace Hearbud
         private string _pathMix = "";
         private string _pathMp3 = "";
         private int _kbps = 192;
+        private bool _writeStems = true;
 
         private string _logPath = "";
         private StreamWriter? _log;
@@ -348,6 +351,7 @@ namespace Hearbud
             await MonitorAsync(opts); 
 
             _kbps = opts.Mp3BitrateKbps;
+            _writeStems = opts.WriteStems;
 
             var basePath = string.IsNullOrWhiteSpace(opts.OutputPath)
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings", $"rec-{DateTime.Now:yyyyMMdd_HHmmss}")
@@ -371,9 +375,18 @@ namespace Hearbud
             Info($"Output Mic:    {_pathMic}");
             Info($"Output Mix:    {_pathMix}");
 
-            // Create writers
-            _wavSys = new WaveWriter(_pathSys, new CSCore.WaveFormat(_outRate, 16, _outChannels));
-            _wavMic = new WaveWriter(_pathMic, new CSCore.WaveFormat(_outRate, 16, _outChannels));
+            // Create writers (stems optional: mix-only cuts write I/O ~3x→1x)
+            if (_writeStems)
+            {
+                _wavSys = new WaveWriter(_pathSys, new CSCore.WaveFormat(_outRate, 16, _outChannels));
+                _wavMic = new WaveWriter(_pathMic, new CSCore.WaveFormat(_outRate, 16, _outChannels));
+            }
+            else
+            {
+                _wavSys = null; _wavMic = null;
+                _pathSys = ""; _pathMic = "";
+                Info("Stems disabled: writing mix only.");
+            }
             _wavMix = new WaveWriter(_pathMix, new CSCore.WaveFormat(_outRate, _mixUse32Bit ? 32 : 16, _outChannels));
 
             // Initialize Async Write Queue and Task
@@ -1053,7 +1066,7 @@ namespace Hearbud
                 }
 
                 // --- Write Mic WAV (Async) ---
-                if (_recording && _wavMic != null)
+                if (_recording && _writeStems && _wavMic != null)
                 {
                     EnsureCapacity(ref _pcm16Mic, conv * 2);
                     FloatToPcm16(_micConvBuf, _pcm16Mic, conv); 
@@ -1062,12 +1075,15 @@ namespace Hearbud
                 }
 
                 // --- Mic-Only Drive (if loopback silent) ---
-                if (_recording && _wavMix != null && _wavSys != null && loopSilent)
+                if (_recording && _wavMix != null && loopSilent)
                 {
-                    // Write zeros to System
-                    EnsureCapacity(ref _pcm16Sys, conv * 2);
-                    Array.Clear(_pcm16Sys, 0, conv * 2);
-                    EnqueueWrite(AudioFileTarget.System, _pcm16Sys, conv * 2);
+                    if (_writeStems && _wavSys != null)
+                    {
+                        // Write zeros to System stem (mix-only mode skips this)
+                        EnsureCapacity(ref _pcm16Sys, conv * 2);
+                        Array.Clear(_pcm16Sys, 0, conv * 2);
+                        EnqueueWrite(AudioFileTarget.System, _pcm16Sys, conv * 2);
+                    }
 
                     // Write Mic to Mix (full level; peak-normalize only on overs, like amix)
                     EnsureCapacity(ref _mixBufF, conv);
@@ -1157,7 +1173,7 @@ namespace Hearbud
                 }
 
                 // --- Write System WAV (Async) ---
-                if (_recording && _wavSys != null)
+                if (_recording && _writeStems && _wavSys != null)
                 {
                     EnsureCapacity(ref _pcm16Sys, gotLoop * 2);
                     FloatToPcm16(_loopBufF, _pcm16Sys, gotLoop);
