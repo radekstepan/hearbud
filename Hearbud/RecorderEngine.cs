@@ -234,7 +234,11 @@ namespace Hearbud
         private double _micBacklogSecMax = 0.0;
         private bool _logTruncated = false;
         private const int BacklogLogEveryNBlocks = 50;
+        private readonly object _devLock = new();
         private readonly object _dumpLock = new();
+        private bool _loopLost;
+        private bool _micLost;
+        private CancellationTokenSource? _reopenCts;
         private FileStream? _dumpMic;
         private FileStream? _dumpSys;
         private FileStream? _dumpMix;
@@ -343,6 +347,7 @@ namespace Hearbud
             if (_disposed) return;
 
             _recording = false;
+            lock (_devLock) { _reopenCts?.Cancel(); _reopenCts = null; _loopLost = _micLost = false; }
 
             StopInternal(fullStop: false);
 
@@ -376,12 +381,11 @@ namespace Hearbud
                 RaiseStatus(EngineStatusKind.Error, $"Disk write failed: {_writerException.Message}");
             }
 
-            // 2. Now it is safe to close the files (WAV headers are updated on Dispose)
-            bool okSys = false, okMic = false, okMix = false, okMp3 = false;
-            try { _wavSys?.Dispose(); okSys = File.Exists(_pathSys) && new FileInfo(_pathSys).Length > 0; } catch { }
-            try { _wavMic?.Dispose(); okMic = File.Exists(_pathMic) && new FileInfo(_pathMic).Length > 0; } catch { }
-            try { _wavMix?.Dispose(); okMix = File.Exists(_pathMix) && new FileInfo(_pathMix).Length > 0; } catch { }
-            _wavSys = null; _wavMic = null; _wavMix = null;
+            // 2. Now it is safe to close the files (WAV headers are updated on Dispose).
+            // GAP-06: shared finalize path so abort/Dispose leaves valid headers too.
+            bool okSys, okMic, okMix;
+            bool okMp3 = false;
+            (okSys, okMic, okMix) = FinalizeWavFiles();
             
             bool doMp3Encoding = _kbps > 0;
             Exception? encEx = null;
@@ -488,10 +492,8 @@ namespace Hearbud
             if (_disposed) return;
             _disposed = true;
 
-            try { _wavSys?.Dispose(); } catch { }
-            try { _wavMic?.Dispose(); } catch { }
-            try { _wavMix?.Dispose(); } catch { }
-            _wavSys = null; _wavMic = null; _wavMix = null;
+            lock (_devLock) { _reopenCts?.Cancel(); _loopLost = _micLost = false; }
+            FinalizeWavFiles();
 
             // Stop the write queue if it's still running. 
             // We check IsAddingCompleted to avoid InvalidOperationException if StopAsync was already called.
@@ -539,6 +541,18 @@ namespace Hearbud
                 try { _dumpMix?.Dispose(); } catch { }
                 _dumpMic = _dumpSys = _dumpMix = null;
             }
+        }
+
+        /// <summary>GAP-06: idempotent WAV finalize — Dispose()s writers so RIFF sizes are
+        /// rewritten, safe from StopAsync, Dispose, or abort paths.</summary>
+        private (bool okSys, bool okMic, bool okMix) FinalizeWavFiles()
+        {
+            bool okSys = false, okMic = false, okMix = false;
+            try { _wavSys?.Dispose(); okSys = File.Exists(_pathSys) && new FileInfo(_pathSys).Length > 44; } catch { }
+            try { _wavMic?.Dispose(); okMic = File.Exists(_pathMic) && new FileInfo(_pathMic).Length > 44; } catch { }
+            try { _wavMix?.Dispose(); okMix = File.Exists(_pathMix) && new FileInfo(_pathMix).Length > 44; } catch { }
+            _wavSys = null; _wavMic = null; _wavMix = null;
+            return (okSys, okMic, okMix);
         }
 
         private void WriteDump(FileStream? stream, float[] data, int count)
@@ -755,9 +769,10 @@ namespace Hearbud
 
         /// <summary>
         /// Called by the UI when Windows reports a device removal or state change to Unplugged.
-        /// If the affected device is one currently in use, stops recording safely (draining
-        /// the write queue and finalising WAV headers) then tears down monitoring.
-        /// Safe to call from any thread — all UI work is marshalled inside the engine events.
+        /// While recording the file stays open: the lost source is detached, the survivor
+        /// keeps feeding the mix via silence-bridge, and a backoff loop re-opens the device
+        /// into the same file (frozen format). Monitoring-only still tears down.
+        /// Safe to call from any thread.
         /// </summary>
         public async Task HandleDeviceDisconnectedAsync(string deviceId)
         {
@@ -766,15 +781,109 @@ namespace Hearbud
 
             if (_recording)
             {
-                // StopAsync drains the write queue and closes the WAV files safely before returning.
+                bool isLoop = deviceId == _activeLoopDeviceId;
+                CancellationToken token;
+                lock (_devLock)
+                {
+                    if (isLoop) _loopLost = true; else _micLost = true;
+                    _reopenCts?.Cancel();
+                    _reopenCts = new CancellationTokenSource();
+                    token = _reopenCts.Token;
+                }
+                DetachSource(isLoop);
                 RaiseStatus(EngineStatusKind.Error,
-                    "Audio device disconnected — stopping recording safely…");
-                await StopAsync();
+                    $"Audio device disconnected — continuing same file on silence, retrying {(isLoop ? "system" : "mic")}…");
+                Info($"Device lost ({(isLoop ? "loop" : "mic")} id={deviceId}); surviving source continues.");
+                await Task.Yield();
+                _ = ReopenLostSourceLoopAsync(isLoop, token);
             }
             else
             {
                 StopInternal(fullStop: true);
                 RaiseStatus(EngineStatusKind.Info, "Audio device disconnected.");
+            }
+        }
+
+        /// <summary>Single-shot resume attempt for OnDeviceAdded; no-op when nothing is lost.</summary>
+        public Task TryResumeLostSourcesAsync()
+        {
+            CancellationToken token;
+            lock (_devLock)
+            {
+                _reopenCts?.Cancel();
+                _reopenCts = new CancellationTokenSource();
+                token = _reopenCts.Token;
+            }
+            return Task.Run(async () =>
+            {
+                await ReopenLostSourceLoopAsync(isLoop: true, token, resumeOnly: true);
+                await ReopenLostSourceLoopAsync(isLoop: false, token, resumeOnly: true);
+            });
+        }
+
+        private void DetachSource(bool isLoop)
+        {
+            try { if (isLoop && _loopIn != null) _loopIn.DataAvailable -= OnLoopbackData; } catch { }
+            try { if (!isLoop && _micIn != null) _micIn.DataAvailable -= OnMicData; } catch { }
+            if (isLoop) { TryStopDispose(ref _loopCap); TryDispose(ref _loopIn); TryDispose(ref _loopSrc); }
+            else { TryStopDispose(ref _micCap); TryDispose(ref _micIn); TryDispose(ref _micSrc); }
+            if (!isLoop) lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+            try { Array.Clear(_resampleScratch, 0, _resampleScratch.Length); } catch { }
+        }
+
+        private async Task ReopenLostSourceLoopAsync(bool isLoop, CancellationToken token, bool resumeOnly = false)
+        {
+            int attempt = 0;
+            while (true)
+            {
+                lock (_devLock)
+                {
+                    if (isLoop ? !_loopLost : !_micLost) return;
+                    if (!_monitoring || !_recording || _disposed) return;
+                }
+                if (resumeOnly && attempt > 0) return;
+                if (token.IsCancellationRequested) return;
+                try
+                {
+                    string devId = isLoop ? _activeLoopDeviceId : _activeMicDeviceId;
+                    if (string.IsNullOrEmpty(devId)) return;
+                    MMDevice dev;
+                    using (var mmde = new MMDeviceEnumerator()) dev = mmde.GetDevice(devId);
+                    if (isLoop)
+                    {
+                        var cap = new WasapiLoopbackCapture { Device = dev };
+                        cap.Initialize();
+                        _loopCap = cap;
+                        _loopIn = new SoundInSource(_loopCap) { FillWithZeros = true };
+                        _loopSrc = _loopIn.ToSampleSource();
+                        _loopIn.DataAvailable += OnLoopbackData;
+                        _loopCap.Start();
+                        _lastLoopTick = Stopwatch.GetTimestamp();
+                    }
+                    else
+                    {
+                        var cap = new WasapiCapture { Device = dev };
+                        cap.Initialize();
+                        _micCap = cap;
+                        _micIn = new SoundInSource(_micCap) { FillWithZeros = true };
+                        _micSrc = _micIn.ToSampleSource();
+                        lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                        try { Array.Clear(_resampleScratch, 0, _resampleScratch.Length); } catch { }
+                        _micIn.DataAvailable += OnMicData;
+                        _micCap.Start();
+                    }
+                    lock (_devLock) { if (isLoop) _loopLost = false; else _micLost = false; }
+                    Info($"Re-opened {(isLoop ? "loopback" : "mic")} on same file: {dev?.FriendlyName}");
+                    RaiseStatus(EngineStatusKind.Info, $"Audio device reconnected — resumed same file ({(isLoop ? "system" : "mic")}).");
+                    return;
+                }
+                catch (Exception ex) when (ex is CoreAudioAPIException || ex is System.Runtime.InteropServices.COMException || ex is FileNotFoundException || ex is DirectoryNotFoundException)
+                {
+                    int delay = attempt switch { 0 => 500, 1 => 1000, 2 => 2000, _ => 5000 };
+                    if (attempt % 4 == 0) Info($"Re-open {(isLoop ? "loop" : "mic")} attempt {attempt + 1} failed, retry in {delay}ms: {ex.Message}");
+                    attempt++;
+                    try { await Task.Delay(delay, token); } catch (OperationCanceledException) { return; }
+                }
             }
         }
 
@@ -915,8 +1024,8 @@ namespace Hearbud
             }
             catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
             {
-                RaiseStatus(EngineStatusKind.Error, "Audio device disconnected");
-                StopInternal(fullStop: true);
+                // GAP-06: keep file open; loopback clock zero-fills this source.
+                _ = HandleDeviceDisconnectedAsync(_activeMicDeviceId);
             }
             catch (Exception ex) { Error("OnMicData", ex); }
         }
@@ -1069,8 +1178,8 @@ namespace Hearbud
             }
             catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
             {
-                RaiseStatus(EngineStatusKind.Error, "Audio device disconnected");
-                StopInternal(fullStop: true);
+                // GAP-06: keep file open; mic-only drive takes over the mix.
+                _ = HandleDeviceDisconnectedAsync(_activeLoopDeviceId);
             }
             catch (Exception ex) { Error("OnLoopbackData", ex); }
         }

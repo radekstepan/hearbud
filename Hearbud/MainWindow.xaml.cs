@@ -602,11 +602,12 @@ namespace Hearbud
         public void OnDeviceAdded(string deviceId)
         {
             // Callbacks arrive on a COM background thread — marshal everything back to the UI thread.
-            Dispatcher.BeginInvoke(() =>
+            Dispatcher.BeginInvoke(async () =>
             {
                 SafeRefreshDevices();
                 UpdateTrayTooltip();
                 TryStartAutoMonitor();
+                await _engine.TryResumeLostSourcesAsync();
             });
         }
 
@@ -619,7 +620,7 @@ namespace Hearbud
         {
             Dispatcher.BeginInvoke(async () =>
             {
-                // Stop the engine first (safe-drains the write queue if recording).
+                // GAP-06: engine keeps the file open and bridges silence; only refresh combos here.
                 await _engine.HandleDeviceDisconnectedAsync(deviceId);
                 SafeRefreshDevices();
                 UpdateTrayTooltip();
