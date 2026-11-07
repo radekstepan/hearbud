@@ -338,8 +338,8 @@ StopAsync() called
 - If loopback goes silent, mic can drive output to support mic-only sessions
 - **Watch out:** Stale mic data is dropped when loopback resumes, preventing echo artifacts
 
-### 2. Three Parallel WAV Files
-**Decision:** Always write separate `*-system.wav`, `*-mic.wav`, and `*-mix.wav` files.
+### 2. WAV Files (stems optional, mix always)
+**Decision:** Default `*-system.wav` + `*-mic.wav` + `*-mix.wav`; `RecorderStartOptions.WriteStems=false` writes mix only (1x I/O).
 
 **Rationale:**
 - Users can later remix or edit individual tracks in DAW/audacity
@@ -368,13 +368,18 @@ StopAsync() called
 - Pooling is a standard .NET optimization for high-frequency buffers
 - **Memory Safety:** `EnqueueWrite` uses a `try/finally` block to ensure rented buffers are always returned to the pool, preventing memory leaks if adding to the queue fails or an exception occurs.
 
-### 5. Ring Buffer for Mic Synchronization
-**Decision:** Mic audio goes into a ring buffer pulled by loopback ticks.
+### 5. Bounded mic FIFO + stateful resample (GAP-01/02/08)
+**Decision:** Mic goes through stateful `ConvertToTargetChunked` (phase carry, no seam clicks,
+cumulative length +-1 frame/s, ITU fold with LFE excluded) into a bounded FIFO (~2 s cap,
+drop-oldest + `_micOverrunBlocks`). Loopback ticks pull fixed mix; underruns zero-fill +
+`_micUnderrunBlocks`/`_silencedSamples`; 1 Hz `lagTime` wall-clock line (depth/over/under/
+silenced/max, LAG>80 ms); pre-roll 2 blocks; MMCSS Pro Audio on writer thread + 1 ms timer;
+`DumpDir` taps (microphoneIn/speakerIn/mixOut.pcm); log cap keeps WARN/ERROR + session tail.
 
 **Rationale:**
-- Handles mic/loopback sample rate differences (resampling in ConvertToTarget)
-- Mic typically arrives at slightly different rate or chunk sizes
-- Ring buffer natural overruns/underruns handled gracefully
+- Handles mic/loopback sample rate differences on arrival (not lazily at mix)
+- Bounded FIFO prevents unbounded growth on crystal drift; counters make drift visible
+- Pre-roll avoids frame-0 silence + spurious underrun
 
 **Sync Edge Case:** When loopback resumes after silence, existing mic backlog is dropped. This prevents "old mic over new system" echo effect.
 
@@ -456,10 +461,10 @@ StopAsync() called
 | Situation | Handling | Comment |
 |-----------|----------|---------|
 | Loopback silent >200ms | Mic drives output | Mix = mic-only, system = zeros |
-| Mic underrun (ring empty) | Zero-fill missing samples | Counted in `_micUnderrunBlocks` |
-| Mic overrun (ring full) | Oldest samples dropped | Happens when mic is much faster than loopback |
+| Mic underrun (FIFO empty) | Zero-fill + `_micUnderrunBlocks`/`_silencedSamples` | Pre-roll 2 blocks not counted; 1 Hz `lagTime` line |
+| Mic overrun (FIFO over cap) | Drop-oldest + `_micOverrunBlocks`, throttled Warn | Bounded ~2 s cap; never grows unbounded |
 | Queue full (disk stall) | Drops data to avoid callback stall | Logged immediately on first drop, then every 100 drops |
-| Device disappears during record | Exception in callback | Caught, logged, continues if possible |
+| Device disappears during record | Detach lost source, silence-bridge, backoff re-open same file | `HandleDeviceDisconnectedAsync` + `DetachSource`/`ReopenLostSourceLoopAsync`; `FinalizeWavFiles` keeps headers valid; plug-in resumes via `TryResumeLostSourcesAsync` |
 | MP3 encode failure | Logs error, WAVs still saved | User gets WAV files even if MP3 fails |
 
 ### Configuration Gotchas
