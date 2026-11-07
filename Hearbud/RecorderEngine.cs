@@ -262,6 +262,39 @@ namespace Hearbud
         private bool _loopLost;
         private bool _micLost;
         private CancellationTokenSource? _reopenCts;
+        private int _preRollRemaining;
+
+        // GAP-01: 1 ms system timer + MMCSS "Pro Audio" for our own threads.
+        // CSCore owns the WASAPI callback threads, so we pin what we own (writer thread)
+        // and raise timer resolution during capture; documented in ARCHITECTURE.
+        private static class NativeTiming
+        {
+            [System.Runtime.InteropServices.DllImport("winmm.dll")]
+            private static extern uint timeBeginPeriod(uint uPeriod);
+            [System.Runtime.InteropServices.DllImport("winmm.dll")]
+            private static extern uint timeEndPeriod(uint uPeriod);
+            [System.Runtime.InteropServices.DllImport("avrt.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+            private static extern int AvSetMmThreadCharacteristicsW(string taskName, ref uint taskIndex);
+            [System.Runtime.InteropServices.DllImport("avrt.dll")]
+            private static extern bool AvRevertMmThreadCharacteristics(int handle);
+
+            public static void Begin1Ms() { try { if (OperatingSystem.IsWindows()) timeBeginPeriod(1); } catch { } }
+            public static void End1Ms() { try { if (OperatingSystem.IsWindows()) timeEndPeriod(1); } catch { } }
+            public static int BoostCurrentThread()
+            {
+                try
+                {
+                    if (!OperatingSystem.IsWindows()) return 0;
+                    uint idx = 0;
+                    return AvSetMmThreadCharacteristicsW("Pro Audio", ref idx);
+                }
+                catch { return 0; }
+            }
+            public static void Unboost(int handle)
+            {
+                try { if (OperatingSystem.IsWindows() && handle != 0) AvRevertMmThreadCharacteristics(handle); } catch { }
+            }
+        }
         private FileStream? _dumpMic;
         private FileStream? _dumpSys;
         private FileStream? _dumpMix;
@@ -355,10 +388,12 @@ namespace Hearbud
             _micOverrunBlocks = 0;
             _silencedSamples = 0;
             _loopBlockCounter = 0;
+            _preRollRemaining = 2;
             _lastLagLogTick = 0;
             _lastMicBacklogSec = 0.0;
             _micBacklogSecMax = 0.0;
             _logTruncated = false;
+            NativeTiming.Begin1Ms();
             OpenDumpStreams(opts.DumpDir, outDir, baseName);
 
             _recording = true;
@@ -496,6 +531,7 @@ namespace Hearbud
             Info("===== Session end =====");
 
             CloseDumpStreams();
+            NativeTiming.End1Ms();
             TryDispose(ref _log);
             _logPath = ""; 
 
@@ -518,6 +554,7 @@ namespace Hearbud
 
             lock (_devLock) { _reopenCts?.Cancel(); _loopLost = _micLost = false; }
             FinalizeWavFiles();
+            NativeTiming.End1Ms();
 
             // Stop the write queue if it's still running. 
             // We check IsAddingCompleted to avoid InvalidOperationException if StopAsync was already called.
@@ -599,6 +636,7 @@ namespace Hearbud
         private void DiskWriteLoop()
         {
             if (_writeQueue == null) return;
+            int mmcss = NativeTiming.BoostCurrentThread();
 
             try
             {
@@ -635,6 +673,10 @@ namespace Hearbud
                 _recording = false; // Stop accepting new data if writer fails
                 Error("DiskWriteLoop fatal", ex);
                 RaiseStatus(EngineStatusKind.Error, $"Disk write failed: {ex.Message}");
+            }
+            finally
+            {
+                NativeTiming.Unboost(mmcss);
             }
         }
 
@@ -983,9 +1025,10 @@ namespace Hearbud
                 else
                 {
                     int overruns = 0;
+                    long capDropped;
                     lock (_micRingLock)
                     {
-                        EnsureRingCapacity(conv);
+                        capDropped = EnsureRingCapacity(conv);
                         for (int i = 0; i < conv; i++)
                         {
                             _micRing[_micW] = _micConvBuf[i];
@@ -993,6 +1036,13 @@ namespace Hearbud
                             if (_micCount < _micRing.Length) _micCount++;
                             else { _micR = (_micR + 1) % _micRing.Length; overruns++; }
                         }
+                    }
+                    long totalCap = capDropped;
+                    if (capDropped > 0)
+                    {
+                        totalCap = Interlocked.Read(ref _micOverrunBlocks);
+                        if (totalCap <= 10 || totalCap % 48000 == 0)
+                            Warn($"Mic ring overrun: dropped {capDropped} samples (total {totalCap}) - mic faster than loopback");
                     }
                     if (overruns > 0)
                     {
@@ -1141,8 +1191,22 @@ namespace Hearbud
                 if (micRead < gotLoop)
                 {
                     Array.Clear(_tmpMicBlock, micRead, gotLoop - micRead);
-                    _micUnderrunBlocks++;
-                    Interlocked.Add(ref _silencedSamples, gotLoop - micRead);
+                    if (_preRollRemaining > 0)
+                    {
+                        // Pre-roll (ere-core graph.cpp:56-57): first frames are not real
+                        // underruns, the mic FIFO just hasn't filled yet.
+                        _preRollRemaining--;
+                        Array.Clear(_tmpMicBlock, 0, gotLoop);
+                    }
+                    else
+                    {
+                        _micUnderrunBlocks++;
+                        Interlocked.Add(ref _silencedSamples, gotLoop - micRead);
+                    }
+                }
+                else if (_preRollRemaining > 0)
+                {
+                    _preRollRemaining--;
                 }
 
                 _loopBlockCounter++;
@@ -1464,9 +1528,11 @@ namespace Hearbud
             return (int)BitOperations.RoundUpToPowerOf2((uint)n);
         }
 
-        private void EnsureRingCapacity(int roomNeeded)
+        // Caller holds _micRingLock; no logging inside (lock discipline: indices only).
+        // Returns samples dropped; caller Warns outside the lock.
+        private long EnsureRingCapacity(int roomNeeded)
         {
-            if (_micRing.Length - _micCount >= roomNeeded) return;
+            if (_micRing.Length - _micCount >= roomNeeded) return 0;
 
             // Bounded FIFO (~2 s at current rate): grow up to cap, then drop-oldest + count.
             // Prevents unbounded growth when mic clock runs faster than loopback (drift).
@@ -1475,14 +1541,14 @@ namespace Hearbud
             if (want <= cap)
             {
                 int newLen = Math.Min(cap, NextPow2(want));
-                if (newLen <= _micRing.Length) return;
+                if (newLen <= _micRing.Length) return 0;
                 var newBuf = new float[newLen];
                 for (int i = 0; i < _micCount; i++)
                     newBuf[i] = _micRing[(_micR + i) % _micRing.Length];
                 _micRing = newBuf;
                 _micR = 0;
                 _micW = _micCount;
-                return;
+                return 0;
             }
 
             int drop = want - cap;
@@ -1492,9 +1558,9 @@ namespace Hearbud
                 _micR = (_micR + drop) % _micRing.Length;
                 _micCount -= drop;
             }
-            long over = Interlocked.Add(ref _micOverrunBlocks, want - cap);
-            if (over <= 10 || over % 48000 == 0)
-                Warn($"Mic ring overrun: dropped {drop} buffered + {want - cap - drop} incoming samples (total {over}) - mic faster than loopback");
+            long dropped = want - cap;
+            Interlocked.Add(ref _micOverrunBlocks, dropped);
+            return dropped;
         }
 
         private void OpenLog()
