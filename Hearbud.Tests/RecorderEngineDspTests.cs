@@ -478,10 +478,9 @@ public class RecorderEngineDspTests
     // ─────────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void ConvertToTarget_StereoToQuad_ExpandsToQuad()
+    public void ConvertToTarget_StereoToQuad_ZeroFillsSurrounds()
     {
-        // 2ch → 4ch hits the "else" branch (srcCh=2, dstCh=4).
-        // For each source frame, dst gets L, R, R, R (last channels duplicate).
+        // 2ch → 4ch: L,R passthrough, surrounds zero (never duplicate R into LFE).
         var srcFmt = new CSCore.WaveFormat(48000, 16, 2);
         float[] src = { 0.1f, 0.9f }; // 1 stereo frame
         float[] dst = new float[16];
@@ -492,24 +491,40 @@ public class RecorderEngineDspTests
         Assert.Equal(4, count);
         Assert.Equal(0.1f, dst[0], precision: 6);
         Assert.Equal(0.9f, dst[1], precision: 6);
-        Assert.Equal(0.9f, dst[2], precision: 6);
-        Assert.Equal(0.9f, dst[3], precision: 6);
+        Assert.Equal(0f, dst[2], precision: 6);
+        Assert.Equal(0f, dst[3], precision: 6);
     }
 
     [Fact]
-    public void ConvertToTarget_SixChannelsToStereo_Truncates()
+    public void ConvertToTarget_SixChannelsToStereo_FoldsCenterAndSurround_LfeExcluded()
     {
-        // 6ch → 2ch also hits the "else" branch.
+        // 6ch L,R,C,LFE,SL,SR → stereo fold: L+0.707C+0.5SL, R+0.707C+0.5SR; LFE excluded.
         var srcFmt = new CSCore.WaveFormat(48000, 16, 6);
-        float[] src = { 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f }; // 1 6-ch frame
+        float[] src = { 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f };
         float[] dst = new float[16];
         float[] scratch = new float[16];
 
         int count = InvokeConvertToTarget(src, src.Length, srcFmt, 48000, 2, ref dst, ref scratch);
 
         Assert.Equal(2, count);
-        Assert.Equal(0.1f, dst[0], precision: 6);
-        Assert.Equal(0.2f, dst[1], precision: 6);
+        Assert.Equal(0.1f + 0.7071f * 0.3f + 0.5f * 0.5f, dst[0], precision: 4);
+        Assert.Equal(0.2f + 0.7071f * 0.3f + 0.5f * 0.6f, dst[1], precision: 4);
+    }
+
+    [Fact]
+    public void ConvertToTarget_SixChannels_LfeOnly_Excluded()
+    {
+        // LFE-only must not leak into stereo (documents intentional drop).
+        var srcFmt = new CSCore.WaveFormat(48000, 16, 6);
+        float[] src = { 0f, 0f, 0f, 1f, 0f, 0f };
+        float[] dst = new float[16];
+        float[] scratch = new float[16];
+
+        int count = InvokeConvertToTarget(src, src.Length, srcFmt, 48000, 2, ref dst, ref scratch);
+
+        Assert.Equal(2, count);
+        Assert.Equal(0f, dst[0], precision: 6);
+        Assert.Equal(0f, dst[1], precision: 6);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -719,5 +734,87 @@ public class RecorderEngineDspTests
         {
             Directory.Delete(dir);
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ConvertToTargetChunked — phase carry + cumulative length
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static int InvokeChunked(
+        float[] src, int floatCount, CSCore.WaveFormat srcFmt,
+        int dstRate, int dstCh,
+        ref float[] dst, ref float[] scratch, object state)
+    {
+        var method = EngineType.GetMethod("ConvertToTargetChunked",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var args = new object[] { src, floatCount, srcFmt, dstRate, dstCh, dst, scratch, state };
+        int result = (int)method.Invoke(null, args)!;
+        dst = (float[])args[5];
+        scratch = (float[])args[6];
+        return result;
+    }
+
+    private static object NewResamplerState(int srcCh, int srcRate, int dstRate)
+    {
+        var nested = EngineType.GetNestedType("ResamplerState", BindingFlags.NonPublic)!;
+        var st = Activator.CreateInstance(nested)!;
+        nested.GetMethod("Reset")!.Invoke(st, new object[] { srcCh, srcRate, dstRate });
+        return st;
+    }
+
+    [Fact]
+    public void ChunkedVsSingle_NoClick_AtSeams()
+    {
+        // 16 kHz mono sine, chunked vs single-shot must match (no phase-restart click).
+        var srcFmt = new CSCore.WaveFormat(16000, 16, 1);
+        int total = 4800;
+        var src = new float[total];
+        for (int i = 0; i < total; i++) src[i] = (float)Math.Sin(2 * Math.PI * 1000 * i / 16000);
+
+        float[] dstSingle = new float[20000];
+        float[] scrSingle = new float[20000];
+        int nSingle = InvokeConvertToTarget(src, total, srcFmt, 48000, 1, ref dstSingle, ref scrSingle);
+
+        var st = NewResamplerState(1, 16000, 48000);
+        var chunked = new System.Collections.Generic.List<float>();
+        int chunk = 160;
+        for (int off = 0; off < total; off += chunk)
+        {
+            int n = Math.Min(chunk, total - off);
+            var piece = new float[n];
+            Array.Copy(src, off, piece, 0, n);
+            float[] d = new float[1000];
+            float[] s = new float[1000];
+            int got = InvokeChunked(piece, n, srcFmt, 48000, 1, ref d, ref s, st);
+            for (int i = 0; i < got; i++) chunked.Add(d[i]);
+        }
+
+        Assert.Equal(nSingle, chunked.Count);
+        double maxDiff = 0;
+        for (int i = 0; i < nSingle; i++)
+            maxDiff = Math.Max(maxDiff, Math.Abs(dstSingle[i] - chunked[i]));
+        Assert.True(maxDiff < 1e-4, $"chunked vs single diff {maxDiff}");
+    }
+
+    [Fact]
+    public void CumulativeLength_WithinOneFramePerSecond()
+    {
+        // 44.1 k → 48 k, 100 x 512-frame chunks: total within 1 frame of ideal.
+        var srcFmt = new CSCore.WaveFormat(44100, 16, 1);
+        var st = NewResamplerState(1, 44100, 48000);
+        long totalSrc = 0;
+        int totalDst = 0;
+        var rnd = new Random(42);
+        for (int k = 0; k < 100; k++)
+        {
+            var piece = new float[512];
+            for (int i = 0; i < 512; i++) piece[i] = (float)(rnd.NextDouble() * 2 - 1);
+            float[] d = new float[2048];
+            float[] s = new float[2048];
+            totalDst += InvokeChunked(piece, 512, srcFmt, 48000, 1, ref d, ref s, st);
+            totalSrc += 512;
+        }
+        int ideal = (int)Math.Floor((double)totalSrc * 48000 / 44100);
+        Assert.InRange(totalDst, ideal - 1, ideal + 1);
     }
 }

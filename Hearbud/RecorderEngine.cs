@@ -207,6 +207,29 @@ namespace Hearbud
         // Reusable scratch buffer for the resampler (Performance Fix)
         private float[] _resampleScratch = new float[BlockFrames * 8];
 
+        // GAP-02: stateful resampler (fractional phase carry, no per-chunk click/drift).
+        // Only mic needs it; loopback is passthrough at _outRate/_outChannels.
+        private sealed class ResamplerState
+        {
+            public double NextSrcPos;
+            public float[] PrevTail = new float[8];
+            public int PrevCh;
+            public long TotalSrcFrames;
+            public long TotalDstFrames;
+            public int SrcCh = -1;
+            public int SrcRate;
+            public int DstRate;
+            public void Reset(int srcCh, int srcRate, int dstRate)
+            {
+                NextSrcPos = 0; PrevCh = 0; TotalSrcFrames = 0; TotalDstFrames = 0;
+                SrcCh = srcCh; SrcRate = srcRate; DstRate = dstRate;
+            }
+            public double DelayDstFrames => SrcRate <= 0 ? 0 : (double)DstRate / SrcRate;
+        }
+        private readonly ResamplerState _micResamp = new();
+        internal double MicResamplerDelaySec => _micResamp.DelayDstFrames / Math.Max(1, _outRate);
+        internal int MicResamplerDelayDstFrames => (int)Math.Ceiling(_micResamp.DelayDstFrames);
+
         private byte[]  _pcm16Sys     = new byte[BlockFrames * 8 * 2];
         private byte[]  _pcm16Mic     = new byte[BlockFrames * 8 * 2];
         private byte[]  _pcm16Mix     = new byte[BlockFrames * 8 * 2];
@@ -327,6 +350,7 @@ namespace Hearbud
             _writeTask = Task.Factory.StartNew(DiskWriteLoop, TaskCreationOptions.LongRunning);
 
             lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+            _micResamp.Reset(-1, 0, 0);
             _micUnderrunBlocks = 0;
             _micOverrunBlocks = 0;
             _silencedSamples = 0;
@@ -709,6 +733,7 @@ namespace Hearbud
                         _micSrc = _micIn.ToSampleSource();
 
                         lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                        _micResamp.Reset(_micSrc.WaveFormat.Channels, _micSrc.WaveFormat.SampleRate, _outRate);
                     }
                     else
                     {
@@ -828,6 +853,7 @@ namespace Hearbud
             if (isLoop) { TryStopDispose(ref _loopCap); TryDispose(ref _loopIn); TryDispose(ref _loopSrc); }
             else { TryStopDispose(ref _micCap); TryDispose(ref _micIn); TryDispose(ref _micSrc); }
             if (!isLoop) lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+            _micResamp.Reset(-1, 0, 0);
             try { Array.Clear(_resampleScratch, 0, _resampleScratch.Length); } catch { }
         }
 
@@ -909,7 +935,7 @@ namespace Hearbud
                 if (got <= 0) return;
 
                 // Optimization: Pass scratch buffer to avoid allocations inside ConvertToTarget
-                int conv = ConvertToTarget(_micInBuf, got, _micSrc.WaveFormat, _outRate, _outChannels, ref _micConvBuf, ref _resampleScratch);
+                int conv = ConvertToTargetChunked(_micInBuf, got, _micSrc.WaveFormat, _outRate, _outChannels, ref _micConvBuf, ref _resampleScratch, _micResamp);
                 WriteDump(_dumpMic, _micConvBuf, conv);
 
                 long nowTicksA = Stopwatch.GetTimestamp();
@@ -1095,7 +1121,7 @@ namespace Hearbud
                 {
                     snapshotMicCount = _micCount;
                 }
-                double backlogSec = (double)snapshotMicCount / (_outChannels * _outRate);
+                double backlogSec = (double)snapshotMicCount / (_outChannels * _outRate) + MicResamplerDelaySec;
                 _lastMicBacklogSec = backlogSec;
                 if (backlogSec > _micBacklogSecMax) _micBacklogSecMax = backlogSec;
 
@@ -1200,51 +1226,84 @@ namespace Hearbud
         // DSP & CONVERSION
         // ==========================================
 
-        // Modified: Now takes 'ref scratch' to avoid "new float[]" allocations in the loop
+        // Modified: Now takes 'ref scratch' to avoid "new float[]" allocations in the loop.
+        // Single-shot wrapper (tests/compat); hot path uses ConvertToTargetChunked with carried phase.
         private static int ConvertToTarget(
             float[] src, int floatCount, CSCore.WaveFormat srcFmt,
-            int dstRate, int dstCh, 
+            int dstRate, int dstCh,
             ref float[] dst, ref float[] scratch)
+        {
+            var st = new ResamplerState();
+            st.Reset(srcFmt.Channels, srcFmt.SampleRate, dstRate);
+            return ConvertToTargetChunked(src, floatCount, srcFmt, dstRate, dstCh, ref dst, ref scratch, st);
+        }
+
+        private static void GetFold(float[] temp, int si, int srcCh, out float L, out float R, out float C, out float SL, out float SR)
+        {
+            // WAVEFORMATEXTENSIBLE canonical order: L,R,C,LFE,SL,SR. LFE deliberately excluded
+            // from folds (prevents bass boom; downstream peak-normalize absorbs full-scale correlation).
+            L = temp[si]; R = srcCh > 1 ? temp[si + 1] : L; C = 0; SL = 0; SR = 0;
+            if (srcCh == 4) { SL = temp[si + 2]; SR = temp[si + 3]; }
+            else if (srcCh >= 6) { C = temp[si + 2]; SL = temp[si + 4]; SR = temp[si + 5]; }
+            else if (srcCh >= 3) { C = temp[si + 2]; if (srcCh >= 5) { SL = temp[si + 3]; SR = temp[si + 4]; } }
+        }
+
+        private static int ConvertToTargetChunked(
+            float[] src, int floatCount, CSCore.WaveFormat srcFmt,
+            int dstRate, int dstCh,
+            ref float[] dst, ref float[] scratch, ResamplerState st)
         {
             int srcCh = srcFmt.Channels;
             int srcRate = srcFmt.SampleRate;
 
             int srcFrames = floatCount / srcCh;
             if (srcFrames <= 0) return 0;
+            if (st.PrevCh != srcCh || st.SrcRate != srcRate || st.DstRate != dstRate)
+                st.Reset(srcCh, srcRate, dstRate);
 
-            int dstFrames = (srcRate == dstRate) ? srcFrames
-                          : (int)((long)srcFrames * dstRate / srcRate);
+            int dstFrames;
+            if (srcRate == dstRate)
+            {
+                dstFrames = srcFrames;
+            }
+            else
+            {
+                dstFrames = (int)Math.Floor((srcFrames - st.NextSrcPos) * (double)dstRate / srcRate);
+                if (dstFrames < 0) dstFrames = 0;
+            }
 
-            EnsureCapacity(ref dst, Math.Max(dstCh, srcCh) * dstFrames);
+            EnsureCapacity(ref dst, Math.Max(dstCh, srcCh) * Math.Max(1, dstFrames));
 
-            // Optimization: Reuse existing buffers instead of creating 'temp'
-            // If no resample needed, we point temp to src.
-            // If resample needed, we use the scratch buffer provided by the caller.
             float[] temp = src;
             int tempFrames = srcFrames;
 
             if (srcRate != dstRate)
             {
-                EnsureCapacity(ref scratch, srcCh * dstFrames);
+                EnsureCapacity(ref scratch, Math.Max(1, srcCh * dstFrames));
                 temp = scratch;
 
-                float ratio = (float)srcRate / dstRate;
+                double ratio = (double)srcRate / dstRate;
                 int di = 0;
                 for (int f = 0; f < dstFrames; f++)
                 {
-                    float sp = f * ratio;
-                    int i0 = (int)sp;
-                    int i1 = Math.Min(i0 + 1, srcFrames - 1);
-                    float t = sp - i0;
-
+                    double sp = st.NextSrcPos + f * ratio;
+                    int i0 = (int)Math.Floor(sp);
+                    double t = sp - i0;
+                    int i1 = i0 + 1;
                     for (int c = 0; c < srcCh; c++)
                     {
-                        float s0 = src[i0 * srcCh + c];
-                        float s1 = src[i1 * srcCh + c];
-                        temp[di++] = s0 + (s1 - s0) * t;
+                        float s0 = i0 < 0 ? st.PrevTail[c] : src[i0 * srcCh + c];
+                        float s1 = i1 >= srcFrames ? src[(srcFrames - 1) * srcCh + c] : src[i1 * srcCh + c];
+                        temp[di++] = (float)(s0 + (s1 - s0) * t);
                     }
                 }
                 tempFrames = dstFrames;
+                st.NextSrcPos = (st.NextSrcPos + dstFrames * ratio) - srcFrames;
+                if (st.PrevTail.Length < srcCh) Array.Resize(ref st.PrevTail, srcCh);
+                Array.Copy(src, (srcFrames - 1) * srcCh, st.PrevTail, 0, srcCh);
+                st.PrevCh = srcCh;
+                st.TotalSrcFrames += srcFrames;
+                st.TotalDstFrames += dstFrames;
             }
 
             int di2 = 0;
@@ -1261,22 +1320,55 @@ namespace Hearbud
                     dst[di2++] = m; dst[di2++] = m;
                 }
             }
-            else if (srcCh >= 2 && dstCh == 1)
+            else if (dstCh == 1)
+            {
+                if (srcCh == 2)
+                {
+                    for (int f = 0; f < tempFrames; f++)
+                    {
+                        float l = temp[f * srcCh + 0];
+                        float r = temp[f * srcCh + 1];
+                        dst[di2++] = 0.5f * (l + r);
+                    }
+                }
+                else
+                {
+                    for (int f = 0; f < tempFrames; f++)
+                    {
+                        GetFold(temp, f * srcCh, srcCh, out float L, out float R, out float C, out float SL, out float SR);
+                        float lo = L + 0.7071f * C + 0.5f * SL;
+                        float ro = R + 0.7071f * C + 0.5f * SR;
+                        dst[di2++] = 0.5f * (lo + ro);
+                    }
+                }
+            }
+            else if (dstCh == 2)
             {
                 for (int f = 0; f < tempFrames; f++)
                 {
-                    float l = temp[f * srcCh + 0];
-                    float r = temp[f * srcCh + 1];
-                    dst[di2++] = 0.5f * (l + r);
+                    GetFold(temp, f * srcCh, srcCh, out float L, out float R, out float C, out float SL, out float SR);
+                    dst[di2++] = L + 0.7071f * C + 0.5f * SL;
+                    dst[di2++] = R + 0.7071f * C + 0.5f * SR;
                 }
             }
             else
             {
+                // dstCh>2: passthrough overlap + zero-fill, never duplicate into C/LFE.
                 for (int f = 0; f < tempFrames; f++)
                 {
                     int si = f * srcCh;
-                    for (int c = 0; c < dstCh; c++)
-                        dst[di2++] = temp[si + Math.Min(c, srcCh - 1)];
+                    if (srcCh == 1)
+                    {
+                        float m = temp[si];
+                        for (int c = 0; c < dstCh; c++)
+                            dst[di2++] = c < 2 ? m : 0f;
+                    }
+                    else
+                    {
+                        int copy = Math.Min(srcCh, dstCh);
+                        for (int c = 0; c < copy; c++) dst[di2++] = temp[si + c];
+                        for (int c = copy; c < dstCh; c++) dst[di2++] = 0f;
+                    }
                 }
             }
 
