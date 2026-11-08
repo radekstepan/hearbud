@@ -157,6 +157,37 @@ namespace Hearbud
             set => Volatile.Write(ref _loopGain, value); 
         }
 
+        private volatile int _micMuted;
+        private volatile int _sysMuted;
+
+        /// <summary>
+        /// RecExperts parity (SetFileMicrophoneMute): per-frame mix mute.
+        /// Zero-fills the mic channel in EmitFixedMix/EmitMicOnlyFixed.
+        /// Mix + meters only — stem WAVs stay raw. Thread-safe mid-record toggle.
+        /// </summary>
+        public bool MicMuted
+        {
+            get => Volatile.Read(ref _micMuted) != 0;
+            set { Volatile.Write(ref _micMuted, value ? 1 : 0); Info($"MicMuted={value} at masterFrames={_masterFramesEmitted}"); }
+        }
+
+        /// <summary>
+        /// RecExperts parity (SetFileSpeakerMute): per-frame mix mute for system audio.
+        /// </summary>
+        public bool SystemMuted
+        {
+            get => Volatile.Read(ref _sysMuted) != 0;
+            set { Volatile.Write(ref _sysMuted, value ? 1 : 0); Info($"SystemMuted={value} at masterFrames={_masterFramesEmitted}"); }
+        }
+
+        /// <summary>Single-call UI toggle so mic+sys flip together with one log line.</summary>
+        public void SetChannelMute(bool micMuted, bool systemMuted)
+        {
+            Volatile.Write(ref _micMuted, micMuted ? 1 : 0);
+            Volatile.Write(ref _sysMuted, systemMuted ? 1 : 0);
+            Info($"Mute mic={micMuted} sys={systemMuted} at masterFrames={_masterFramesEmitted}");
+        }
+
         /// <summary>
         /// Gets a value indicating whether the engine is currently recording to disk.
         /// </summary>
@@ -1394,13 +1425,15 @@ namespace Hearbud
                 // GAP-09: no loopback device → mic permanently drives the mix.
                 bool loopSilent = _loopCap == null || msSinceLoop > LoopSilentMsThreshold;
 
-                // --- Metering ---
+                // --- Metering (post-mute: muted channel reads live 0) ---
                 float blockPeak = 0f;
                 double blockRmsSum = 0.0;
                 bool blockClipped = false;
+                double micGainSnap = MicGain;
+                bool micMutedSnap = MicMuted;
                 for (int i = 0; i < conv; i++)
                 {
-                    float sample = (float)(_micConvBuf[i] * MicGain);
+                    float sample = micMutedSnap ? 0f : (float)(_micConvBuf[i] * micGainSnap);
                     float abs = MathF.Abs(sample);
                     if (abs > blockPeak) blockPeak = abs;
                     blockRmsSum += (double)abs * abs;
@@ -1523,13 +1556,15 @@ namespace Hearbud
                 int gotLoop = ReadExactSamples(_loopSrc, _loopBufF, wantFloats);
                 if (gotLoop <= 0) return;
 
-                // --- Metering ---
+                // --- Metering (post-mute: muted channel reads live 0) ---
                 float blockPeak = 0f;
                 double blockRmsSum = 0.0;
                 bool blockClipped = false;
+                double loopGainSnap = LoopGain;
+                bool sysMutedSnap = SystemMuted;
                 for (int i = 0; i < gotLoop; i++)
                 {
-                    float sample = (float)(_loopBufF[i] * LoopGain);
+                    float sample = sysMutedSnap ? 0f : (float)(_loopBufF[i] * loopGainSnap);
                     float abs = MathF.Abs(sample);
                     if (abs > blockPeak) blockPeak = abs;
                     blockRmsSum += (double)abs * abs;
@@ -2129,11 +2164,15 @@ namespace Hearbud
         private void EmitFixedMix(float[] loopFrame, float[] micFrame, int n)
         {
             EnsureCapacity(ref _mixBufF, n);
+            double loopGain = LoopGain;
+            double micGain = MicGain;
+            bool sysM = SystemMuted;
+            bool micM = MicMuted;
             float peak = 0f;
             for (int i = 0; i < n; i++)
             {
-                float s = (float)(loopFrame[i] * LoopGain);
-                float m = (float)(micFrame[i] * MicGain);
+                float s = sysM ? 0f : (float)(loopFrame[i] * loopGain);
+                float m = micM ? 0f : (float)(micFrame[i] * micGain);
                 float a = s + m;
                 _mixBufF[i] = a;
                 float abs = MathF.Abs(a);
@@ -2153,8 +2192,10 @@ namespace Hearbud
         private void EmitMicOnlyFixed(float[] micFrame, int n)
         {
             EnsureCapacity(ref _mixBufF, n);
+            double micGain = MicGain;
+            bool micM = MicMuted;
             float micPeak = 0f;
-            for (int i = 0; i < n; i++) { float m = (float)(micFrame[i] * MicGain); _mixBufF[i] = m; float abs = MathF.Abs(m); if (abs > micPeak) micPeak = abs; }
+            for (int i = 0; i < n; i++) { float m = micM ? 0f : (float)(micFrame[i] * micGain); _mixBufF[i] = m; float abs = MathF.Abs(m); if (abs > micPeak) micPeak = abs; }
             float micScale = ComputeMixScale(micPeak);
             for (int i = 0; i < n; i++) _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i] * micScale);
             WriteDump(_dumpMix, _mixBufF, n);
