@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -20,7 +21,7 @@ using H.NotifyIcon;
 
 namespace Hearbud
 {
-    public partial class MainWindow : Window, IMMNotificationClient
+    public partial class MainWindow : Window, IMMNotificationClient, IDisposable
     {
     private readonly RecorderEngine _engine = new();
     private readonly System.Timers.Timer _uiTimer = new(100);
@@ -55,6 +56,8 @@ namespace Hearbud
         private readonly Dictionary<string, MMDevice> _spkDict = new();
 
         private bool _uiReady;
+
+    private bool _disposed;
 
         public MainWindow()
         {
@@ -262,7 +265,7 @@ namespace Hearbud
         /// blocks below 100 MB. Returns false when recording must not start.
         /// UNC paths (no DriveInfo) skip the space check but still get the probe.
         /// </summary>
-        private bool CheckDiskSpaceAndWritable(string outDir)
+        private static bool CheckDiskSpaceAndWritable(string outDir)
         {
             try
             {
@@ -1234,13 +1237,7 @@ namespace Hearbud
         protected override void OnClosed(EventArgs e)
         {
             base.OnClosed(e);
-            try { _uiTimer.Stop(); } catch { }
-            try { _trayIcon?.Dispose(); } catch { }
-
-            // Unregister device notifications before disposing the enumerator.
-            try { _notifEnumerator?.UnregisterEndpointNotificationCallback(this); } catch { }
-            try { _notifEnumerator?.Dispose(); } catch { }
-            _notifEnumerator = null;
+            Dispose();
 
             try
             {
@@ -1261,6 +1258,25 @@ namespace Hearbud
                 _settings.Save();
             }
             catch { /* best-effort */ }
+        }
+
+        /// <summary>
+        /// CA1001: disposes owned <see cref="_engine"/>, <see cref="_notifEnumerator"/>,
+        /// <see cref="_trayIcon"/> and <see cref="_uiTimer"/>. Called from
+        /// <see cref="OnClosed(EventArgs)"/>; idempotent so double-close is safe.
+        /// </summary>
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try { _uiTimer.Stop(); } catch { }
+            try { _trayIcon?.Dispose(); } catch { }
+
+            // Unregister device notifications before disposing the enumerator.
+            try { _notifEnumerator?.UnregisterEndpointNotificationCallback(this); } catch { }
+            try { _notifEnumerator?.Dispose(); } catch { }
+            _notifEnumerator = null;
+
             _engine.Dispose();
         }
 
@@ -1294,7 +1310,7 @@ namespace Hearbud
                 OutputFormatCombo.SelectedValue = wavOnly ? "wav" : "mp3";
                 if (OutputFormatCombo.SelectedItem as ComboBoxItem == null)
                     OutputFormatCombo.SelectedValue = "mp3";
-                OutputQualityCombo.SelectedValue = wavOnly ? "192" : persisted.ToString();
+                OutputQualityCombo.SelectedValue = wavOnly ? "192" : persisted.ToString(CultureInfo.InvariantCulture);
                 if (OutputQualityCombo.SelectedItem as ComboBoxItem == null)
                     OutputQualityCombo.SelectedValue = "192";
                 UpdateBitrateEnabled();
@@ -1302,8 +1318,8 @@ namespace Hearbud
                 WriteStemsCheck.IsChecked = _settings.WriteStems;
                 IncludeMicCheck.IsChecked = _settings.IncludeMic;
                 RecordSysCheck.IsChecked = _settings.IncludeSystem;
-                LimitMinutesText.Text = _settings.AutoStopMinutes > 0 ? _settings.AutoStopMinutes.ToString() : "";
-                LimitSizeMbText.Text = _settings.AutoStopSizeMb > 0 ? _settings.AutoStopSizeMb.ToString() : "";
+                LimitMinutesText.Text = _settings.AutoStopMinutes > 0 ? _settings.AutoStopMinutes.ToString(CultureInfo.InvariantCulture) : "";
+                LimitSizeMbText.Text = _settings.AutoStopSizeMb > 0 ? _settings.AutoStopSizeMb.ToString(CultureInfo.InvariantCulture) : "";
                 SplitInsteadOfStopCheck.IsChecked = _settings.SplitInsteadOfStop;
                 CountdownCombo.SelectedValue = _settings.CountdownSeconds switch { 3 => "3", 5 => "5", 10 => "10", _ => "0" };
 
@@ -1634,16 +1650,16 @@ namespace Hearbud
         /// Fires when an existing device changes state (e.g. headphone jack goes from Active to UnPlugged).
         /// Routes to OnDeviceAdded/Removed so the same logic applies.
         /// </summary>
-        public void OnDeviceStateChanged(string deviceId, DeviceState newState)
+        public void OnDeviceStateChanged(string deviceId, DeviceState deviceState)
         {
-            if (newState == DeviceState.Active)
+            if (deviceState == DeviceState.Active)
                 OnDeviceAdded(deviceId);
-            else if (newState is DeviceState.UnPlugged or DeviceState.NotPresent)
+            else if (deviceState is DeviceState.UnPlugged or DeviceState.NotPresent)
                 OnDeviceRemoved(deviceId);
         }
 
         /// <summary>Not used — we don't need to react to default-device changes.</summary>
-        public void OnDefaultDeviceChanged(DataFlow dataFlow, Role role, string defaultDeviceId) { }
+        public void OnDefaultDeviceChanged(DataFlow dataFlow, Role role, string deviceId) { }
 
         /// <summary>Not used — we don't react to property-value changes on devices.</summary>
         public void OnPropertyValueChanged(string deviceId, PropertyKey key) { }

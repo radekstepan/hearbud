@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Threading;
 
@@ -42,8 +43,8 @@ namespace Hearbud
             {
                 var elapsed = _getElapsed();
                 TimeText.Text = elapsed.TotalHours >= 1
-                    ? elapsed.ToString(@"h\:mm\:ss")
-                    : elapsed.ToString(@"mm\:ss");
+                    ? elapsed.ToString(@"h\:mm\:ss", CultureInfo.InvariantCulture)
+                    : elapsed.ToString(@"mm\:ss", CultureInfo.InvariantCulture);
 
                 var (mic, sys, paused) = _getState();
                 MicBar.Value = Math.Clamp(mic, 0f, 1f) * 100;

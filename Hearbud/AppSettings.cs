@@ -80,6 +80,8 @@ namespace Hearbud
         private static string ConfigPath =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".hearbud_config.json");
 
+        private static readonly JsonSerializerOptions IndentedOptions = new() { WriteIndented = true };
+
         /// <summary>
         /// Loads settings from the configuration file, validating values to ensure they are within safe ranges.
         /// </summary>
@@ -147,7 +149,7 @@ namespace Hearbud
             {
                 // To avoid confusion with legacy configs, we null out the old field.
                 this.Mp3Quality = null;
-                var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+                var json = JsonSerializer.Serialize(this, IndentedOptions);
                 File.WriteAllText(ConfigPath, json);
             }
             catch { /* ignore */ }

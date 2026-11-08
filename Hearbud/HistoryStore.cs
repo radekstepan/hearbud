@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text.Json;
 
@@ -24,7 +25,7 @@ namespace Hearbud
 
         public override string ToString()
         {
-            string dur = TimeSpan.FromSeconds(Math.Max(0, DurationSeconds)).ToString(@"m\:ss");
+            string dur = TimeSpan.FromSeconds(Math.Max(0, DurationSeconds)).ToString(@"m\:ss", CultureInfo.InvariantCulture);
             return $"{Timestamp:yyyy-MM-dd HH:mm}  {BaseName}  ({dur}, {FormatSize(SizeBytes)})";
         }
 
@@ -44,6 +45,8 @@ namespace Hearbud
     public sealed class HistoryStore
     {
         public const int MaxEntries = 50;
+
+        private static readonly JsonSerializerOptions IndentedOptions = new() { WriteIndented = true };
 
         public static string DefaultPath => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -104,7 +107,7 @@ namespace Hearbud
             try
             {
                 File.WriteAllText(_path,
-                    JsonSerializer.Serialize(Entries, new JsonSerializerOptions { WriteIndented = true }));
+                    JsonSerializer.Serialize(Entries, IndentedOptions));
             }
             catch { /* best-effort */ }
         }

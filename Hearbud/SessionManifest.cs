@@ -33,6 +33,8 @@ namespace Hearbud
         public string? FirstMessage { get; set; }
         public List<string> Repaired { get; set; } = new();
 
+        private static readonly JsonSerializerOptions IndentedOptions = new() { WriteIndented = true };
+
         public static string PathFor(string outDir, string baseName)
             => Path.Combine(outDir, $"{baseName}.hearbud-session.json");
 
@@ -142,7 +144,7 @@ namespace Hearbud
         private static void WriteAtomic(string path, SessionManifest m)
         {
             string tmp = path + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(m, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(tmp, JsonSerializer.Serialize(m, IndentedOptions));
             File.Move(tmp, path, overwrite: true);
         }
     }
