@@ -239,9 +239,26 @@ namespace Hearbud
         private byte[]  _pcm32Mix     = new byte[BlockFrames * 8 * 4];
 
         private readonly object _micRingLock = new();
+        private readonly object _loopRingLock = new();
         private readonly object _logLock = new();
         private float[] _micRing = new float[48000 * 4];
         private int _micR, _micW, _micCount;
+        // GAP-01 fixed-frame dual-FIFO: loopback is no longer passthrough; both
+        // sources land in bounded FIFOs (~2 s) and the mix emits fixed quanta.
+        private float[] _loopRing = new float[48000 * 4];
+        private int _loopR, _loopW, _loopCount;
+        private long _loopOverrunBlocks = 0;
+        // Fixed emit quantum: 480 frames (10 ms @ 48 kHz) = 960 floats stereo.
+        internal const int FixedFramesPerChannel = 480;
+        private float[] _frameLoop = new float[FixedFramesPerChannel * 2];
+        private float[] _frameMic = new float[FixedFramesPerChannel * 2];
+        // Master clock: total fixed frames emitted + wall-clock anchor for resync.
+        private long _masterFramesEmitted = 0;
+        private long _masterStartTick = 0;
+        private int _lagStreak = 0;
+        private long _resyncCount = 0;
+        internal const double ResyncThresholdSec = 0.08;
+        internal const int ResyncStreakNeeded = 3;
 
         private static readonly double _tickMs = 1000.0 / Stopwatch.Frequency;
         private long _lastLoopTick = 0;
@@ -396,11 +413,17 @@ namespace Hearbud
             _writeTask = Task.Factory.StartNew(DiskWriteLoop, TaskCreationOptions.LongRunning);
 
             lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+            lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; }
             _micResamp.Reset(-1, 0, 0);
             _micUnderrunBlocks = 0;
             _micOverrunBlocks = 0;
+            _loopOverrunBlocks = 0;
             _silencedSamples = 0;
             _loopBlockCounter = 0;
+            _masterFramesEmitted = 0;
+            _masterStartTick = Stopwatch.GetTimestamp();
+            _lagStreak = 0;
+            _resyncCount = 0;
             _preRollRemaining = 2;
             _lastLagLogTick = 0;
             _lastMicBacklogSec = 0.0;
@@ -907,6 +930,7 @@ namespace Hearbud
             try { if (!isLoop && _micIn != null) _micIn.DataAvailable -= OnMicData; } catch { }
             if (isLoop) { TryStopDispose(ref _loopCap); TryDispose(ref _loopIn); TryDispose(ref _loopSrc); }
             else { TryStopDispose(ref _micCap); TryDispose(ref _micIn); TryDispose(ref _micSrc); }
+            if (isLoop) lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; }
             if (!isLoop) lock (_micRingLock) { _micR = _micW = _micCount = 0; }
             _micResamp.Reset(-1, 0, 0);
             try { Array.Clear(_resampleScratch, 0, _resampleScratch.Length); } catch { }
@@ -940,6 +964,7 @@ namespace Hearbud
                         _loopIn.DataAvailable += OnLoopbackData;
                         _loopCap.Start();
                         _lastLoopTick = Stopwatch.GetTimestamp();
+                        lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; }
                     }
                     else
                     {
@@ -1026,16 +1051,7 @@ namespace Hearbud
                     _lastLevelTickMic = nowTicksA;
                 }
 
-                // --- Sync Logic ---
-                if (loopSilent)
-                {
-                    lock (_micRingLock)
-                    {
-                        _micR = _micW;
-                        _micCount = 0;
-                    }
-                }
-                else
+                // --- Sync Logic: always buffer mic; fixed-frame drain emits. ---
                 {
                     int overruns = 0;
                     long capDropped;
@@ -1074,43 +1090,23 @@ namespace Hearbud
                     EnqueueWrite(AudioFileTarget.Mic, _pcm16Mic, conv * 2);
                 }
 
-                // --- Mic-Only Drive (if loopback silent) ---
+                // --- Mic-Only Drive (if loopback silent): fixed-frame emit ---
                 if (_recording && _wavMix != null && loopSilent)
                 {
-                    if (_writeStems && _wavSys != null)
+                    int n = FixedFrameFloats();
+                    EnsureCapacity(ref _frameMic, n);
+                    while (true)
                     {
-                        // Write zeros to System stem (mix-only mode skips this)
-                        EnsureCapacity(ref _pcm16Sys, conv * 2);
-                        Array.Clear(_pcm16Sys, 0, conv * 2);
-                        EnqueueWrite(AudioFileTarget.System, _pcm16Sys, conv * 2);
-                    }
-
-                    // Write Mic to Mix (full level; peak-normalize only on overs, like amix)
-                    EnsureCapacity(ref _mixBufF, conv);
-                    float micPeak = 0f;
-                    for (int i = 0; i < conv; i++)
-                    {
-                        float m = (float)(_micConvBuf[i] * MicGain);
-                        _mixBufF[i] = m;
-                        float abs = MathF.Abs(m);
-                        if (abs > micPeak) micPeak = abs;
-                    }
-                    float micScale = ComputeMixScale(micPeak);
-                    for (int i = 0; i < conv; i++)
-                        _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i] * micScale);
-                    WriteDump(_dumpMix, _mixBufF, conv);
-
-                    if (_mixUse32Bit)
-                    {
-                        EnsureCapacity(ref _pcm32Mix, conv * 4);
-                        FloatToPcm32(_mixBufF, _pcm32Mix, conv);
-                        EnqueueWrite(AudioFileTarget.Mix, _pcm32Mix, conv * 4);
-                    }
-                    else
-                    {
-                        EnsureCapacity(ref _pcm16Mix, conv * 2);
-                        FloatToPcm16(_mixBufF, _pcm16Mix, conv);
-                        EnqueueWrite(AudioFileTarget.Mix, _pcm16Mix, conv * 2);
+                        int got;
+                        lock (_micRingLock)
+                        {
+                            if (_micCount < n) break;
+                            for (int i = 0; i < n; i++) { _frameMic[i] = _micRing[_micR]; _micR = (_micR + 1) % _micRing.Length; }
+                            _micCount -= n;
+                        }
+                        if (_preRollRemaining > 0) { _preRollRemaining--; Array.Clear(_frameMic, 0, n); }
+                        Interlocked.Add(ref _masterFramesEmitted, FixedFramesPerChannel);
+                        EmitMicOnlyFixed(_frameMic, n);
                     }
                 }
             }
@@ -1181,54 +1177,33 @@ namespace Hearbud
                 }
                 WriteDump(_dumpSys, _loopBufF, gotLoop);
 
-                // --- Diagnostics ---
-                int snapshotMicCount;
-                lock (_micRingLock)
+                // --- Dual-FIFO tick: buffer loopback, emit fixed frames. ---
+                long loopDropped = PushLoopRing(_loopBufF, gotLoop);
+                if (loopDropped > 0)
                 {
-                    snapshotMicCount = _micCount;
+                    long totalLoop = Interlocked.Read(ref _loopOverrunBlocks);
+                    if (totalLoop <= 10 || totalLoop % 48000 == 0)
+                        Warn($"Loop ring overrun: dropped {loopDropped} samples (total {totalLoop})");
                 }
-                double backlogSec = (double)snapshotMicCount / (_outChannels * _outRate) + MicResamplerDelaySec;
+
+                // --- Diagnostics + master-clock resync ---
+                double backlogSec = MicBacklogSec();
+                int snapshotMicCount;
+                lock (_micRingLock) snapshotMicCount = _micCount;
                 _lastMicBacklogSec = backlogSec;
                 if (backlogSec > _micBacklogSecMax) _micBacklogSecMax = backlogSec;
+                CheckLagResync(backlogSec);
 
-                // --- Mixing ---
-                EnsureCapacity(ref _tmpMicBlock, gotLoop);
-                int micRead;
-                lock (_micRingLock)
-                {
-                    micRead = Math.Min(gotLoop, _micCount);
-                    for (int i = 0; i < micRead; i++)
-                    {
-                        _tmpMicBlock[i] = _micRing[_micR];
-                        _micR = (_micR + 1) % _micRing.Length;
-                    }
-                    _micCount -= micRead;
-                }
-                if (micRead < gotLoop)
-                {
-                    Array.Clear(_tmpMicBlock, micRead, gotLoop - micRead);
-                    if (_preRollRemaining > 0)
-                    {
-                        // Pre-roll (ere-core graph.cpp:56-57): first frames are not real
-                        // underruns, the mic FIFO just hasn't filled yet.
-                        _preRollRemaining--;
-                        Array.Clear(_tmpMicBlock, 0, gotLoop);
-                    }
-                    else
-                    {
-                        _micUnderrunBlocks++;
-                        Interlocked.Add(ref _silencedSamples, gotLoop - micRead);
-                    }
-                }
-                else if (_preRollRemaining > 0)
-                {
-                    _preRollRemaining--;
-                }
+                // --- Fixed-frame emit (480 frames = 960 floats stereo) ---
+                int fixedN = FixedFrameFloats();
+                EnsureCapacity(ref _frameLoop, fixedN);
+                EnsureCapacity(ref _frameMic, fixedN);
+                while (TryPopFixedFrame(_frameLoop, _frameMic))
+                    EmitFixedMix(_frameLoop, _frameMic, fixedN);
 
                 _loopBlockCounter++;
                 // lagTime-equivalent: wall-clock 1 Hz line (RecExperts style), not callback-count anchored.
-                // Includes FIFO depth, over/under counters, backlog max. Sustained lag >80 ms is the
-                // future resync trigger (GAP-01); today we observe + log.
+                // Includes FIFO depth, over/under counters, backlog max + master clock + resync count.
                 long nowLagTick = Stopwatch.GetTimestamp();
                 if (_lastLagLogTick == 0) _lastLagLogTick = nowLagTick;
                 double secSinceLag = (nowLagTick - _lastLagLogTick) * _tickMs / 1000.0;
@@ -1237,49 +1212,12 @@ namespace Hearbud
                     _lastLagLogTick = nowLagTick;
                     long over = Interlocked.Read(ref _micOverrunBlocks);
                     long under = Interlocked.Read(ref _micUnderrunBlocks);
-                    Info($"lagTime={backlogSec:F3}s micDepth={snapshotMicCount} over={over} under={under} silenced={_silencedSamples} backlogMax={_micBacklogSecMax:F3}s lagWatch={(backlogSec > 0.08 ? "LAG" : "ok")}");
+                    long loopOver = Interlocked.Read(ref _loopOverrunBlocks);
+                    Info($"lagTime={backlogSec:F3}s micDepth={snapshotMicCount} over={over} loopOver={loopOver} under={under} silenced={_silencedSamples} backlogMax={_micBacklogSecMax:F3}s masterFrames={_masterFramesEmitted} resyncs={_resyncCount} lagWatch={(backlogSec > 0.08 ? "LAG" : "ok")}");
                 }
                 else if (_loopBlockCounter % BacklogLogEveryNBlocks == 0)
                 {
                     Info($"Mic ring backlog: {backlogSec:F4} s (max {_micBacklogSecMax:F4} s)");
-                }
-
-                EnsureCapacity(ref _mixBufF, gotLoop);
-                float peak = 0f;
-                for (int i = 0; i < gotLoop; i++)
-                {
-                    float s = (float)(_loopBufF[i] * LoopGain);
-                    float m = (float)(_tmpMicBlock[i] * MicGain);
-                    float a = s + m;
-                    _mixBufF[i] = a;
-                    float abs = MathF.Abs(a);
-                    if (abs > peak) peak = abs;
-                }
-                float scale = ComputeMixScale(peak);
-                if (scale != 1f)
-                {
-                    for (int i = 0; i < gotLoop; i++)
-                        _mixBufF[i] *= scale;
-                }
-                for (int i = 0; i < gotLoop; i++)
-                    _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i]);
-                WriteDump(_dumpMix, _mixBufF, gotLoop);
-
-                // --- Write Mix WAV (Async) ---
-                if (_recording && _wavMix != null)
-                {
-                    if (_mixUse32Bit)
-                    {
-                        EnsureCapacity(ref _pcm32Mix, gotLoop * 4);
-                        FloatToPcm32(_mixBufF, _pcm32Mix, gotLoop);
-                        EnqueueWrite(AudioFileTarget.Mix, _pcm32Mix, gotLoop * 4);
-                    }
-                    else
-                    {
-                        EnsureCapacity(ref _pcm16Mix, gotLoop * 2);
-                        FloatToPcm16(_mixBufF, _pcm16Mix, gotLoop); 
-                        EnqueueWrite(AudioFileTarget.Mix, _pcm16Mix, gotLoop * 2);
-                    }
                 }
             }
             catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
@@ -1525,6 +1463,158 @@ namespace Hearbud
                 dst[j++] = (byte)((s >> 8) & 0xFF);
                 dst[j++] = (byte)((s >> 16) & 0xFF);
                 dst[j++] = (byte)((s >> 24) & 0xFF);
+            }
+        }
+
+        // GAP-01 fixed-frame dual-FIFO tick (reflection-testable).
+        // Loopback is the master clock: both sources are buffered, mix emits
+        // FixedFramesPerChannel quanta (480 frames = 960 floats stereo).
+        private int FixedFrameFloats() => FixedFramesPerChannel * Math.Max(1, _outChannels);
+
+        private double MicBacklogSec()
+        {
+            int c;
+            lock (_micRingLock) c = _micCount;
+            return (double)c / (Math.Max(1, _outChannels) * Math.Max(1, _outRate)) + MicResamplerDelaySec;
+        }
+
+        // Caller holds _loopRingLock; no logging inside (indices only).
+        private long EnsureLoopRingCapacity(int roomNeeded)
+        {
+            if (_loopRing.Length - _loopCount >= roomNeeded) return 0;
+            int cap = Math.Max(_loopRing.Length, _outRate * _outChannels * 2);
+            int want = _loopCount + roomNeeded;
+            if (want <= cap)
+            {
+                int newLen = Math.Min(cap, NextPow2(want));
+                if (newLen <= _loopRing.Length) return 0;
+                var newBuf = new float[newLen];
+                for (int i = 0; i < _loopCount; i++)
+                    newBuf[i] = _loopRing[(_loopR + i) % _loopRing.Length];
+                _loopRing = newBuf;
+                _loopR = 0;
+                _loopW = _loopCount;
+                return 0;
+            }
+            int drop = Math.Min(want - cap, _loopCount);
+            if (drop > 0) { _loopR = (_loopR + drop) % _loopRing.Length; _loopCount -= drop; }
+            long dropped = want - cap;
+            Interlocked.Add(ref _loopOverrunBlocks, dropped);
+            return dropped;
+        }
+
+        private long PushLoopRing(float[] src, int count)
+        {
+            long dropped;
+            lock (_loopRingLock)
+            {
+                dropped = EnsureLoopRingCapacity(count);
+                for (int i = 0; i < count; i++)
+                {
+                    _loopRing[_loopW] = src[i];
+                    _loopW = (_loopW + 1) % _loopRing.Length;
+                    if (_loopCount < _loopRing.Length) _loopCount++;
+                    else { _loopR = (_loopR + 1) % _loopRing.Length; Interlocked.Increment(ref _loopOverrunBlocks); }
+                }
+            }
+            return dropped;
+        }
+
+        // Pops one fixed frame: full loop quantum + best-effort mic (zero-fill).
+        // Advances the master clock. Returns false when loop FIFO is short.
+        private bool TryPopFixedFrame(float[] loopDst, float[] micDst)
+        {
+            int n = FixedFrameFloats();
+            if (loopDst == null || micDst == null || loopDst.Length < n || micDst.Length < n) return false;
+            lock (_loopRingLock)
+            {
+                if (_loopCount < n) return false;
+                for (int i = 0; i < n; i++) { loopDst[i] = _loopRing[_loopR]; _loopR = (_loopR + 1) % _loopRing.Length; }
+                _loopCount -= n;
+            }
+            int micRead;
+            lock (_micRingLock)
+            {
+                micRead = Math.Min(n, _micCount);
+                for (int i = 0; i < micRead; i++) { micDst[i] = _micRing[_micR]; _micR = (_micR + 1) % _micRing.Length; }
+                _micCount -= micRead;
+            }
+            if (micRead < n)
+            {
+                Array.Clear(micDst, micRead, n - micRead);
+                if (_preRollRemaining > 0) { _preRollRemaining--; Array.Clear(micDst, 0, n); }
+                else { _micUnderrunBlocks++; Interlocked.Add(ref _silencedSamples, n - micRead); }
+            }
+            else if (_preRollRemaining > 0) { _preRollRemaining--; }
+            Interlocked.Add(ref _masterFramesEmitted, FixedFramesPerChannel);
+            return true;
+        }
+
+        // Master-clock resync: sustained backlog >80 ms drops mic excess back to
+        // one fixed frame. Returns true on the tick that resyncs.
+        private bool CheckLagResync(double backlogSec)
+        {
+            if (backlogSec > ResyncThresholdSec) _lagStreak++;
+            else _lagStreak = 0;
+            if (_lagStreak < ResyncStreakNeeded) return false;
+            _lagStreak = 0;
+            int keep = FixedFrameFloats();
+            int dropped = 0;
+            lock (_micRingLock)
+            {
+                if (_micCount > keep) { dropped = _micCount - keep; _micR = (_micR + dropped) % _micRing.Length; _micCount = keep; }
+            }
+            if (dropped > 0)
+            {
+                _resyncCount++;
+                Warn($"Master-clock resync: dropped {dropped} mic samples (backlog {backlogSec:F3}s > {ResyncThresholdSec:F2}s, resync #{_resyncCount})");
+                return true;
+            }
+            return false;
+        }
+
+        private void EmitFixedMix(float[] loopFrame, float[] micFrame, int n)
+        {
+            EnsureCapacity(ref _mixBufF, n);
+            float peak = 0f;
+            for (int i = 0; i < n; i++)
+            {
+                float s = (float)(loopFrame[i] * LoopGain);
+                float m = (float)(micFrame[i] * MicGain);
+                float a = s + m;
+                _mixBufF[i] = a;
+                float abs = MathF.Abs(a);
+                if (abs > peak) peak = abs;
+            }
+            float scale = ComputeMixScale(peak);
+            if (scale != 1f) for (int i = 0; i < n; i++) _mixBufF[i] *= scale;
+            for (int i = 0; i < n; i++) _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i]);
+            WriteDump(_dumpMix, _mixBufF, n);
+            if (_recording && _wavMix != null)
+            {
+                if (_mixUse32Bit) { EnsureCapacity(ref _pcm32Mix, n * 4); FloatToPcm32(_mixBufF, _pcm32Mix, n); EnqueueWrite(AudioFileTarget.Mix, _pcm32Mix, n * 4); }
+                else { EnsureCapacity(ref _pcm16Mix, n * 2); FloatToPcm16(_mixBufF, _pcm16Mix, n); EnqueueWrite(AudioFileTarget.Mix, _pcm16Mix, n * 2); }
+            }
+        }
+
+        private void EmitMicOnlyFixed(float[] micFrame, int n)
+        {
+            EnsureCapacity(ref _mixBufF, n);
+            float micPeak = 0f;
+            for (int i = 0; i < n; i++) { float m = (float)(micFrame[i] * MicGain); _mixBufF[i] = m; float abs = MathF.Abs(m); if (abs > micPeak) micPeak = abs; }
+            float micScale = ComputeMixScale(micPeak);
+            for (int i = 0; i < n; i++) _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i] * micScale);
+            WriteDump(_dumpMix, _mixBufF, n);
+            if (_writeStems && _wavSys != null)
+            {
+                EnsureCapacity(ref _pcm16Sys, n * 2);
+                Array.Clear(_pcm16Sys, 0, n * 2);
+                EnqueueWrite(AudioFileTarget.System, _pcm16Sys, n * 2);
+            }
+            if (_recording && _wavMix != null)
+            {
+                if (_mixUse32Bit) { EnsureCapacity(ref _pcm32Mix, n * 4); FloatToPcm32(_mixBufF, _pcm32Mix, n); EnqueueWrite(AudioFileTarget.Mix, _pcm32Mix, n * 4); }
+                else { EnsureCapacity(ref _pcm16Mix, n * 2); FloatToPcm16(_mixBufF, _pcm16Mix, n); EnqueueWrite(AudioFileTarget.Mix, _pcm16Mix, n * 2); }
             }
         }
 
