@@ -1284,13 +1284,19 @@ namespace Hearbud
                 MicGain.Value  = _settings.MicGain;
                 LoopGain.Value = _settings.LoopGain;
 
-                // Select Output Quality (0 for WAV, else MP3 bitrate)
-                var desired = _settings.Mp3BitrateKbps < 0 ? 192 : _settings.Mp3BitrateKbps;
-                OutputQualityCombo.SelectedValue = desired;
-                
-                // If desired value isn't in the list, fall back to 192.
+                // GAP-09 #9 mapping slice: single persisted value
+                // (AppSettings.Mp3BitrateKbps) drives two controls.
+                // 0 -> WAV master (bitrate box disabled, parked at 192);
+                // >0 -> WAV + MP3 @ that bitrate (unknown values fall back to 192).
+                var persisted = _settings.Mp3BitrateKbps < 0 ? 192 : _settings.Mp3BitrateKbps;
+                bool wavOnly = persisted == 0;
+                OutputFormatCombo.SelectedValue = wavOnly ? "wav" : "mp3";
+                if (OutputFormatCombo.SelectedItem as ComboBoxItem == null)
+                    OutputFormatCombo.SelectedValue = "mp3";
+                OutputQualityCombo.SelectedValue = wavOnly ? "192" : persisted.ToString();
                 if (OutputQualityCombo.SelectedItem as ComboBoxItem == null)
-                    OutputQualityCombo.SelectedValue = 192;
+                    OutputQualityCombo.SelectedValue = "192";
+                UpdateBitrateEnabled();
 
                 WriteStemsCheck.IsChecked = _settings.WriteStems;
                 IncludeMicCheck.IsChecked = _settings.IncludeMic;
@@ -1312,10 +1318,47 @@ namespace Hearbud
             }
         }
 
+        /// <summary>
+        /// GAP-09 #9 mapping slice (UI-only): two controls, one persisted value.
+        /// Format "wav" (WAV master) forces 0 regardless of the bitrate box;
+        /// format "mp3" (WAV + MP3) uses the bitrate box, clamped to 64..320.
+        /// Unknown/unset format defaults to MP3-included to preserve the
+        /// historical default (WAV + MP3 @ 192).
+        /// </summary>
+        private bool IsMp3Included()
+        {
+            try
+            {
+                string? tag = (OutputFormatCombo.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string
+                    ?? OutputFormatCombo.SelectedValue as string;
+                if (string.Equals(tag, "wav", StringComparison.OrdinalIgnoreCase)) return false;
+                if (string.Equals(tag, "mp3", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            catch { /* best-effort: default below */ }
+            return true;
+        }
+
+        private void UpdateBitrateEnabled()
+        {
+            try
+            {
+                if (OutputQualityCombo != null)
+                    OutputQualityCombo.IsEnabled = IsMp3Included();
+            }
+            catch { /* best-effort */ }
+        }
+
+        private void OnOutputFormatChanged(object sender, SelectionChangedEventArgs e)
+        {
+            UpdateBitrateEnabled();
+        }
+
         private int GetSelectedBitrateKbps()
         {
             try
             {
+                // WAV master ignores the bitrate box entirely.
+                if (!IsMp3Included()) return 0;
                 int kb = 192; // default
                 if (OutputQualityCombo.SelectedItem is ComboBoxItem item &&
                     item.Tag is string s &&
