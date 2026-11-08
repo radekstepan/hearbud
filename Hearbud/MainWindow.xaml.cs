@@ -51,13 +51,13 @@ namespace Hearbud
             {
                 InitializeComponent();
 
-                // Shortcuts
+                // GAP-09 #6: remappable in-app hotkeys (window-focused scope only;
+                // no RegisterHotKey/HwndSource). Command bindings are static;
+                // gestures are rebuilt from settings by RebuildInputBindings().
                 CommandBindings.Add(new CommandBinding(ApplicationCommands.New, (_, __) => OnStart(null, null)));
-                InputBindings.Add(new KeyBinding(ApplicationCommands.New, new KeyGesture(Key.R, ModifierKeys.Control)));
                 CommandBindings.Add(new CommandBinding(ApplicationCommands.Stop, (_, __) => OnStop(null, null)));
-                InputBindings.Add(new KeyBinding(ApplicationCommands.Stop, new KeyGesture(Key.S, ModifierKeys.Control)));
                 CommandBindings.Add(new CommandBinding(MediaCommands.Pause, (_, __) => OnPauseResume(null, null)));
-                InputBindings.Add(new KeyBinding(MediaCommands.Pause, new KeyGesture(Key.P, ModifierKeys.Control)));
+                RebuildInputBindings();
 
                 // Setup system tray icon
                 SetupTrayIcon();
@@ -401,7 +401,7 @@ namespace Hearbud
 
                 StartBtn.IsEnabled = false;
                 PauseBtn.IsEnabled = true;
-                PauseBtn.Content = "Pause (Ctrl+P)";
+                UpdateHotkeyButtonLabels();
                 StopBtn.IsEnabled  = true;
                 StatusText.Text = "Recording...";
                 UpdateTrayTooltip();
@@ -506,7 +506,7 @@ namespace Hearbud
                 await _engine.StartAsync(BuildStartOptions(_splitOutDir, newBase));
                 StartBtn.IsEnabled = false;
                 PauseBtn.IsEnabled = true;
-                PauseBtn.Content = "Pause (Ctrl+P)";
+                UpdateHotkeyButtonLabels();
                 StopBtn.IsEnabled = true;
                 StatusText.Text = "Recording...";
                 _limitTimer.Start();
@@ -526,7 +526,7 @@ namespace Hearbud
             if (_autoActionRunning) return;
             StopBtn.IsEnabled = false;
             PauseBtn.IsEnabled = false;
-            PauseBtn.Content = "Pause (Ctrl+P)";
+            UpdateHotkeyButtonLabels();
             _limitTimer.Stop();
             try 
             {
@@ -549,13 +549,13 @@ namespace Hearbud
                 if (!_engine.IsPaused)
                 {
                     _engine.Pause();
-                    PauseBtn.Content = "Resume (Ctrl+P)";
+                    UpdateHotkeyButtonLabels();
                     StatusText.Text = "Paused — silence while paused";
                 }
                 else
                 {
                     _engine.Resume();
-                    PauseBtn.Content = "Pause (Ctrl+P)";
+                    UpdateHotkeyButtonLabels();
                     StatusText.Text = "Recording...";
                 }
                 UpdateTrayTooltip();
@@ -796,7 +796,7 @@ namespace Hearbud
                     StartBtn.IsEnabled = true;
                     StopBtn.IsEnabled = false;
                     PauseBtn.IsEnabled = false;
-                    PauseBtn.Content = "Pause (Ctrl+P)";
+                    UpdateHotkeyButtonLabels();
                     UpdateTrayTooltip();
 
                     WpfMessageBox.Show(
@@ -980,6 +980,12 @@ namespace Hearbud
                 LimitMinutesText.Text = _settings.AutoStopMinutes > 0 ? _settings.AutoStopMinutes.ToString() : "";
                 LimitSizeMbText.Text = _settings.AutoStopSizeMb > 0 ? _settings.AutoStopSizeMb.ToString() : "";
                 SplitInsteadOfStopCheck.IsChecked = _settings.SplitInsteadOfStop;
+
+                // GAP-09 #6: show persisted hotkeys, then rebuild gestures.
+                if (StartHotkeyBox != null) StartHotkeyBox.Text = _settings.StartHotkey;
+                if (PauseHotkeyBox != null) PauseHotkeyBox.Text = _settings.PauseHotkey;
+                if (StopHotkeyBox != null) StopHotkeyBox.Text = _settings.StopHotkey;
+                RebuildInputBindings();
             }
             catch (Exception ex)
             {
@@ -1012,6 +1018,217 @@ namespace Hearbud
             }
             catch { }
             return 192;
+        }
+
+        // ==========================================
+        // GAP-09 #6: REMAPPABLE IN-APP HOTKEYS
+        // Window-focused scope only (plain InputBindings; no RegisterHotKey /
+        // HwndSource global hooks — system-wide capture is phase 2).
+        // ==========================================
+
+        /// <summary>
+        /// Clears and re-adds the Start/Pause/Stop KeyBindings from the current
+        /// settings, then refreshes button labels. Invalid gestures are skipped
+        /// (settings are validated on load/capture so this should not happen);
+        /// duplicates are skipped (capture-time conflict check prevents them).
+        /// </summary>
+        private void RebuildInputBindings()
+        {
+            try
+            {
+                InputBindings.Clear();
+                var map = new (string Text, ICommand Command)[]
+                {
+                    (_settings.StartHotkey, ApplicationCommands.New),
+                    (_settings.StopHotkey, ApplicationCommands.Stop),
+                    (_settings.PauseHotkey, MediaCommands.Pause),
+                };
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var conv = new KeyGestureConverter();
+                foreach (var (text, command) in map)
+                {
+                    if (!AppSettings.TryNormalizeHotkey(text, out var normalized))
+                        continue;
+                    if (!seen.Add(normalized))
+                        continue;
+                    try
+                    {
+                        if (conv.ConvertFromString(normalized) is KeyGesture gesture)
+                            InputBindings.Add(new KeyBinding(command, gesture));
+                    }
+                    catch { /* skip one bad gesture, keep the rest */ }
+                }
+                UpdateHotkeyButtonLabels();
+            }
+            catch { /* best-effort: window works without shortcuts */ }
+        }
+
+        /// <summary>Refreshes Start/Pause/Stop button labels + AcceleratorKey from settings.</summary>
+        private void UpdateHotkeyButtonLabels()
+        {
+            try
+            {
+                if (StartBtn != null)
+                {
+                    StartBtn.Content = $"Start Recording ({_settings.StartHotkey})";
+                    System.Windows.Automation.AutomationProperties.SetAcceleratorKey(StartBtn, _settings.StartHotkey);
+                }
+                if (PauseBtn != null)
+                {
+                    bool paused = _engine.IsPaused && _engine.IsRecording;
+                    PauseBtn.Content = paused ? $"Resume ({_settings.PauseHotkey})" : $"Pause ({_settings.PauseHotkey})";
+                    System.Windows.Automation.AutomationProperties.SetAcceleratorKey(PauseBtn, _settings.PauseHotkey);
+                }
+                if (StopBtn != null)
+                {
+                    StopBtn.Content = $"Stop ({_settings.StopHotkey})";
+                    System.Windows.Automation.AutomationProperties.SetAcceleratorKey(StopBtn, _settings.StopHotkey);
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        private void OnHotkeyBoxGotFocus(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is TextBox tb)
+                {
+                    tb.SelectAll();
+                    StatusText.Text = "Press the new shortcut (Esc cancels)…";
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        private void OnHotkeyBoxLostFocus(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // Restore canonical text in case focus left mid-capture.
+                if (sender is TextBox tb && tb.Tag is string tag)
+                    tb.Text = HotkeyFor(tag);
+            }
+            catch { /* best-effort */ }
+        }
+
+        private string HotkeyFor(string tag) => tag switch
+        {
+            "Start" => _settings.StartHotkey,
+            "Pause" => _settings.PauseHotkey,
+            "Stop" => _settings.StopHotkey,
+            _ => "",
+        };
+
+        /// <summary>
+        /// Click-to-capture: converts the pressed key + current modifiers into a
+        /// canonical gesture string. Bare-modifier presses are ignored; a
+        /// modifier-less key or Escape cancels. Duplicates across the three
+        /// actions warn and keep the old value; otherwise the new gesture is
+        /// persisted and bindings are rebuilt.
+        /// </summary>
+        private void OnHotkeyCapturePreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (sender is not TextBox tb || tb.Tag is not string tag)
+                return;
+            try
+            {
+                e.Handled = true;
+
+                // Resolve the real key first: with Alt held, e.Key is
+                // Key.System and the physical key is in e.SystemKey.
+                Key key = e.Key == Key.System ? e.SystemKey : e.Key;
+                if (key == Key.ImeProcessed)
+                    key = e.ImeProcessedKey;
+
+                // Ignore bare modifier presses (user is still chording).
+                if (key is Key.LeftCtrl or Key.RightCtrl or Key.LeftAlt or Key.RightAlt
+                    or Key.LeftShift or Key.RightShift or Key.LWin or Key.RWin)
+                    return;
+
+                // Escape with no modifiers cancels the capture.
+                if (key == Key.Escape && Keyboard.Modifiers == ModifierKeys.None)
+                {
+                    tb.Text = HotkeyFor(tag);
+                    StatusText.Text = "Shortcut capture cancelled.";
+                    MoveFocus(new TraversalRequest(FocusNavigationDirection.Next));
+                    return;
+                }
+
+                var mods = Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Shift | ModifierKeys.Windows);
+                if (mods == ModifierKeys.None)
+                {
+                    StatusText.Text = "Shortcut needs a modifier (Ctrl/Alt/Shift) — keeping old.";
+                    return;
+                }
+
+                string? gestureText;
+                try
+                {
+                    gestureText = new KeyGestureConverter().ConvertToString(new KeyGesture(key, mods));
+                }
+                catch
+                {
+                    StatusText.Text = "That key can't be used as a shortcut — keeping old.";
+                    return;
+                }
+                if (string.IsNullOrWhiteSpace(gestureText) ||
+                    !AppSettings.TryNormalizeHotkey(gestureText, out var normalized))
+                {
+                    StatusText.Text = "That key can't be used as a shortcut — keeping old.";
+                    return;
+                }
+
+                // Conflict check: duplicate gesture → warning, keep old.
+                string other1, other2;
+                if (tag == "Start") { other1 = _settings.PauseHotkey; other2 = _settings.StopHotkey; }
+                else if (tag == "Pause") { other1 = _settings.StartHotkey; other2 = _settings.StopHotkey; }
+                else if (tag == "Stop") { other1 = _settings.StartHotkey; other2 = _settings.PauseHotkey; }
+                else return;
+                if (string.Equals(normalized, other1, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(normalized, other2, StringComparison.OrdinalIgnoreCase))
+                {
+                    WpfMessageBox.Show(
+                        $"\"{normalized}\" is already assigned to another action.\nKeeping the old shortcut.",
+                        "Shortcut already in use",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                    tb.Text = HotkeyFor(tag);
+                    return;
+                }
+
+                if (tag == "Start") _settings.StartHotkey = normalized;
+                else if (tag == "Pause") _settings.PauseHotkey = normalized;
+                else _settings.StopHotkey = normalized;
+                _settings.Save();
+                tb.Text = normalized;
+                RebuildInputBindings();
+                StatusText.Text = $"Shortcut set: {tag} = {normalized}";
+                MoveFocus(new TraversalRequest(FocusNavigationDirection.Next));
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("OnHotkeyCapture", ex);
+            }
+        }
+
+        private void OnResetHotkeys(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                _settings.StartHotkey = AppSettings.DefaultStartHotkey;
+                _settings.PauseHotkey = AppSettings.DefaultPauseHotkey;
+                _settings.StopHotkey = AppSettings.DefaultStopHotkey;
+                _settings.Save();
+                if (StartHotkeyBox != null) StartHotkeyBox.Text = _settings.StartHotkey;
+                if (PauseHotkeyBox != null) PauseHotkeyBox.Text = _settings.PauseHotkey;
+                if (StopHotkeyBox != null) StopHotkeyBox.Text = _settings.StopHotkey;
+                RebuildInputBindings();
+                StatusText.Text = "Shortcuts reset to Ctrl+R / Ctrl+P / Ctrl+S.";
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("OnResetHotkeys", ex);
+            }
         }
 
         // ==========================================

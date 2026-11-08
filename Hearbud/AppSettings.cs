@@ -34,6 +34,46 @@ namespace Hearbud
         public double AutoStopSizeMb { get; set; } = 0;
         public bool SplitInsteadOfStop { get; set; } = false;
 
+        // GAP-09 #6: in-app remappable hotkeys (window-focused scope only;
+        // system-wide RegisterHotKey is phase 2). Canonical "Ctrl+R" form via
+        // KeyGestureConverter round-trip; invalid values fall back to defaults.
+        public const string DefaultStartHotkey = "Ctrl+R";
+        public const string DefaultPauseHotkey = "Ctrl+P";
+        public const string DefaultStopHotkey = "Ctrl+S";
+
+        public string StartHotkey { get; set; } = DefaultStartHotkey;
+        public string PauseHotkey { get; set; } = DefaultPauseHotkey;
+        public string StopHotkey { get; set; } = DefaultStopHotkey;
+
+        /// <summary>
+        /// Normalizes a hotkey string through KeyGestureConverter. Returns false
+        /// when the input is null/empty or does not parse; normalized holds the
+        /// canonical display string (e.g. "Ctrl+R") on success. Never throws
+        /// for bad input (any converter failure yields false and the caller
+        /// falls back to the default).
+        /// </summary>
+        public static bool TryNormalizeHotkey(string? input, out string normalized)
+        {
+            normalized = "";
+            try
+            {
+                if (string.IsNullOrWhiteSpace(input))
+                    return false;
+                var conv = new System.Windows.Input.KeyGestureConverter();
+                if (conv.ConvertFromString(input.Trim()) is not System.Windows.Input.KeyGesture gesture)
+                    return false;
+                var s = conv.ConvertToString(gesture);
+                if (string.IsNullOrWhiteSpace(s))
+                    return false;
+                normalized = s;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static string ConfigPath =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".hearbud_config.json");
 
@@ -76,6 +116,19 @@ namespace Hearbud
 
             if (string.IsNullOrWhiteSpace(OutputDir))
                 OutputDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings");
+
+            if (!TryNormalizeHotkey(StartHotkey, out var start))
+                StartHotkey = DefaultStartHotkey;
+            else
+                StartHotkey = start;
+            if (!TryNormalizeHotkey(PauseHotkey, out var pause))
+                PauseHotkey = DefaultPauseHotkey;
+            else
+                PauseHotkey = pause;
+            if (!TryNormalizeHotkey(StopHotkey, out var stop))
+                StopHotkey = DefaultStopHotkey;
+            else
+                StopHotkey = stop;
         }
 
         /// <summary>

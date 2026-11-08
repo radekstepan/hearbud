@@ -4,8 +4,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="Hearbud" Height="590" Width="960"
-        MinHeight="590" MinWidth="900"
+        Title="Hearbud" Height="680" Width="960"
+        MinHeight="680" MinWidth="900"
         ResizeMode="CanMinimize"
         Background="{StaticResource AppBackground}"
         Foreground="{StaticResource ControlForeground}"
@@ -83,6 +83,53 @@
                     </StackPanel>
                     <CheckBox x:Name="SplitInsteadOfStopCheck" Content="Split into new file instead of stopping"
                                Margin="0,4,0,0"/>
+                    <!-- GAP-09 #6: in-app remappable hotkeys (window-focused only).
+                         Click a box, then press the new shortcut to capture it. -->
+                    <TextBlock Text="Keyboard Shortcuts (window-focused)" Margin="0,12,0,0" FontWeight="SemiBold"/>
+                    <Grid Margin="0,4,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Start" Opacity="0.7"/>
+                        <TextBlock Grid.Row="0" Grid.Column="1" Text="Pause" Opacity="0.7" Margin="4,0,0,0"/>
+                        <TextBlock Grid.Row="0" Grid.Column="2" Text="Stop" Opacity="0.7" Margin="4,0,0,0"/>
+                        <TextBox Grid.Row="1" Grid.Column="0" x:Name="StartHotkeyBox" Margin="0,2,0,0"
+                                 IsReadOnly="True" Focusable="True"
+                                 ToolTip="Click, then press the new Start shortcut"
+                                 AutomationProperties.Name="Start hotkey"
+                                 Tag="Start"
+                                 GotFocus="OnHotkeyBoxGotFocus"
+                                 LostFocus="OnHotkeyBoxLostFocus"
+                                 PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
+                        <TextBox Grid.Row="1" Grid.Column="1" x:Name="PauseHotkeyBox" Margin="4,2,0,0"
+                                 IsReadOnly="True" Focusable="True"
+                                 ToolTip="Click, then press the new Pause shortcut"
+                                 AutomationProperties.Name="Pause hotkey"
+                                 Tag="Pause"
+                                 GotFocus="OnHotkeyBoxGotFocus"
+                                 LostFocus="OnHotkeyBoxLostFocus"
+                                 PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
+                        <TextBox Grid.Row="1" Grid.Column="2" x:Name="StopHotkeyBox" Margin="4,2,0,0"
+                                 IsReadOnly="True" Focusable="True"
+                                 ToolTip="Click, then press the new Stop shortcut"
+                                 AutomationProperties.Name="Stop hotkey"
+                                 Tag="Stop"
+                                 GotFocus="OnHotkeyBoxGotFocus"
+                                 LostFocus="OnHotkeyBoxLostFocus"
+                                 PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
+                        <Button Grid.Row="1" Grid.Column="3" x:Name="ResetHotkeysBtn" Content="Reset"
+                                Click="OnResetHotkeys" Margin="4,2,0,0"
+                                ToolTip="Restore Ctrl+R / Ctrl+P / Ctrl+S"
+                                AutomationProperties.Name="Reset hotkeys"/>
+                    </Grid>
+                    <TextBlock Text="Click a box, press keys to capture (Esc cancels)." Opacity="0.6" Margin="0,2,0,0"/>
                 </StackPanel>
             </GroupBox>
 
