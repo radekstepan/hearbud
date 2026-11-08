@@ -391,7 +391,13 @@ MMCSS Pro Audio on writer thread + 1 ms timer; `DumpDir` taps; log cap keeps WAR
 
 ### 5b. Pause, source toggles, disk guard (GAP-09 p1-p4)
 **Decision:** `Pause()`/`Resume()`/`IsPaused` keep files open and emit silence frames (timeline preserved, meters frozen, resync skipped, loop clock re-armed on resume). Source checkboxes gate device IDs (`null` = disabled); Start requires at-least-one ("Keep system audio or microphone on"). Loopback is optional in `OpenDevicesAsync` (mic drives clock, format derived from mic). Pre-start `CheckDiskSpaceAndWritable` probes folder + zero-byte write, warns <500 MB and blocks <100 MB.
-Time/size auto-stop/split (`LimitMinutesText`/`LimitSizeMbText`, `SplitInsteadOfStopCheck`): engine `TotalMixBytesWritten`/`RecordElapsed` getters, 1 s UI poll, split = stop + `(N)` restart.
+### 5c. AEC/AGC/NS intentionally omitted (GAP-05 accepted gap)
+**Decision:** No echo canceller, AGC, or noise suppressor in the capture path. Rationale: this tool records both sides for later listening (no live-call feedback loop); both stems exist so speaker bleed is fixable in post; a loopback reference lags the true render signal (OS mixer + silence gating), making delay estimation fragile; native WebRTC-APM interop (x64+arm64, single-file publish, AV friction) is unjustified without user evidence.
+Insertion point is safe if ever needed: `TryPopFixedFrame` returns two aligned 480-frame quanta (the `graph.cpp:78` equivalent) — AEC would hook there, AGC/NS in `EmitFixedMix`/`EmitMicOnlyFixed` after per-input gains. Dump taps already mirror stage taps. Guidance: use headphones for live monitoring.
+### 5d. Out-of-process capture deferred (GAP-04)
+**Decision:** Capture stays in-process. Rationale: no evidence of long-capture reliability demand; hot-swap (GAP-06) + bounded FIFOs + 30 s drain timeout + log cap already cover the observed failure modes. Revisit only if crash/lockup reports implicate the capture process.
+### 5e. Limits, test, hotkeys, countdown, history (GAP-09 p5-p9)
+**Decision:** Time/size auto-stop/split (`LimitMinutesText`/`LimitSizeMbText`, `SplitInsteadOfStopCheck`): engine `TotalMixBytesWritten`/`RecordElapsed` getters, 1 s UI poll, split = stop + `(N)` restart.
 Sound test: `TestMicBtn` samples live peak 3 s → dBFS report; `TestSysBtn` synthesizes 1 kHz/1 s tone to temp WAV, plays via `WasapiOut` on selected speaker.
 Hotkeys: `Start/Pause/StopHotkey` settings (`Ctrl+R/P/S` defaults, converter-validated), capture boxes + reset, `RebuildInputBindings` on startup/change.
 Countdown + mini-bar + tray: `CountdownSeconds` (0/3/5/10, cancellable) runs before guard/engine start; `MiniBar` Topmost window (elapsed + levels, Pause/Stop delegate, owned by main); tray Pause/Stop items + balloon tips (no icon swap: single ico).
