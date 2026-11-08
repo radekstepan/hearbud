@@ -34,6 +34,9 @@ namespace Hearbud
         public double AutoStopSizeMb { get; set; } = 0;
         public bool SplitInsteadOfStop { get; set; } = false;
 
+        // GAP-09 #4: countdown before recording starts. 0 = off, else seconds.
+        public int CountdownSeconds { get; set; } = 0;
+
         // GAP-09 #6: in-app remappable hotkeys (window-focused scope only;
         // system-wide RegisterHotKey is phase 2). Canonical "Ctrl+R" form via
         // KeyGestureConverter round-trip; invalid values fall back to defaults.
@@ -113,6 +116,10 @@ namespace Hearbud
             else AutoStopMinutes = Math.Min(AutoStopMinutes, 24 * 60);
             if (double.IsNaN(AutoStopSizeMb) || AutoStopSizeMb < 0) AutoStopSizeMb = 0;
             else AutoStopSizeMb = Math.Min(AutoStopSizeMb, 100_000);
+
+            // GAP-09 #4: only the ComboBox values are valid; anything else is off.
+            if (CountdownSeconds is not (0 or 3 or 5 or 10))
+                CountdownSeconds = 0;
 
             if (string.IsNullOrWhiteSpace(OutputDir))
                 OutputDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings");

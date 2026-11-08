@@ -83,6 +83,17 @@
                     </StackPanel>
                     <CheckBox x:Name="SplitInsteadOfStopCheck" Content="Split into new file instead of stopping"
                                Margin="0,4,0,0"/>
+                    <!-- GAP-09 #4: pre-record countdown (0 = off). Delayed start only;
+                         disk-guard + engine StartAsync run after it elapses. -->
+                    <TextBlock Text="Countdown before recording" Margin="0,12,0,0" FontWeight="SemiBold"/>
+                    <ComboBox x:Name="CountdownCombo" Margin="0,4,0,0"
+                              SelectedValuePath="Tag"
+                              AutomationProperties.Name="Countdown before recording">
+                        <ComboBoxItem Content="Off" Tag="0"/>
+                        <ComboBoxItem Content="3 s" Tag="3"/>
+                        <ComboBoxItem Content="5 s" Tag="5"/>
+                        <ComboBoxItem Content="10 s" Tag="10"/>
+                    </ComboBox>
                     <!-- GAP-09 #6: in-app remappable hotkeys (window-focused only).
                          Click a box, then press the new shortcut to capture it. -->
                     <TextBlock Text="Keyboard Shortcuts (window-focused)" Margin="0,12,0,0" FontWeight="SemiBold"/>
@@ -231,6 +242,10 @@
                 <TextBlock x:Name="VersionText" DockPanel.Dock="Right" Opacity="0.5" VerticalAlignment="Center"/>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock x:Name="StatusText" Text="Ready to record" Opacity="0.8" />
+                    <!-- GAP-09 #4: visible only while a start countdown is running. -->
+                    <Button x:Name="CancelCountdownBtn" Content="Cancel" Margin="8,0,0,0"
+                            Visibility="Collapsed" Click="OnCancelCountdown"
+                            AutomationProperties.Name="Cancel countdown"/>
                     <ProgressBar x:Name="EncodingProgressBar" Width="120" Margin="15,0,0,0" Visibility="Collapsed" Minimum="0" Maximum="100"/>
                     <TextBlock x:Name="EncodingProgressText" Text="0%" Margin="5,0,0,0" Visibility="Collapsed" FontFamily="Consolas"/>
                 </StackPanel>

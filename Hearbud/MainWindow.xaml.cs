@@ -7,6 +7,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -38,6 +39,13 @@ namespace Hearbud
     private int _splitIndex = 1;
     private bool _autoActionRunning;
     private bool _suppressStopUi;
+
+    // GAP-09 #4: pre-record countdown + mini-bar + tray states.
+    private CancellationTokenSource? _countdownCts;
+    private MiniBar? _miniBar;
+    private System.Windows.Controls.MenuItem? _trayPauseItem;
+    private System.Windows.Controls.MenuItem? _trayStopItem;
+    private string? _lastAutoReason;
 
     private AppSettings _settings = AppSettings.Load();
         private readonly Dictionary<string, MMDevice> _micDict = new();
@@ -322,6 +330,14 @@ namespace Hearbud
         {
             try
             {
+                // GAP-09 #4: a second Start press while counting down aborts it.
+                if (_countdownCts != null)
+                {
+                    _countdownCts.Cancel();
+                    return;
+                }
+                if (_engine.IsRecording) return;
+
                 var outDir = OutputFolderText.Text;
                 if (string.IsNullOrWhiteSpace(outDir) || !Directory.Exists(outDir))
                 {
@@ -349,6 +365,34 @@ namespace Hearbud
                         MessageBoxButton.OK,
                         MessageBoxImage.Warning);
                     return;
+                }
+
+                // GAP-09 #4: optional pre-record countdown. Runs BEFORE the
+                // disk-guard + engine StartAsync below. Cancellable via the
+                // Cancel button or a second Start press (handled at the top).
+                if (GetCountdownSeconds() is int countdown && countdown > 0)
+                {
+                    var cts = new CancellationTokenSource();
+                    _countdownCts = cts;
+                    CancelCountdownBtn.Visibility = Visibility.Visible;
+                    try
+                    {
+                        for (int i = countdown; i >= 1; i--)
+                        {
+                            StatusText.Text = $"Starting in {i}…";
+                            await Task.Delay(1000, cts.Token);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        StatusText.Text = "Start cancelled.";
+                        return;
+                    }
+                    finally
+                    {
+                        if (_countdownCts == cts) _countdownCts = null;
+                        CancelCountdownBtn.Visibility = Visibility.Collapsed;
+                    }
                 }
 
                 // GAP-09 free-space / permission guard (UI-only pre-flight; engine disk path untouched).
@@ -404,6 +448,8 @@ namespace Hearbud
                 UpdateHotkeyButtonLabels();
                 StopBtn.IsEnabled  = true;
                 StatusText.Text = "Recording...";
+                _lastAutoReason = null;
+                ShowMiniBar();
                 UpdateTrayTooltip();
             }
             catch (Exception ex)
@@ -470,6 +516,7 @@ namespace Hearbud
                 {
                     StatusText.Text = $"Auto-stop: {reason} reached — stopping…";
                     _limitTimer.Stop();
+                    _lastAutoReason = reason;
                     await _engine.StopAsync();
                 }
             }
@@ -510,6 +557,7 @@ namespace Hearbud
                 StopBtn.IsEnabled = true;
                 StatusText.Text = "Recording...";
                 _limitTimer.Start();
+                ShowTrayBalloon("Hearbud: auto-split", $"{reason} — continuing in a new file.");
             }
             finally
             {
@@ -539,6 +587,56 @@ namespace Hearbud
                 StopBtn.IsEnabled = false;
             }
             UpdateTrayTooltip();
+        }
+
+        /// <summary>
+        /// GAP-09 #4: reads the Output Settings countdown ComboBox. Only the
+        /// listed values (0/3/5/10) are valid; anything else means off.
+        /// </summary>
+        private int GetCountdownSeconds()
+        {
+            try
+            {
+                string? tag = (CountdownCombo.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string
+                    ?? CountdownCombo.SelectedValue as string;
+                if (int.TryParse(tag, out var v) && v is 0 or 3 or 5 or 10) return v;
+            }
+            catch { /* best-effort: off */ }
+            return 0;
+        }
+
+        /// <summary>GAP-09 #4: aborts a running start countdown (button next to StatusText).</summary>
+        private void OnCancelCountdown(object sender, RoutedEventArgs e)
+        {
+            try { _countdownCts?.Cancel(); }
+            catch { /* best-effort */ }
+        }
+
+        /// <summary>
+        /// GAP-09 #4: shows the mini-bar (created on demand, owned by main so
+        /// it closes with it). Its buttons delegate to OnPauseResume / OnStop.
+        /// </summary>
+        private void ShowMiniBar()
+        {
+            try
+            {
+                if (_miniBar == null)
+                {
+                    _miniBar = new MiniBar(
+                        () => _engine.RecordElapsed,
+                        () => (_micPeak, _sysPeak, _engine.IsPaused && _engine.IsRecording),
+                        () => OnPauseResume(null, null),
+                        () => OnStop(null, null));
+                    _miniBar.Owner = this;
+                    _miniBar.Closed += (_, __) => _miniBar = null;
+                }
+                _miniBar.Show();
+                _miniBar.Activate();
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("ShowMiniBar", ex);
+            }
         }
 
         private void OnPauseResume(object? sender, RoutedEventArgs? e)
@@ -793,6 +891,15 @@ namespace Hearbud
                     // skip the saved-dialog, folder open, and auto-monitor here.
                     if (_suppressStopUi) return;
 
+                    // GAP-09 #4: mini-bar only lives while recording.
+                    try { _miniBar?.Hide(); } catch { }
+
+                    if (_lastAutoReason != null)
+                    {
+                        ShowTrayBalloon("Hearbud: auto-stopped", $"{_lastAutoReason} — recording saved.");
+                        _lastAutoReason = null;
+                    }
+
                     StartBtn.IsEnabled = true;
                     StopBtn.IsEnabled = false;
                     PauseBtn.IsEnabled = false;
@@ -858,8 +965,21 @@ namespace Hearbud
                 };
 
                 // Right-click context menu
+                // GAP-09 #4: only hearbud.ico ships, so there is no icon swap per
+                // state — state is conveyed via tooltip text + these Pause/Stop
+                // items (+ balloon tips on auto-stop/split) instead.
                 var contextMenu = new System.Windows.Controls.ContextMenu();
-                
+
+                _trayPauseItem = new System.Windows.Controls.MenuItem { Header = "Pause", IsEnabled = false };
+                _trayPauseItem.Click += OnPauseResume;
+                contextMenu.Items.Add(_trayPauseItem);
+
+                _trayStopItem = new System.Windows.Controls.MenuItem { Header = "Stop", IsEnabled = false };
+                _trayStopItem.Click += OnStop;
+                contextMenu.Items.Add(_trayStopItem);
+
+                contextMenu.Items.Add(new System.Windows.Controls.Separator());
+
                 var showItem = new System.Windows.Controls.MenuItem { Header = "Show Window" };
                 showItem.Click += (s, e) =>
                 {
@@ -893,6 +1013,11 @@ namespace Hearbud
         protected override async void OnClosing(CancelEventArgs e)
         {
             base.OnClosing(e);
+
+            // GAP-09 #4: abort any pending start countdown; the mini-bar is
+            // Owner-bound so it closes with main, but close explicitly too.
+            try { _countdownCts?.Cancel(); } catch { }
+            try { _miniBar?.Close(); } catch { }
 
             if (_engine.IsRecording)
             {
@@ -939,6 +1064,7 @@ namespace Hearbud
                 _settings.AutoStopMinutes = ParseNonNegativeMinutes(LimitMinutesText.Text);
                 _settings.AutoStopSizeMb = ParseNonNegativeSizeBytes(LimitSizeMbText.Text) / (1024.0 * 1024.0);
                 _settings.SplitInsteadOfStop = SplitInsteadOfStopCheck.IsChecked ?? false;
+                _settings.CountdownSeconds = GetCountdownSeconds();
                 _settings.Save();
             }
             catch { /* best-effort */ }
@@ -980,6 +1106,7 @@ namespace Hearbud
                 LimitMinutesText.Text = _settings.AutoStopMinutes > 0 ? _settings.AutoStopMinutes.ToString() : "";
                 LimitSizeMbText.Text = _settings.AutoStopSizeMb > 0 ? _settings.AutoStopSizeMb.ToString() : "";
                 SplitInsteadOfStopCheck.IsChecked = _settings.SplitInsteadOfStop;
+                CountdownCombo.SelectedValue = _settings.CountdownSeconds switch { 3 => "3", 5 => "5", 10 => "10", _ => "0" };
 
                 // GAP-09 #6: show persisted hotkeys, then rebuild gestures.
                 if (StartHotkeyBox != null) StartHotkeyBox.Text = _settings.StartHotkey;
@@ -1287,7 +1414,8 @@ namespace Hearbud
 
         /// <summary>
         /// Updates the system tray tooltip to reflect whether recording is active
-        /// and which output device is selected.
+        /// and which output device is selected. Also refreshes the Pause/Stop
+        /// menu items (GAP-09 #4: no icon assets to swap, so text carries state).
         /// </summary>
         private void UpdateTrayTooltip()
         {
@@ -1302,6 +1430,21 @@ namespace Hearbud
                 : spkName != null
                     ? $"Hearbud \u2014 {spkName}"
                     : "Hearbud \u2014 No device connected";
+
+            if (_trayPauseItem != null)
+            {
+                _trayPauseItem.Header = _engine.IsPaused ? "Resume" : "Pause";
+                _trayPauseItem.IsEnabled = _engine.IsRecording;
+            }
+            if (_trayStopItem != null)
+                _trayStopItem.IsEnabled = _engine.IsRecording;
+        }
+
+        /// <summary>GAP-09 #4: tray balloon tip (auto-stop / auto-split). Best-effort.</summary>
+        private void ShowTrayBalloon(string title, string message)
+        {
+            try { _trayIcon?.ShowBalloonTip(title, message, H.NotifyIcon.BalloonIcon.Info); }
+            catch { /* best-effort */ }
         }
     }
 }
