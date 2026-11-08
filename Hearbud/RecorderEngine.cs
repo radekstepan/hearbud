@@ -255,6 +255,11 @@ namespace Hearbud
         private Task? _writeTask;
         private long _droppedBlocks = 0;
         private Exception? _writerException;
+        private readonly WriterFaultTracker _faults = new();
+        private int _queueHighWaterWarned;
+        private volatile bool _diskFullStopRequested;
+        public bool DiskFullStopRequested => _diskFullStopRequested;
+        public string? FirstWriterError => _faults.FirstError?.Message;
         // GAP-09 auto-stop/split: cumulative mix payload bytes handed to the write
         // queue this session (WAV container overhead excluded; close enough for limits).
         private long _totalMixBytesWritten = 0;
@@ -772,8 +777,12 @@ namespace Hearbud
             _lastMicBacklogSec = 0.0;
             _micBacklogSecMax = 0.0;
             _logTruncated = false;
+            _faults.Reset();
+            _queueHighWaterWarned = 0;
+            _diskFullStopRequested = false;
             NativeTiming.Begin1Ms();
             OpenDumpStreams(opts.DumpDir, outDir, baseName);
+            try { SessionManifest.Begin(outDir, baseName, _pathSys, _pathMic, _pathMix, _pathMp3, _outRate, _outChannels, _mixUse32Bit ? 32 : 16); } catch { }
 
             _paused = false;
             _recording = true;
@@ -819,7 +828,8 @@ namespace Hearbud
             if (_writeQueue != null && _writeTask != null)
             {
                 Info("Finishing background writes...");
-                _writeQueue.CompleteAdding();
+                try { _writeQueue.CompleteAdding(); }
+                catch (InvalidOperationException) { /* writer thread already completed it (disk-full path) */ }
 
                 // Wait for background writes to finish, but with a timeout to prevent hanging
                 // if disk I/O stalls or the writer thread deadlocks.
@@ -841,6 +851,14 @@ namespace Hearbud
             if (_writerException != null)
             {
                 RaiseStatus(EngineStatusKind.Error, $"Disk write failed: {_writerException.Message}");
+            }
+            if (_faults.TotalErrors > 0)
+            {
+                Warn($"Write errors this session: sys={_faults.SysErrors} mic={_faults.MicErrors} mix={_faults.MixErrors} " +
+                     $"first=({_faults.FirstTarget}) {_faults.FirstError?.Message}");
+                if (_writerException == null)
+                    RaiseStatus(EngineStatusKind.Error,
+                        $"Disk write failed ({_faults.TotalErrors} block(s), first {_faults.FirstTarget}): {_faults.FirstError?.Message}");
             }
 
             // 2. Now it is safe to close the files (WAV headers are updated on Dispose).
@@ -932,6 +950,26 @@ namespace Hearbud
             }
             Info("Recording stopped");
             Info("===== Session end =====");
+
+            try
+            {
+                string? dir = null, bn = null;
+                try
+                {
+                    string anchor = !string.IsNullOrEmpty(_pathMix) ? _pathMix : (!string.IsNullOrEmpty(_pathSys) ? _pathSys : _pathMic);
+                    if (!string.IsNullOrEmpty(anchor)) { dir = Path.GetDirectoryName(anchor); bn = Path.GetFileNameWithoutExtension(anchor)?.Replace("-mix", "").Replace("-system", "").Replace("-mic", ""); }
+                }
+                catch { }
+                if (!string.IsNullOrEmpty(dir) && !string.IsNullOrEmpty(bn))
+                {
+                    string? firstTarget = _faults.FirstError != null ? _faults.FirstTarget.ToString() : null;
+                    SessionManifest.MarkClosed(dir, bn, TotalMixBytesWritten,
+                        _faults.DiskFullLatched || _diskFullStopRequested,
+                        _faults.TotalErrors, _faults.SysErrors, _faults.MicErrors, _faults.MixErrors,
+                        firstTarget, _faults.FirstError?.Message);
+                }
+            }
+            catch { }
 
             CloseDumpStreams();
             NativeTiming.End1Ms();
@@ -1058,10 +1096,21 @@ namespace Hearbud
                     }
                     catch (Exception ex)
                     {
-                        // Keep the writer thread alive for other files, but surface in session log
-                        // (previously Debug-only, invisible in field reports).
-                        Warn($"Disk write failed ({job.Target}): {ex.Message}");
+                        // Sticky counters (DealFfmpegMuxError equivalent); ENOSPC latches
+                        // an immediate graceful stop — intake halts, queued audio still
+                        // drains so FinalizeWavFiles rewrites headers (av_write_trailer-always).
+                        bool latched = _faults.Record(job.Target, ex);
+                        Warn($"Disk write failed ({job.Target}): {ex.Message} " +
+                             $"(n={_faults.TotalErrors}, first={_faults.FirstTarget}:{_faults.FirstError?.Message})");
                         Debug.WriteLine($"Disk write error: {ex.Message}");
+                        if (latched && !_diskFullStopRequested)
+                        {
+                            _diskFullStopRequested = true;
+                            _recording = false;
+                            RaiseStatus(EngineStatusKind.Error,
+                                "Disk full — stopping gracefully. Already-written audio will be finalized; free space, then press Stop.");
+                            try { _writeQueue?.CompleteAdding(); } catch { }
+                        }
                     }
                     finally
                     {
@@ -1092,7 +1141,7 @@ namespace Hearbud
 
         private void EnqueueWrite(AudioFileTarget target, byte[] sourceData, int count)
         {
-            if (!_recording || _writeQueue == null || _writeQueue.IsAddingCompleted) return;
+            if (!_recording || _diskFullStopRequested || _writeQueue == null || _writeQueue.IsAddingCompleted) return;
 
             byte[] rented = ArrayPool<byte>.Shared.Rent(count);
             bool added = false;
@@ -1108,6 +1157,15 @@ namespace Hearbud
 
             if (added && target == AudioFileTarget.Mix)
                 Interlocked.Add(ref _totalMixBytesWritten, count);
+
+            if (added)
+            {
+                var q = _writeQueue;
+                if (Volatile.Read(ref _queueHighWaterWarned) == 0
+                    && q != null && WriterHealth.ShouldRaiseHighWater(q.Count, q.BoundedCapacity)
+                    && Interlocked.CompareExchange(ref _queueHighWaterWarned, 1, 0) == 0)
+                    Warn($"Write queue >75% full ({q.Count}/{q.BoundedCapacity}) — disk is falling behind.");
+            }
 
             if (!added)
             {
