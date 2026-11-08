@@ -253,7 +253,7 @@ namespace Hearbud
         // Async Write Queue
         private BlockingCollection<AudioWriteJob>? _writeQueue;
         private Task? _writeTask;
-        private long _droppedBlocks = 0;
+        private long _droppedBlocks;
         private Exception? _writerException;
         private readonly WriterFaultTracker _faults = new();
         private int _queueHighWaterWarned;
@@ -262,7 +262,7 @@ namespace Hearbud
         public string? FirstWriterError => _faults.FirstError?.Message;
         // GAP-09 auto-stop/split: cumulative mix payload bytes handed to the write
         // queue this session (WAV container overhead excluded; close enough for limits).
-        private long _totalMixBytesWritten = 0;
+        private long _totalMixBytesWritten;
 
         private string _pathSys = "";
         private string _pathMic = "";
@@ -274,7 +274,7 @@ namespace Hearbud
         private string _logPath = "";
         private StreamWriter? _log;
         private const long MaxLogSizeBytes = 10 * 1024 * 1024; // 10 MB
-        private long _logBytesWritten = 0;
+        private long _logBytesWritten;
 
         // Buffers
         private float[] _loopBufF     = new float[BlockFrames * 8];
@@ -377,16 +377,16 @@ namespace Hearbud
         // sources land in bounded FIFOs (~2 s) and the mix emits fixed quanta.
         private float[] _loopRing = new float[48000 * 4];
         private int _loopR, _loopW, _loopCount;
-        private long _loopOverrunBlocks = 0;
+        private long _loopOverrunBlocks;
         // Fixed emit quantum: 480 frames (10 ms @ 48 kHz) = 960 floats stereo.
         internal const int FixedFramesPerChannel = 480;
         private float[] _frameLoop = new float[FixedFramesPerChannel * 2];
         private float[] _frameMic = new float[FixedFramesPerChannel * 2];
         // Master clock: total fixed frames emitted + wall-clock anchor for resync.
-        private long _masterFramesEmitted = 0;
-        private long _masterStartTick = 0;
-        private int _lagStreak = 0;
-        private long _resyncCount = 0;
+        private long _masterFramesEmitted;
+        private long _masterStartTick;
+        private int _lagStreak;
+        private long _resyncCount;
         internal const double ResyncThresholdSec = 0.08;
         internal const int ResyncStreakNeeded = 3;
 
@@ -398,24 +398,24 @@ namespace Hearbud
         internal const int TrimZeroCrossWindow = 32;
         private const double TrimGainP = 0.25;
         private const double TrimGainI = 0.02;
-        private double _driftIntegral = 0.0;
+        private double _driftIntegral;
         private const double DriftIntegralMax = 0.005;
-        private long _trimTotalDropped = 0;
-        private long _trimTotalInserted = 0;
-        private long _trimTickDropped = 0;
-        private long _trimTickInserted = 0;
+        private long _trimTotalDropped;
+        private long _trimTotalInserted;
+        private long _trimTickDropped;
+        private long _trimTickInserted;
         public long TrimDropped => Interlocked.Read(ref _trimTotalDropped);
         public long TrimInserted => Interlocked.Read(ref _trimTotalInserted);
 
         private static readonly double _tickMs = 1000.0 / Stopwatch.Frequency;
-        private long _lastLoopTick = 0;
-        private long _lastMicTick = 0;
-        private long _captureGlitchBlocks = 0;
+        private long _lastLoopTick;
+        private long _lastMicTick;
+        private long _captureGlitchBlocks;
         private const double CaptureStarvationMs = 50.0;
         internal const double CaptureWatchdogStarveMs = 2000.0;
         internal const double CaptureWatchdogCooldownSec = 10.0;
-        private long _lastWatchdogTriggerTick = 0;
-        private long _watchdogRestarts = 0;
+        private long _lastWatchdogTriggerTick;
+        private long _watchdogRestarts;
         private readonly System.Collections.Concurrent.ConcurrentBag<int> _captureMmcssHandles =
             new System.Collections.Concurrent.ConcurrentBag<int>();
 
@@ -527,14 +527,14 @@ namespace Hearbud
         private string _micDevName  = "(none)";
         private string _activeLoopDeviceId = "";
         private string _activeMicDeviceId  = "";
-        private long _micUnderrunBlocks = 0;
-        private long _micOverrunBlocks = 0;
-        private long _silencedSamples = 0;
-        private long _loopBlockCounter = 0;
-        private long _lastLagLogTick = 0;
-        private double _lastMicBacklogSec = 0.0;
-        private double _micBacklogSecMax = 0.0;
-        private bool _logTruncated = false;
+        private long _micUnderrunBlocks;
+        private long _micOverrunBlocks;
+        private long _silencedSamples;
+        private long _loopBlockCounter;
+        private long _lastLagLogTick;
+        private double _lastMicBacklogSec;
+        private double _micBacklogSecMax;
+        private bool _logTruncated;
         private const int BacklogLogEveryNBlocks = 50;
         private readonly object _devLock = new();
         private readonly object _dumpLock = new();
@@ -563,7 +563,7 @@ namespace Hearbud
             private static extern bool SetThreadPriority(IntPtr hThread, int nPriority);
             private const int THREAD_PRIORITY_TIME_CRITICAL = 15;
 
-            private static int s_timerRef = 0;
+            private static int s_timerRef;
 
             private static readonly ThreadLocal<int> s_captureHandle =
                 new ThreadLocal<int>(() => 0, trackAllValues: true);
@@ -663,16 +663,16 @@ namespace Hearbud
         private FileStream? _dumpMix;
 
         private const double LevelThrottleMs = 50.0; 
-        private long _lastLevelTickMic = 0;
-        private long _lastLevelTickSys = 0;
-        private float _peakSinceLastMic = 0f;
-        private float _peakSinceLastSys = 0f;
-        private double _rmsSumSinceLastMic = 0.0;
-        private double _rmsSumSinceLastSys = 0.0;
-        private long _rmsCountSinceLastMic = 0;
-        private long _rmsCountSinceLastSys = 0;
-        private bool _clippedSinceLastMic = false;
-        private bool _clippedSinceLastSys = false;
+        private long _lastLevelTickMic;
+        private long _lastLevelTickSys;
+        private float _peakSinceLastMic;
+        private float _peakSinceLastSys;
+        private double _rmsSumSinceLastMic;
+        private double _rmsSumSinceLastSys;
+        private long _rmsCountSinceLastMic;
+        private long _rmsCountSinceLastSys;
+        private bool _clippedSinceLastMic;
+        private bool _clippedSinceLastSys;
 
         private volatile bool _disposed;
 

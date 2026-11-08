@@ -30,12 +30,12 @@ namespace Hearbud
         public bool WriteStems { get; set; } = true;
 
         // GAP-09 auto-stop / auto-split limits. 0 = off.
-        public double AutoStopMinutes { get; set; } = 0;
-        public double AutoStopSizeMb { get; set; } = 0;
-        public bool SplitInsteadOfStop { get; set; } = false;
+        public double AutoStopMinutes { get; set; }
+        public double AutoStopSizeMb { get; set; }
+        public bool SplitInsteadOfStop { get; set; }
 
         // GAP-09 #4: countdown before recording starts. 0 = off, else seconds.
-        public int CountdownSeconds { get; set; } = 0;
+        public int CountdownSeconds { get; set; }
 
         // GAP-09 #6: in-app remappable hotkeys (window-focused scope only;
         // system-wide RegisterHotKey is phase 2). Canonical "Ctrl+R" form via
