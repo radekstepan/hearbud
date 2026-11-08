@@ -506,6 +506,7 @@ namespace Hearbud
         /// </summary>
         private async void OnLimitTimerTick(object? sender, EventArgs e)
         {
+            _engine.PollCaptureWatchdog();
             if (!_engine.IsRecording || _autoActionRunning) return;
             if (_limitMinutes <= 0 && _limitSizeBytes <= 0) return;
             bool timeHit = _limitMinutes > 0 && _engine.RecordElapsed.TotalMinutes >= _limitMinutes;

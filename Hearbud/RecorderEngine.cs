@@ -376,11 +376,77 @@ namespace Hearbud
         private long _lastMicTick = 0;
         private long _captureGlitchBlocks = 0;
         private const double CaptureStarvationMs = 50.0;
+        internal const double CaptureWatchdogStarveMs = 2000.0;
+        internal const double CaptureWatchdogCooldownSec = 10.0;
+        private long _lastWatchdogTriggerTick = 0;
+        private long _watchdogRestarts = 0;
         private readonly System.Collections.Concurrent.ConcurrentBag<int> _captureMmcssHandles =
             new System.Collections.Concurrent.ConcurrentBag<int>();
 
         /// <summary>Callback gaps &gt; 50 ms observed (WASAPI buffer-overwrite risk).</summary>
         public long CaptureGlitches => Interlocked.Read(ref _captureGlitchBlocks);
+
+        /// <summary>Same-file reopen attempts triggered by the starvation watchdog.</summary>
+        public long WatchdogRestarts => Interlocked.Read(ref _watchdogRestarts);
+
+        /// <summary>
+        /// Pure per-source staleness: lastTick==0 (no callback yet) falls back to the
+        /// recording-start baseline so startup gets a grace period. baselineTick==0 → not stale.
+        /// </summary>
+        internal static bool IsCaptureStale(long nowTick, long lastTick, long baselineTick, double thresholdMs)
+        {
+            long b = lastTick != 0 ? lastTick : baselineTick;
+            if (b == 0) return false;
+            return (nowTick - b) * _tickMs >= thresholdMs;
+        }
+
+        /// <summary>
+        /// RecExperts RestartGraph equivalent (decision only): while recording, if EVERY
+        /// active source is callback-stale for &gt;CaptureWatchdogStarveMs, approve one
+        /// same-file reopen. Pause-aware, disposal-safe, skips while a reopen is already
+        /// in flight (_loopLost/_micLost, so _reopenCts ownership is never disturbed),
+        /// rate-limited by CaptureWatchdogCooldownSec. Test hook: pass any nowTick.
+        /// </summary>
+        internal bool CheckCaptureStarvation(long nowTick)
+        {
+            if (!_recording || _paused || _disposed || !_monitoring) return false;
+            bool loopActive = _loopCap != null || !string.IsNullOrEmpty(_activeLoopDeviceId);
+            bool micActive = _micCap != null || !string.IsNullOrEmpty(_activeMicDeviceId);
+            if (!loopActive && !micActive) return false;
+            long start = Volatile.Read(ref _masterStartTick);
+            long loopTick = Interlocked.Read(ref _lastLoopTick);
+            long micTick = Interlocked.Read(ref _lastMicTick);
+            bool loopStale = !loopActive || IsCaptureStale(nowTick, loopTick, start, CaptureWatchdogStarveMs);
+            bool micStale = !micActive || IsCaptureStale(nowTick, micTick, start, CaptureWatchdogStarveMs);
+            if (!(loopStale && micStale)) return false;
+            lock (_devLock) { if (_loopLost || _micLost) return false; }
+            long last = Interlocked.Read(ref _lastWatchdogTriggerTick);
+            if (last != 0 && (nowTick - last) * _tickMs < CaptureWatchdogCooldownSec * 1000.0) return false;
+            Interlocked.Exchange(ref _lastWatchdogTriggerTick, nowTick);
+            return true;
+        }
+
+        /// <summary>
+        /// 1 Hz UI-timer entry. On starvation: Warn, detach zombie(s), single
+        /// TryResumeLostSourcesAsync (one CTS for both sources; cooldown re-triggers
+        /// if still dead). WAV writers/headers never touched. Never throws.
+        /// </summary>
+        public void PollCaptureWatchdog()
+        {
+            try
+            {
+                if (!CheckCaptureStarvation(Stopwatch.GetTimestamp())) return;
+                long n = Interlocked.Increment(ref _watchdogRestarts);
+                Warn($"Capture watchdog: no callback from any active source for >{CaptureWatchdogStarveMs:F0}ms — same-file device reopen (attempt #{n}), WAV headers kept open.");
+                bool loopActive = _loopCap != null || !string.IsNullOrEmpty(_activeLoopDeviceId);
+                bool micActive = _micCap != null || !string.IsNullOrEmpty(_activeMicDeviceId);
+                if (loopActive) { lock (_devLock) { _loopLost = true; } DetachSource(isLoop: true); }
+                if (micActive) { lock (_devLock) { _micLost = true; } DetachSource(isLoop: false); }
+                RaiseStatus(EngineStatusKind.Error, "Audio capture stalled — reopening devices in same file…");
+                _ = TryResumeLostSourcesAsync();
+            }
+            catch { }
+        }
 
         internal void RecordCallbackTiming(bool isLoop)
         {
@@ -661,6 +727,8 @@ namespace Hearbud
             _loopOverrunBlocks = 0;
             _lastMicTick = 0;
             Interlocked.Exchange(ref _captureGlitchBlocks, 0);
+            Interlocked.Exchange(ref _lastWatchdogTriggerTick, 0);
+            Interlocked.Exchange(ref _watchdogRestarts, 0);
             _silencedSamples = 0;
             _loopBlockCounter = 0;
             _masterFramesEmitted = 0;
@@ -695,6 +763,7 @@ namespace Hearbud
             if (!_recording || !_paused) return;
             _paused = false;
             _lastLoopTick = Stopwatch.GetTimestamp();
+            _lastMicTick = _lastLoopTick;
             _lagStreak = 0;
             Info($"Resumed at masterFrames={_masterFramesEmitted}");
             RaiseStatus(EngineStatusKind.Info, "Recording to WAV…");
