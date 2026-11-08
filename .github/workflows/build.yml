@@ -14,7 +14,49 @@ concurrency:
 permissions:
   contents: write
 
+# NOTE: actions are pinned to major versions (v4) mirroring the ere-core
+# pinning approach. Keep actions/*@v4; do not float or unpin.
 jobs:
+  # Runs on GitHub-hosted ubuntu-latest (no self-hosted dependency) so PRs
+  # get fast feedback even when the Windows runner is busy/offline.
+  changeset-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a changeset on non-master branches
+        shell: bash
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == "refs/heads/master" ]]; then
+            echo "master: changeset gate skipped (release flow owns versioning there)"
+            exit 0
+          fi
+          if [[ "${COMMIT_MSG:-}" == *"[skip ci]"* ]]; then
+            echo "[skip ci]: changeset gate skipped"
+            exit 0
+          fi
+          shopt -s nullglob
+          count=0
+          for f in .changeset/*.md; do
+            base="$(basename "$f")"
+            if [[ "$base" == "README.md" ]]; then
+              continue
+            fi
+            count=$((count + 1))
+            echo "found: $f"
+          done
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::Missing changeset: add a .changeset/<name>.md (\"hearbud\": patch) or include [skip ci] in the commit message. Master is exempt."
+            exit 1
+          fi
+          echo "changeset gate passed ($count file(s))"
+
   build-windows:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
@@ -40,6 +82,40 @@ jobs:
             [Net.Dns]::GetHostEntry('api.nuget.org') | Out-Null
           } catch {
             throw 'no usable network: cannot resolve api.nuget.org'
+          }
+          # Informational only: the SDK comes from setup-dotnet later, so an
+          # absent/stale SDK here must not fail the job — just warn.
+          $dotnetCmd = Get-Command dotnet -ErrorAction SilentlyContinue
+          if ($dotnetCmd) {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $sdks = dotnet --list-sdks 2>$null
+            if ($sdks -match '8\.0\.1\d\d') {
+              Write-Host 'dotnet SDK 8.0.1xx present pre-setup'
+            } else {
+              Write-Warning 'dotnet SDK 8.0.1xx not found pre-setup; setup-dotnet will install it (DOTNET_INSTALL_DIR=$env:RUNNER_TOOL_CACHE\dotnet)'
+            }
+          } else {
+            Write-Warning 'dotnet not on PATH pre-setup; setup-dotnet will install SDK 8 into the runner tool cache'
+          }
+          $drive = Get-PSDrive -Name C -ErrorAction Stop
+          $freeGB = [math]::Round($drive.Free / 1GB, 2)
+          Write-Host "C: free ${freeGB}GB"
+          if ($drive.Free -lt 5GB) {
+            throw "insufficient disk space on C: (${freeGB}GB free, need >= 5GB; free space or expand the volume)"
+          }
+          $toolCache = $env:RUNNER_TOOL_CACHE
+          if ([string]::IsNullOrWhiteSpace($toolCache)) {
+            throw 'missing: RUNNER_TOOL_CACHE env var (runner misconfigured; setup-dotnet install target unknown)'
+          }
+          if (-not (Test-Path $toolCache)) {
+            throw "missing: RUNNER_TOOL_CACHE dir '$toolCache' does not exist (runner misconfigured)"
+          }
+          $probe = Join-Path $toolCache '.hearbud-write-probe'
+          try {
+            [IO.File]::WriteAllText($probe, 'ok')
+            Remove-Item $probe -Force
+          } catch {
+            throw "not writable: RUNNER_TOOL_CACHE '$toolCache' is not writable by the runner service account (check ACLs / service identity)"
           }
           git --version
 
