@@ -157,8 +157,8 @@ namespace Hearbud
             set => Volatile.Write(ref _loopGain, value); 
         }
 
-        private volatile int _micMuted;
-        private volatile int _sysMuted;
+        private int _micMuted;
+        private int _sysMuted;
 
         /// <summary>
         /// RecExperts parity (SetFileMicrophoneMute): per-frame mix mute.

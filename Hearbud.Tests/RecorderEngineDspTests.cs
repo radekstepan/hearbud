@@ -712,6 +712,10 @@ public class RecorderEngineDspTests
         }
         finally
         {
+            // Dispose first: _log holds the file open (FileShare.Read, no
+            // FileShare.Delete), so deleting while the engine is alive throws
+            // IOException on Windows. Dispose is idempotent (using var re-disposes).
+            try { engine.Dispose(); } catch { }
             File.Delete(tempLog);
         }
     }
