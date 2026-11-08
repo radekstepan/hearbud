@@ -59,6 +59,18 @@ namespace Hearbud
 
     private bool _disposed;
 
+    // Click-glitch diagnostics: env dump once + 1 Hz lag/input summary, tail-capped.
+    private readonly InputEventRing _diagInput = new(50);
+    private readonly LagTracker _diagLag = new();
+    private DispatcherTimer? _diagTimer;
+    private long _diagLastTick;
+    private int _diagTickCount;
+    private int _diagMouseDown;
+    private int _diagMouseUp;
+    private int _diagStylusDown;
+    private int _diagLastMouseDown;
+    private int _diagLastMouseUp;
+
         public MainWindow()
         {
             try
@@ -80,6 +92,7 @@ namespace Hearbud
                 {
                     SafeRefreshDevices();
                     LoadSettingsToUi();
+                    CrashLog.SetLogDirectory(OutputFolderText.Text);
 
                     // default base name
                     var defBase = $"rec-{DateTime.Now:yyyyMMdd_HHmmss}";
@@ -108,6 +121,11 @@ namespace Hearbud
                     // Must be done after the window handle exists (i.e. inside Loaded).
                     _notifEnumerator = new MMDeviceEnumerator();
                     _notifEnumerator.RegisterEndpointNotificationCallback(this);
+
+                    // Click-glitch diagnostics: env snapshot once per start.
+                    try { CrashLog.LogOnly("UiDiagnostics.Env", UiDiagnostics.BuildEnvReport(this)); } catch { }
+                    _diagLastTick = Stopwatch.GetTimestamp();
+                    try { _diagTimer?.Start(); } catch { }
                 };
 
                 _engine.LevelChanged += OnEngineLevelChanged;
@@ -118,6 +136,8 @@ namespace Hearbud
                 _uiTimer.Start();
 
                 _limitTimer.Tick += OnLimitTimerTick;
+
+                SetupUiDiagnostics();
             }
             catch (Exception ex)
             {
@@ -248,6 +268,7 @@ namespace Hearbud
                 if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
                 {
                     OutputFolderText.Text = dlg.SelectedPath;
+                    CrashLog.SetLogDirectory(OutputFolderText.Text);
                 }
             }
             catch (Exception ex)
@@ -357,6 +378,7 @@ namespace Hearbud
                     OutputFolderText.Text = def;
                     outDir = def;
                 }
+                CrashLog.SetLogDirectory(outDir);
 
                 var baseName = SanitizeFilename(BaseNameText.Text);
                 if (string.IsNullOrWhiteSpace(baseName))
@@ -1270,6 +1292,16 @@ namespace Hearbud
             if (_disposed) return;
             _disposed = true;
             try { _uiTimer.Stop(); } catch { }
+            try
+            {
+                // Click-glitch diagnostics: close summary with tail-capped input ring.
+                try { _diagTimer?.Stop(); } catch { }
+                string tail = string.Join(" | ", _diagInput.Tail(20));
+                CrashLog.LogOnly("UiDiagnostics.Close",
+                    $"ticks={_diagTickCount} maxLag={_diagLag.MaxLagMs:F0}ms spikes={_diagLag.SpikeCount} " +
+                    $"mouseDown={_diagMouseDown} mouseUp={_diagMouseUp} stylus={_diagStylusDown} tail=[{tail}]");
+            }
+            catch { /* best-effort */ }
             try { _trayIcon?.Dispose(); } catch { }
 
             // Unregister device notifications before disposing the enumerator.
@@ -1279,6 +1311,74 @@ namespace Hearbud
 
             _engine.Dispose();
             GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Click-glitch diagnostics: counts raw mouse/stylus presses + dropdown
+        /// open/close into a capped ring, and runs a 1 Hz UI-thread lag watchdog
+        /// (WARN to the log only on spikes &gt;250 ms, with tail context).
+        /// </summary>
+        private void SetupUiDiagnostics()
+        {
+            try
+            {
+                PreviewMouseDown += (_, e) =>
+                {
+                    _diagMouseDown++;
+                    _diagInput.Record($"MouseDown src={UiDiagnostics.SourceName(e.OriginalSource)} tid={Environment.CurrentManagedThreadId}");
+                };
+                PreviewMouseUp += (_, e) =>
+                {
+                    _diagMouseUp++;
+                    _diagInput.Record($"MouseUp src={UiDiagnostics.SourceName(e.OriginalSource)} tid={Environment.CurrentManagedThreadId}");
+                };
+                PreviewStylusDown += (_, e) =>
+                {
+                    _diagStylusDown++;
+                    _diagInput.Record($"StylusDown src={UiDiagnostics.SourceName(e.OriginalSource)} tid={Environment.CurrentManagedThreadId}");
+                };
+                foreach (var cb in new ComboBox[] { MicCombo, SpeakerCombo, OutputFormatCombo, OutputQualityCombo, CountdownCombo })
+                {
+                    try
+                    {
+                        ComboBox captured = cb;
+                        captured.DropDownOpened += (_, __) =>
+                            _diagInput.Record($"DropDownOpened src={UiDiagnostics.SourceName(captured)} tid={Environment.CurrentManagedThreadId}");
+                        captured.DropDownClosed += (_, __) =>
+                            _diagInput.Record($"DropDownClosed src={UiDiagnostics.SourceName(captured)} tid={Environment.CurrentManagedThreadId}");
+                    }
+                    catch { /* one bad combo must not break the rest */ }
+                }
+                _diagTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+                _diagTimer.Tick += (_, __) => OnDiagTick();
+            }
+            catch { /* best-effort: window works without diagnostics */ }
+        }
+
+        private void OnDiagTick()
+        {
+            try
+            {
+                long now = Stopwatch.GetTimestamp();
+                double elapsedMs = (now - _diagLastTick) * 1000.0 / Stopwatch.Frequency;
+                _diagLastTick = now;
+                _diagTickCount++;
+                if (_diagTickCount <= 1) return; // baseline tick: no lag math yet
+                double lag = _diagLag.Observe(elapsedMs, 1000.0);
+                int dDown = _diagMouseDown - _diagLastMouseDown;
+                int dUp = _diagMouseUp - _diagLastMouseUp;
+                _diagLastMouseDown = _diagMouseDown;
+                _diagLastMouseUp = _diagMouseUp;
+                if (lag > 250.0)
+                {
+                    string tail = string.Join(" | ", _diagInput.Tail(10));
+                    CrashLog.LogOnly("UiDiagnostics.Lag",
+                        $"WARN lag={lag:F0}ms max={_diagLag.MaxLagMs:F0}ms spikes={_diagLag.SpikeCount} n={_diagTickCount} " +
+                        $"mouseDown={_diagMouseDown}(+{dDown}) mouseUp={_diagMouseUp}(+{dUp}) stylus={_diagStylusDown} " +
+                        $"tid={Environment.CurrentManagedThreadId} tail=[{tail}]");
+                }
+            }
+            catch { /* best-effort */ }
         }
 
         private void LoadSettingsToUi()

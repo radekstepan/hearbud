@@ -570,7 +570,10 @@ Audio and engine hot paths log transitions only:
 
 ### Crash Logs
 
-Crashes are logged to `%LocalAppData%\Hearbud\logs.txt`:
+Crashes and diagnostics are logged to `logs.txt` in the output folder
+(same folder as the per-session logs), falling back to
+`%LocalAppData%\Hearbud\logs.txt` when the output folder is unset or
+unwritable:
 
 ```
 [2025-12-23 14:35:10] ERROR AppDomain.UnhandledException:
