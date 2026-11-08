@@ -90,7 +90,7 @@ namespace Hearbud
             try
             {
                 if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) return result;
-                foreach (var f in Directory.EnumerateFiles(dir, "*.hearbud-session.json", SearchOption.TopLevelOnly))
+                foreach (var f in Directory.EnumerateFiles(dir, "*.hearbud-session.json", SearchOption.TopDirectoryOnly))
                 {
                     try
                     {
