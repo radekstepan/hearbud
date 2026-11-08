@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 
 namespace Hearbud
@@ -101,25 +102,25 @@ namespace Hearbud
         public static string BuildEnvReport(System.Windows.Window? window = null)
         {
             var sb = new StringBuilder();
-            sb.AppendLine($"utc={DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}");
-            sb.AppendLine($"os={Safe(() => Environment.OSVersion.VersionString)} " +
+            sb.AppendLine(CultureInfo.InvariantCulture, $"utc={DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"os={Safe(() => Environment.OSVersion.VersionString)} " +
                 $"64bitProcess={Environment.Is64BitProcess} 64bitOs={Environment.Is64BitOperatingSystem} " +
                 $"cpus={Environment.ProcessorCount} clr={Safe(() => Environment.Version.ToString())}");
-            sb.AppendLine($"renderTier=0x{Safe(() => System.Windows.Media.RenderCapability.Tier.ToString("X8"))} " +
-                $"tierLevel={Safe(() => (System.Windows.Media.RenderCapability.Tier >> 16).ToString())} " +
+            sb.AppendLine(CultureInfo.InvariantCulture, $"renderTier=0x{Safe(() => System.Windows.Media.RenderCapability.Tier.ToString("X8", CultureInfo.InvariantCulture))} " +
+                $"tierLevel={Safe(() => (System.Windows.Media.RenderCapability.Tier >> 16).ToString(CultureInfo.InvariantCulture))} " +
                 $"renderMode={Safe(() => System.Windows.Media.RenderOptions.ProcessRenderMode.ToString())}");
-            sb.AppendLine($"remote={Safe(() => System.Windows.SystemParameters.IsRemoteSession.ToString())} " +
+            sb.AppendLine(CultureInfo.InvariantCulture, $"remote={Safe(() => System.Windows.SystemParameters.IsRemoteSession.ToString())} " +
                 $"menuAnim={Safe(() => System.Windows.SystemParameters.MenuAnimation.ToString())} " +
-                $"menuFade={Safe(() => System.Windows.SystemParameters.MenuFadeEnabled.ToString())} " +
+                $"menuFade={Safe(() => System.Windows.SystemParameters.MenuFade.ToString())} " +
                 $"clientAnim={Safe(() => System.Windows.SystemParameters.ClientAreaAnimation.ToString())} " +
-                $"mousePresent={Safe(() => System.Windows.SystemParameters.MousePresent.ToString())} " +
+                $"mousePresent={Safe(() => System.Windows.Forms.SystemInformation.MousePresent.ToString())} " +
                 $"swapButtons={Safe(() => System.Windows.SystemParameters.SwapButtons.ToString())} " +
-                $"screen={Safe(() => System.Windows.SystemParameters.PrimaryScreenWidth.ToString())}x{Safe(() => System.Windows.SystemParameters.PrimaryScreenHeight.ToString())}");
-            sb.AppendLine($"tablets={Safe(() =>
+                $"screen={Safe(() => System.Windows.SystemParameters.PrimaryScreenWidth.ToString(CultureInfo.InvariantCulture))}x{Safe(() => System.Windows.SystemParameters.PrimaryScreenHeight.ToString(CultureInfo.InvariantCulture))}");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"tablets={Safe(() =>
             {
                 var devs = System.Windows.Input.Tablet.TabletDevices;
                 var parts = new List<string>();
-                foreach (var d in devs)
+                foreach (System.Windows.Input.TabletDevice d in devs)
                 {
                     try { parts.Add($"{d.Type}:{d.Name}"); } catch { parts.Add("?"); }
                 }
@@ -127,15 +128,15 @@ namespace Hearbud
             })}");
             if (window != null)
             {
-                sb.AppendLine($"dpi={Safe(() =>
+                sb.AppendLine(CultureInfo.InvariantCulture, $"dpi={Safe(() =>
                 {
                     var dpi = System.Windows.Media.VisualTreeHelper.GetDpi(window);
-                    return $"{dpi.DpiScaleX:F2}x{dpi.DpiScaleY:F2}";
+                    return $"{dpi.DpiScaleX.ToString("F2", CultureInfo.InvariantCulture)}x{dpi.DpiScaleY.ToString("F2", CultureInfo.InvariantCulture)}";
                 })} tid={Environment.CurrentManagedThreadId}");
             }
             else
             {
-                sb.AppendLine($"tid={Environment.CurrentManagedThreadId}");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"tid={Environment.CurrentManagedThreadId}");
             }
             return sb.ToString();
         }

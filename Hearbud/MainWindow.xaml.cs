@@ -1337,11 +1337,11 @@ namespace Hearbud
                     _diagStylusDown++;
                     _diagInput.Record($"StylusDown src={UiDiagnostics.SourceName(e.OriginalSource)} tid={Environment.CurrentManagedThreadId}");
                 };
-                foreach (var cb in new ComboBox[] { MicCombo, SpeakerCombo, OutputFormatCombo, OutputQualityCombo, CountdownCombo })
+                foreach (var cb in new System.Windows.Controls.ComboBox[] { MicCombo, SpeakerCombo, OutputFormatCombo, OutputQualityCombo, CountdownCombo })
                 {
                     try
                     {
-                        ComboBox captured = cb;
+                        System.Windows.Controls.ComboBox captured = cb;
                         captured.DropDownOpened += (_, __) =>
                             _diagInput.Record($"DropDownOpened src={UiDiagnostics.SourceName(captured)} tid={Environment.CurrentManagedThreadId}");
                         captured.DropDownClosed += (_, __) =>
