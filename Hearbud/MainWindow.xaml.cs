@@ -42,6 +42,8 @@ namespace Hearbud
                 InputBindings.Add(new KeyBinding(ApplicationCommands.New, new KeyGesture(Key.R, ModifierKeys.Control)));
                 CommandBindings.Add(new CommandBinding(ApplicationCommands.Stop, (_, __) => OnStop(null, null)));
                 InputBindings.Add(new KeyBinding(ApplicationCommands.Stop, new KeyGesture(Key.S, ModifierKeys.Control)));
+                CommandBindings.Add(new CommandBinding(MediaCommands.Pause, (_, __) => OnPauseResume(null, null)));
+                InputBindings.Add(new KeyBinding(MediaCommands.Pause, new KeyGesture(Key.P, ModifierKeys.Control)));
 
                 // Setup system tray icon
                 SetupTrayIcon();
@@ -280,6 +282,8 @@ namespace Hearbud
                 });
 
                 StartBtn.IsEnabled = false;
+                PauseBtn.IsEnabled = true;
+                PauseBtn.Content = "Pause (Ctrl+P)";
                 StopBtn.IsEnabled  = true;
                 StatusText.Text = "Recording...";
                 UpdateTrayTooltip();
@@ -293,6 +297,8 @@ namespace Hearbud
         private async void OnStop(object? sender, RoutedEventArgs? e)
         {
             StopBtn.IsEnabled = false;
+            PauseBtn.IsEnabled = false;
+            PauseBtn.Content = "Pause (Ctrl+P)";
             try 
             {
                 await _engine.StopAsync(); 
@@ -304,6 +310,31 @@ namespace Hearbud
                 StopBtn.IsEnabled = false;
             }
             UpdateTrayTooltip();
+        }
+
+        private void OnPauseResume(object? sender, RoutedEventArgs? e)
+        {
+            try
+            {
+                if (!_engine.IsRecording) return;
+                if (!_engine.IsPaused)
+                {
+                    _engine.Pause();
+                    PauseBtn.Content = "Resume (Ctrl+P)";
+                    StatusText.Text = "Paused — silence while paused";
+                }
+                else
+                {
+                    _engine.Resume();
+                    PauseBtn.Content = "Pause (Ctrl+P)";
+                    StatusText.Text = "Recording...";
+                }
+                UpdateTrayTooltip();
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("OnPauseResume", ex);
+            }
         }
 
         private static string SanitizeFilename(string name)
@@ -389,6 +420,8 @@ namespace Hearbud
 
                     StartBtn.IsEnabled = true;
                     StopBtn.IsEnabled = false;
+                    PauseBtn.IsEnabled = false;
+                    PauseBtn.Content = "Pause (Ctrl+P)";
                     UpdateTrayTooltip();
 
                     WpfMessageBox.Show(
@@ -663,7 +696,9 @@ namespace Hearbud
             var micName = MicCombo.SelectedItem as string;
 
             _trayIcon.ToolTipText = _engine.IsRecording
-                ? $"\u25cf Recording \u2014 {spkName ?? "No device"}"
+                ? (_engine.IsPaused
+                    ? $"Paused \u2014 {spkName ?? "No device"}"
+                    : $"\u25cf Recording \u2014 {spkName ?? "No device"}")
                 : spkName != null
                     ? $"Hearbud \u2014 {spkName}"
                     : "Hearbud \u2014 No device connected";

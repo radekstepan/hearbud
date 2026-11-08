@@ -175,6 +175,8 @@ namespace Hearbud
 
         private bool _monitoring;
         private bool _recording;
+        private volatile bool _paused;
+        public bool IsPaused => _paused;
 
         // Writers are now accessed ONLY by the background thread
         private WaveWriter? _wavSys;
@@ -432,9 +434,28 @@ namespace Hearbud
             NativeTiming.Begin1Ms();
             OpenDumpStreams(opts.DumpDir, outDir, baseName);
 
+            _paused = false;
             _recording = true;
             RaiseStatus(EngineStatusKind.Info, "Recording to WAV…");
             Info("Recording started");
+        }
+
+        public void Pause()
+        {
+            if (!_recording || _paused) return;
+            _paused = true;
+            Info($"Paused at masterFrames={_masterFramesEmitted}");
+            RaiseStatus(EngineStatusKind.Info, "Paused — silence while paused");
+        }
+
+        public void Resume()
+        {
+            if (!_recording || !_paused) return;
+            _paused = false;
+            _lastLoopTick = Stopwatch.GetTimestamp();
+            _lagStreak = 0;
+            Info($"Resumed at masterFrames={_masterFramesEmitted}");
+            RaiseStatus(EngineStatusKind.Info, "Recording to WAV…");
         }
 
         public async Task StopAsync(CancellationToken cancellationToken = default)
@@ -442,6 +463,7 @@ namespace Hearbud
             if (_disposed) return;
 
             _recording = false;
+            _paused = false;
             lock (_devLock) { _reopenCts?.Cancel(); _reopenCts = null; _loopLost = _micLost = false; }
 
             StopInternal(fullStop: false);
@@ -1042,6 +1064,16 @@ namespace Hearbud
                 double msSince = (nowTicksA - _lastLevelTickMic) * _tickMs;
                 if (msSince >= LevelThrottleMs && _rmsCountSinceLastMic > 0)
                 {
+                    if (_paused)
+                    {
+                        _peakSinceLastMic = 0f;
+                        _rmsSumSinceLastMic = 0.0;
+                        _rmsCountSinceLastMic = 0;
+                        _clippedSinceLastMic = false;
+                        _lastLevelTickMic = nowTicksA;
+                    }
+                    else
+                    {
                     float rms = (float)Math.Sqrt(_rmsSumSinceLastMic / _rmsCountSinceLastMic);
                     LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.Mic, rms, _peakSinceLastMic, _clippedSinceLastMic));
                     _peakSinceLastMic = 0f;
@@ -1049,6 +1081,7 @@ namespace Hearbud
                     _rmsCountSinceLastMic = 0;
                     _clippedSinceLastMic = false;
                     _lastLevelTickMic = nowTicksA;
+                    }
                 }
 
                 // --- Sync Logic: always buffer mic; fixed-frame drain emits. ---
@@ -1084,6 +1117,7 @@ namespace Hearbud
                 // --- Write Mic WAV (Async) ---
                 if (_recording && _writeStems && _wavMic != null)
                 {
+                    if (_paused) Array.Clear(_micConvBuf, 0, conv);
                     EnsureCapacity(ref _pcm16Mic, conv * 2);
                     FloatToPcm16(_micConvBuf, _pcm16Mic, conv); 
                     // Queue for background writing instead of blocking here
@@ -1105,6 +1139,7 @@ namespace Hearbud
                             _micCount -= n;
                         }
                         if (_preRollRemaining > 0) { _preRollRemaining--; Array.Clear(_frameMic, 0, n); }
+                        if (_paused) Array.Clear(_frameMic, 0, n);
                         Interlocked.Add(ref _masterFramesEmitted, FixedFramesPerChannel);
                         EmitMicOnlyFixed(_frameMic, n);
                     }
@@ -1159,6 +1194,16 @@ namespace Hearbud
                 double msSince = (nowTicks - _lastLevelTickSys) * _tickMs;
                 if (msSince >= LevelThrottleMs && _rmsCountSinceLastSys > 0)
                 {
+                    if (_paused)
+                    {
+                        _peakSinceLastSys = 0f;
+                        _rmsSumSinceLastSys = 0.0;
+                        _rmsCountSinceLastSys = 0;
+                        _clippedSinceLastSys = false;
+                        _lastLevelTickSys = nowTicks;
+                    }
+                    else
+                    {
                     float rms = (float)Math.Sqrt(_rmsSumSinceLastSys / _rmsCountSinceLastSys);
                     LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.System, rms, _peakSinceLastSys, _clippedSinceLastSys));
                     _peakSinceLastSys = 0f;
@@ -1166,11 +1211,13 @@ namespace Hearbud
                     _rmsCountSinceLastSys = 0;
                     _clippedSinceLastSys = false;
                     _lastLevelTickSys = nowTicks;
+                    }
                 }
 
                 // --- Write System WAV (Async) ---
                 if (_recording && _writeStems && _wavSys != null)
                 {
+                    if (_paused) Array.Clear(_loopBufF, 0, gotLoop);
                     EnsureCapacity(ref _pcm16Sys, gotLoop * 2);
                     FloatToPcm16(_loopBufF, _pcm16Sys, gotLoop);
                     EnqueueWrite(AudioFileTarget.System, _pcm16Sys, gotLoop * 2);
@@ -1192,14 +1239,17 @@ namespace Hearbud
                 lock (_micRingLock) snapshotMicCount = _micCount;
                 _lastMicBacklogSec = backlogSec;
                 if (backlogSec > _micBacklogSecMax) _micBacklogSecMax = backlogSec;
-                CheckLagResync(backlogSec);
+                if (!_paused) CheckLagResync(backlogSec);
 
                 // --- Fixed-frame emit (480 frames = 960 floats stereo) ---
                 int fixedN = FixedFrameFloats();
                 EnsureCapacity(ref _frameLoop, fixedN);
                 EnsureCapacity(ref _frameMic, fixedN);
                 while (TryPopFixedFrame(_frameLoop, _frameMic))
+                {
+                    if (_paused) { Array.Clear(_frameLoop, 0, fixedN); Array.Clear(_frameMic, 0, fixedN); }
                     EmitFixedMix(_frameLoop, _frameMic, fixedN);
+                }
 
                 _loopBlockCounter++;
                 // lagTime-equivalent: wall-clock 1 Hz line (RecExperts style), not callback-count anchored.

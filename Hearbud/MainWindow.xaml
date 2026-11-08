@@ -150,6 +150,9 @@
                         Style="{StaticResource AccentButton}"
                         AutomationProperties.Name="Start Recording"
                         AutomationProperties.AcceleratorKey="Ctrl+R"/>
+                <Button x:Name="PauseBtn" Content="Pause (Ctrl+P)" Click="OnPauseResume" IsEnabled="False" Margin="8,0,0,0"
+                        AutomationProperties.Name="Pause Recording"
+                        AutomationProperties.AcceleratorKey="Ctrl+P"/>
                 <Button x:Name="StopBtn" Content="Stop (Ctrl+S)" Click="OnStop" IsEnabled="False" Margin="8,0,0,0"
                         Style="{StaticResource AccentButton}"/>
             </StackPanel>
