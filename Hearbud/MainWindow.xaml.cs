@@ -47,6 +47,9 @@ namespace Hearbud
     private System.Windows.Controls.MenuItem? _trayStopItem;
     private string? _lastAutoReason;
 
+    // GAP-09 #8: session history (JSON beside config) + startup repair scan.
+    private HistoryStore _history = new();
+
     private AppSettings _settings = AppSettings.Load();
         private readonly Dictionary<string, MMDevice> _micDict = new();
         private readonly Dictionary<string, MMDevice> _spkDict = new();
@@ -92,6 +95,11 @@ namespace Hearbud
 
                     // Auto-start live monitoring so meters show immediately
                     TryStartAutoMonitor();
+
+                    // GAP-09 #8: session history list + startup repair scan
+                    // for unfinalized WAVs (crash/abort leftovers).
+                    RefreshHistoryList();
+                    RunStartupRepairScan();
 
                     // Register for Windows audio device notifications (plug/unplug).
                     // Must be done after the window handle exists (i.e. inside Loaded).
@@ -887,6 +895,11 @@ namespace Hearbud
                     EncodingProgressBar.Visibility = Visibility.Collapsed;
                     EncodingProgressText.Visibility = Visibility.Collapsed;
 
+                    // GAP-09 #8: every finished file is history — including
+                    // auto-split parts (the suppress flag only skips the
+                    // saved-dialog, folder open, and auto-monitor below).
+                    RecordHistoryEntry(e);
+
                     // GAP-09 auto-split handoff: the next StartAsync rearms UI;
                     // skip the saved-dialog, folder open, and auto-monitor here.
                     if (_suppressStopUi) return;
@@ -937,6 +950,185 @@ namespace Hearbud
                         MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             });
+        }
+
+        // ==========================================
+        // GAP-09 #8: HISTORY + REPAIR SCAN + PREVIEW
+        // Preview is OS-default only (Process.Start in the default player);
+        // no embedded MediaElement — a full player is out of scope (§12).
+        // ==========================================
+
+        /// <summary>
+        /// Appends the finished session to the JSON history (best-effort).
+        /// Runs for every Stopped event, including suppressed auto-split parts.
+        /// </summary>
+        private void RecordHistoryEntry(EngineStatusEventArgs e)
+        {
+            try
+            {
+                string mix = e.OutputPathMix ?? "";
+                if (string.IsNullOrWhiteSpace(mix)) return;
+                string baseName = Path.GetFileNameWithoutExtension(mix);
+                if (baseName.EndsWith("-mix", StringComparison.OrdinalIgnoreCase))
+                    baseName = baseName[..^4];
+                _history.Add(new HistoryEntry
+                {
+                    Timestamp = DateTime.Now,
+                    BaseName = baseName,
+                    MixPath = mix,
+                    Mp3Path = e.OutputPathMp3 ?? "",
+                    SystemPath = e.OutputPathSystem ?? "",
+                    MicPath = e.OutputPathMic ?? "",
+                    DurationSeconds = _engine.LastRecordElapsed.TotalSeconds,
+                    SizeBytes = _engine.TotalMixBytesWritten,
+                });
+                RefreshHistoryList();
+            }
+            catch { /* best-effort */ }
+        }
+
+        private void RefreshHistoryList()
+        {
+            try
+            {
+                HistoryList.ItemsSource = null;
+                HistoryList.ItemsSource = _history.Entries;
+            }
+            catch { /* best-effort */ }
+        }
+
+        private HistoryEntry? SelectedHistoryEntry() => HistoryList.SelectedItem as HistoryEntry;
+
+        private static string? FirstExistingFile(params string?[] paths)
+        {
+            foreach (var p in paths)
+            {
+                try { if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p; }
+                catch { /* best-effort */ }
+            }
+            return null;
+        }
+
+        private void OnHistoryDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
+            => RevealSelectedHistoryEntry();
+
+        private void OnHistoryOpen(object sender, RoutedEventArgs e)
+            => RevealSelectedHistoryEntry();
+
+        /// <summary>Reveals the selected session file in Explorer (selects it); falls back to the folder.</summary>
+        private void RevealSelectedHistoryEntry()
+        {
+            try
+            {
+                var entry = SelectedHistoryEntry();
+                if (entry == null) { StatusText.Text = "Select a history entry first."; return; }
+                string? target = FirstExistingFile(entry.MixPath, entry.Mp3Path, entry.SystemPath, entry.MicPath);
+                if (target != null)
+                {
+                    Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{target}\"") { UseShellExecute = true });
+                    return;
+                }
+                string? dir = null;
+                try
+                {
+                    string? d = Path.GetDirectoryName(entry.MixPath);
+                    if (!string.IsNullOrWhiteSpace(d) && Directory.Exists(d)) dir = d;
+                    else if (Directory.Exists(OutputFolderText.Text)) dir = OutputFolderText.Text;
+                }
+                catch { /* best-effort */ }
+                if (dir != null)
+                    Process.Start(new ProcessStartInfo() { FileName = dir, UseShellExecute = true, Verb = "open" });
+                else
+                    StatusText.Text = "Session files no longer exist.";
+            }
+            catch (Exception ex) { CrashLog.LogAndShow("HistoryReveal", ex); }
+        }
+
+        /// <summary>
+        /// Minimal preview: opens the session (MP3 preferred, else mix WAV) in the
+        /// OS-default player. No embedded MediaElement by design (§12).
+        /// </summary>
+        private void OnHistoryPlay(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var entry = SelectedHistoryEntry();
+                if (entry == null) { StatusText.Text = "Select a history entry to play."; return; }
+                string? target = FirstExistingFile(entry.Mp3Path, entry.MixPath);
+                if (target == null)
+                {
+                    WpfMessageBox.Show("Session file no longer exists on disk.",
+                        "Play", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                Process.Start(new ProcessStartInfo() { FileName = target, UseShellExecute = true });
+            }
+            catch (Exception ex) { CrashLog.LogAndShow("HistoryPlay", ex); }
+        }
+
+        private void OnHistoryDelete(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var entry = SelectedHistoryEntry();
+                if (entry == null) { StatusText.Text = "Select a history entry to delete."; return; }
+                var answer = WpfMessageBox.Show(
+                    $"Delete session files for \"{entry.BaseName}\"?\nThis removes the mix, MP3 and stems from disk.",
+                    "Delete session",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning);
+                if (answer != MessageBoxResult.Yes) return;
+                foreach (var f in new[] { entry.MixPath, entry.Mp3Path, entry.SystemPath, entry.MicPath })
+                {
+                    try { if (!string.IsNullOrWhiteSpace(f) && File.Exists(f)) File.Delete(f); }
+                    catch { /* best-effort */ }
+                }
+                _history.Remove(entry);
+                RefreshHistoryList();
+            }
+            catch (Exception ex) { CrashLog.LogAndShow("HistoryDelete", ex); }
+        }
+
+        /// <summary>
+        /// Startup scan of the output folder for unfinalized WAVs (crash/abort
+        /// leftovers). Fixable headers are repaired in place; the rest are
+        /// listed with a delete offer. Best-effort.
+        /// </summary>
+        private void RunStartupRepairScan()
+        {
+            try
+            {
+                var suspects = WavRepair.ScanDirectory(OutputFolderText.Text);
+                if (suspects.Count == 0) return;
+                int repaired = 0;
+                var unrepairable = new List<string>();
+                foreach (var f in suspects)
+                {
+                    try
+                    {
+                        if (WavRepair.TryRepair(f)) repaired++;
+                        else unrepairable.Add(f);
+                    }
+                    catch { unrepairable.Add(f); }
+                }
+                if (unrepairable.Count > 0)
+                {
+                    int show = Math.Min(10, unrepairable.Count);
+                    string list = string.Join("\n", unrepairable.Take(show).Select(Path.GetFileName));
+                    if (unrepairable.Count > show) list += $"\n… and {unrepairable.Count - show} more.";
+                    var answer = WpfMessageBox.Show(
+                        $"{repaired} file(s) repaired.\n\n{unrepairable.Count} unrepairable file(s) (empty or corrupt header):\n{list}\n\nDelete them?",
+                        "Unfinished recordings found",
+                        MessageBoxButton.YesNo, MessageBoxImage.Warning);
+                    if (answer == MessageBoxResult.Yes)
+                        foreach (var f in unrepairable)
+                            try { if (File.Exists(f)) File.Delete(f); } catch { }
+                }
+                else if (repaired > 0)
+                {
+                    StatusText.Text = $"Repaired {repaired} unfinalized recording(s).";
+                }
+            }
+            catch { /* best-effort */ }
         }
 
         private void SetupTrayIcon()

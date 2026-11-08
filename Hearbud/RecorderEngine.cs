@@ -190,6 +190,13 @@ namespace Hearbud
             }
         }
 
+        /// <summary>
+        /// GAP-09 #8: wall-clock elapsed of the most recently finished session,
+        /// captured at StopAsync entry (RecordElapsed zeroes once stopping begins).
+        /// Zero when no session has finished. Reflection-friendly public getter.
+        /// </summary>
+        public TimeSpan LastRecordElapsed { get; private set; }
+
         public event EventHandler<LevelChangedEventArgs>? LevelChanged;
         public event EventHandler<EngineStatusEventArgs>? Status;
         public event EventHandler<int>? EncodingProgress; 
@@ -493,6 +500,9 @@ namespace Hearbud
         public async Task StopAsync(CancellationToken cancellationToken = default)
         {
             if (_disposed) return;
+
+            // GAP-09 #8: snapshot for history before _recording flips (RecordElapsed zeroes after).
+            try { LastRecordElapsed = RecordElapsed; } catch { LastRecordElapsed = TimeSpan.Zero; }
 
             _recording = false;
             _paused = false;

@@ -4,8 +4,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="Hearbud" Height="680" Width="960"
-        MinHeight="680" MinWidth="900"
+        Title="Hearbud" Height="790" Width="960"
+        MinHeight="740" MinWidth="900"
         ResizeMode="CanMinimize"
         Background="{StaticResource AppBackground}"
         Foreground="{StaticResource ControlForeground}"
@@ -14,6 +14,7 @@
         <!-- Main content -->
         <Grid>
             <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
@@ -236,9 +237,29 @@
                         Style="{StaticResource AccentButton}"/>
             </StackPanel>
 
+            <!-- GAP-09 #8: recent-sessions history. Preview is OS-default:
+                 Play opens the file in the default player; no embedded
+                 MediaElement (full in-app player is out of scope per §12). -->
+            <GroupBox Grid.Row="3" Grid.ColumnSpan="2" Header="History (recent sessions)" Margin="0,8,0,0">
+                <DockPanel Margin="6">
+                    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,6,0,0" VerticalAlignment="Center">
+                        <Button x:Name="HistoryOpenBtn" Content="Open Folder" Click="OnHistoryOpen" Width="90"
+                                ToolTip="Reveal the selected session file in Explorer"/>
+                        <Button x:Name="HistoryPlayBtn" Content="Play" Click="OnHistoryPlay" Margin="8,0,0,0" Width="70"
+                                ToolTip="Preview with the default MP3/WAV player (OS-default preview)"/>
+                        <Button x:Name="HistoryDeleteBtn" Content="Delete" Click="OnHistoryDelete" Margin="8,0,0,0" Width="70"
+                                ToolTip="Delete the session files and remove the entry"/>
+                        <TextBlock Text="Double-click a session to reveal it. Play uses your default player."
+                                   Opacity="0.6" Margin="12,0,0,0" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <ListBox x:Name="HistoryList" Height="86" MouseDoubleClick="OnHistoryDoubleClick"
+                             ToolTip="Recent recording sessions (newest first, max 50)"/>
+                </DockPanel>
+            </GroupBox>
+
             <!-- Status bar -->
-            <Separator Grid.Row="3" Grid.ColumnSpan="2" Margin="0,12,0,0"/>
-            <DockPanel Grid.Row="4" Grid.ColumnSpan="2" Margin="0,8,0,0">
+            <Separator Grid.Row="4" Grid.ColumnSpan="2" Margin="0,12,0,0"/>
+            <DockPanel Grid.Row="5" Grid.ColumnSpan="2" Margin="0,8,0,0">
                 <TextBlock x:Name="VersionText" DockPanel.Dock="Right" Opacity="0.5" VerticalAlignment="Center"/>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock x:Name="StatusText" Text="Ready to record" Opacity="0.8" />
