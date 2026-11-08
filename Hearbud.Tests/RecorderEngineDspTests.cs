@@ -1112,11 +1112,11 @@ public class RecorderEngineDspTests
     public void Trim_ZeroCrossDrop_IsFrameAligned_WithinWindow()
     {
         using var engine = new RecorderEngine();
-        var m = GetInstance("FindZeroCrossDrop");
+        var m = GetStatic("FindZeroCrossDrop");
         var ring = new float[4096];
         for (int i = 0; i < ring.Length; i++)
             ring[i] = (float)Math.Sin(2 * Math.PI * 440 * i / 48000);
-        int got = (int)m.Invoke(engine, new object[] { ring, 100, 2000, 90, 2 })!;
+        int got = (int)m.Invoke(null, new object[] { ring, 100, 2000, 90, 2 })!;
         Assert.Equal(0, got % 2); // frame-aligned for stereo
         Assert.InRange(got, 90 - 16, 90 + 16);
     }

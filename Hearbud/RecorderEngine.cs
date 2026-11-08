@@ -577,7 +577,7 @@ namespace Hearbud
                 try
                 {
                     if (!OperatingSystem.IsWindows()) return;
-                    if (Interlocked.Increment(ref s_timerRef) == 1) timeBeginPeriod(1);
+                    if (Interlocked.Increment(ref s_timerRef) == 1) _ = timeBeginPeriod(1);
                 }
                 catch { }
             }
@@ -589,7 +589,7 @@ namespace Hearbud
                     if (Interlocked.Decrement(ref s_timerRef) <= 0)
                     {
                         Interlocked.Exchange(ref s_timerRef, 0);
-                        timeEndPeriod(1);
+                        _ = timeEndPeriod(1);
                     }
                 }
                 catch { }
@@ -606,7 +606,7 @@ namespace Hearbud
             }
             public static void Unboost(int handle)
             {
-                try { if (OperatingSystem.IsWindows() && handle != 0) AvRevertMmThreadCharacteristics(handle); } catch { }
+                try { if (OperatingSystem.IsWindows() && handle != 0) _ = AvRevertMmThreadCharacteristics(handle); } catch { }
             }
 
             public static int TryBoostCaptureThread()
@@ -638,7 +638,7 @@ namespace Hearbud
                 try
                 {
                     if (OperatingSystem.IsWindows() && handle != 0)
-                        AvRevertMmThreadCharacteristics(handle);
+                        _ = AvRevertMmThreadCharacteristics(handle);
                 }
                 catch { }
                 finally
@@ -680,7 +680,7 @@ namespace Hearbud
 
         public async Task MonitorAsync(RecorderStartOptions opts)
         {
-            if (_disposed) throw new ObjectDisposedException(nameof(RecorderEngine));
+            ObjectDisposedException.ThrowIf(_disposed, this);
             StopInternal(fullStop: true);
             await OpenDevicesAsync(opts);
 
@@ -707,7 +707,7 @@ namespace Hearbud
 
         public async Task StartAsync(RecorderStartOptions opts)
         {
-            if (_disposed) throw new ObjectDisposedException(nameof(RecorderEngine));
+            ObjectDisposedException.ThrowIf(_disposed, this);
             await MonitorAsync(opts); 
 
             _kbps = opts.Mp3BitrateKbps;
@@ -1943,7 +1943,7 @@ namespace Hearbud
             new ThreadLocal<Random>(() => new Random(
                 HashCode.Combine(
                     Environment.TickCount64,
-                    Thread.CurrentThread.ManagedThreadId,
+                    Environment.CurrentManagedThreadId,
                     Guid.NewGuid().GetHashCode())));
 
         private static void FloatToPcm16(float[] src, byte[] dst, int count)
@@ -2169,7 +2169,7 @@ namespace Hearbud
             return backlogSec;
         }
 
-        private int FindZeroCrossDrop(float[] ring, int r, int count, int nominal, int ch)
+        private static int FindZeroCrossDrop(float[] ring, int r, int count, int nominal, int ch)
         {
             int half = TrimZeroCrossWindow / 2;
             int lo = ((nominal - half) / ch) * ch;
