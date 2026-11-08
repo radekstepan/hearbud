@@ -182,7 +182,9 @@ public sealed class RecorderEngine : IDisposable
 - `OutputDir` - Default save folder
 - `Mp3BitrateKbps` - MP3 encoding bitrate (0 = Original/WAV only)
 - `MicGain`, `LoopGain` - Persisted gain values
-- `IncludeMic` - Whether to include mic in recording
+- `IncludeMic` - Whether to include mic in recording (unchecked → MicDeviceId=null)
+- `IncludeSystem` - Whether to include system audio (unchecked → LoopbackDeviceId=null; at-least-one required)
+- `WriteStems` - Save separate mic/system stems (false = mix only, ~1x I/O)
 
 **Legacy Handling:**
 - Old configs used `Mp3Quality` string (e.g., "192 kbps")
@@ -386,6 +388,9 @@ MMCSS Pro Audio on writer thread + 1 ms timer; `DumpDir` taps; log cap keeps WAR
 - Pre-roll avoids frame-0 silence + spurious underrun
 
 **Sync Edge Case:** When loopback resumes after silence, mic backlog beyond one fixed frame is dropped on sustained >80 ms lag. This prevents "old mic over new system" echo effect.
+
+### 5b. Pause, source toggles, disk guard (GAP-09 p1-p4)
+**Decision:** `Pause()`/`Resume()`/`IsPaused` keep files open and emit silence frames (timeline preserved, meters frozen, resync skipped, loop clock re-armed on resume). Source checkboxes gate device IDs (`null` = disabled); Start requires at-least-one ("Keep system audio or microphone on"). Loopback is optional in `OpenDevicesAsync` (mic drives clock, format derived from mic). Pre-start `CheckDiskSpaceAndWritable` probes folder + zero-byte write, warns <500 MB and blocks <100 MB.
 
 ### 6. Conditional limiter (tanh only on overs) + peak normalize
 **Decision:** Sum `s*gL + m*gM` at full level, peak-normalize the block only if peak>1, then apply `tanh` soft-knee only to samples with `|x|>1` before clamp.
