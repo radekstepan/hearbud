@@ -1678,7 +1678,7 @@ namespace Hearbud
         /// <summary>GAP-09 #4: tray balloon tip (auto-stop / auto-split). Best-effort.</summary>
         private void ShowTrayBalloon(string title, string message)
         {
-            try { _trayIcon?.ShowBalloonTip(title, message, H.NotifyIcon.BalloonIcon.Info); }
+            try { _trayIcon?.ShowNotification(title, message, H.NotifyIcon.Core.NotificationIcon.Info); }
             catch { /* best-effort */ }
         }
     }

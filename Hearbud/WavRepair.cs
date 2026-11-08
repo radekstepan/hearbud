@@ -33,7 +33,7 @@ namespace Hearbud
             try
             {
                 if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) return suspects;
-                foreach (var f in Directory.EnumerateFiles(dir, "*.wav", SearchOption.TopLevelOnly))
+                foreach (var f in Directory.EnumerateFiles(dir, "*.wav", SearchOption.TopDirectoryOnly))
                 {
                     try { if (!IsValidWav(f)) suspects.Add(f); }
                     catch { suspects.Add(f); }

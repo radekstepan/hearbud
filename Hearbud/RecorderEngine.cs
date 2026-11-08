@@ -1412,7 +1412,6 @@ namespace Hearbud
                     EnsureCapacity(ref _frameMic, n);
                     while (true)
                     {
-                        int got;
                         lock (_micRingLock)
                         {
                             if (_micCount < n) break;
