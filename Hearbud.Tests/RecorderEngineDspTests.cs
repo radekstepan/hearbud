@@ -817,4 +817,101 @@ public class RecorderEngineDspTests
         int ideal = (int)Math.Floor((double)totalSrc * 48000 / 44100);
         Assert.InRange(totalDst, ideal - 1, ideal + 1);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GAP-01 fixed-frame dual-FIFO tick (private instance, reflection)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static T Field<T>(object o, string name)
+        => (T)EngineType.GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(o)!;
+
+    private static void SetField(object o, string name, object v)
+        => EngineType.GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(o, v);
+
+    [Fact]
+    public void FixedFrameFloats_Stereo_Is960()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        int n = (int)GetInstance("FixedFrameFloats").Invoke(engine, null)!;
+        Assert.Equal(480 * 2, n);
+    }
+
+    [Fact]
+    public void DualFifo_FixedFrame_RoundTrips()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        SetField(engine, "_preRollRemaining", 0);
+        int n = (int)GetInstance("FixedFrameFloats").Invoke(engine, null)!;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = i * 0.001f;
+        GetInstance("PushLoopRing").Invoke(engine, new object[] { src, n });
+        // Feed mic ring directly via EnsureRingCapacity + field write.
+        var micRing = Field<float[]>(engine, "_micRing");
+        Assert.True(micRing.Length >= n);
+        Array.Copy(src, 0, micRing, 0, n);
+        SetField(engine, "_micW", n % micRing.Length);
+        SetField(engine, "_micR", 0);
+        SetField(engine, "_micCount", n);
+        var loopDst = new float[n];
+        var micDst = new float[n];
+        bool ok = (bool)GetInstance("TryPopFixedFrame").Invoke(engine, new object[] { loopDst, micDst })!;
+        Assert.True(ok);
+        Assert.Equal(src[0], loopDst[0], precision: 6);
+        Assert.Equal(src[n - 1], micDst[n - 1], precision: 6);
+        Assert.Equal(0, Field<int>(engine, "_micCount"));
+        Assert.Equal(0, Field<int>(engine, "_loopCount"));
+    }
+
+    [Fact]
+    public void TryPopFixedFrame_MicShortfall_ZeroFillsAndCountsUnderrun()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        SetField(engine, "_preRollRemaining", 0);
+        int n = (int)GetInstance("FixedFrameFloats").Invoke(engine, null)!;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = 0.25f;
+        GetInstance("PushLoopRing").Invoke(engine, new object[] { src, n });
+        var loopDst = new float[n];
+        var micDst = new float[n];
+        for (int i = 0; i < n; i++) micDst[i] = 99f;
+        bool ok = (bool)GetInstance("TryPopFixedFrame").Invoke(engine, new object[] { loopDst, micDst })!;
+        Assert.True(ok);
+        Assert.Equal(0f, micDst[0], precision: 6);
+        Assert.Equal(0f, micDst[n - 1], precision: 6);
+        Assert.True(Field<long>(engine, "_micUnderrunBlocks") >= 1);
+    }
+
+    [Fact]
+    public void CheckLagResync_SustainedBacklog_DropsToOneFrame()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        int n = (int)GetInstance("FixedFrameFloats").Invoke(engine, null)!;
+        var micRing = Field<float[]>(engine, "_micRing");
+        int fill = Math.Min(micRing.Length - 1, n * 4);
+        SetField(engine, "_micR", 0);
+        SetField(engine, "_micW", fill % micRing.Length);
+        SetField(engine, "_micCount", fill);
+        var m = GetInstance("CheckLagResync");
+        Assert.False((bool)m.Invoke(engine, new object[] { 0.5 })!);
+        Assert.False((bool)m.Invoke(engine, new object[] { 0.5 })!);
+        Assert.True((bool)m.Invoke(engine, new object[] { 0.5 })!);
+        Assert.Equal(n, Field<int>(engine, "_micCount"));
+        Assert.Equal(1L, Field<long>(engine, "_resyncCount"));
+    }
+
+    [Fact]
+    public void CheckLagResync_BelowThreshold_NoResync()
+    {
+        using var engine = new RecorderEngine();
+        var m = GetInstance("CheckLagResync");
+        Assert.False((bool)m.Invoke(engine, new object[] { 0.01 })!);
+        Assert.Equal(0L, Field<long>(engine, "_resyncCount"));
+    }
 }
