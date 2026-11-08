@@ -1278,6 +1278,7 @@ namespace Hearbud
             _notifEnumerator = null;
 
             _engine.Dispose();
+            GC.SuppressFinalize(this);
         }
 
         private void LoadSettingsToUi()
