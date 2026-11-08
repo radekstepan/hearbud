@@ -1998,7 +1998,7 @@ namespace Hearbud
         // GAP-01 fixed-frame dual-FIFO tick (reflection-testable).
         // Loopback is the master clock: both sources are buffered, mix emits
         // FixedFramesPerChannel quanta (480 frames = 960 floats stereo).
-        private int FixedFrameFloats() => FixedFramesPerChannel * Math.Max(1, _outChannels);
+        private int FixedFrameFloats() { int n = FixedFramesPerChannel * Math.Max(1, _outChannels); Debug.Assert(n == FixedFramesPerChannel * Math.Max(1, _outChannels) && n % Math.Max(1, _outChannels) == 0, "FixedFrameFloats must equal FixedFramesPerChannel*channels and be channel-aligned"); return n; }
 
         private double MicBacklogSec()
         {
@@ -2055,6 +2055,7 @@ namespace Hearbud
         {
             int n = FixedFrameFloats();
             if (loopDst == null || micDst == null || loopDst.Length < n || micDst.Length < n) return false;
+            Debug.Assert(loopDst.Length >= n && micDst.Length >= n, "TryPopFixedFrame dst buffers must hold one fixed frame (n floats)");
             lock (_loopRingLock)
             {
                 if (_loopCount < n) return false;
@@ -2083,6 +2084,7 @@ namespace Hearbud
         // one fixed frame. Returns true on the tick that resyncs.
         private bool CheckLagResync(double backlogSec)
         {
+            Debug.Assert(ResyncThresholdSec == 0.08, "ResyncThresholdSec 80ms contract with watchdog tests");
             if (backlogSec > ResyncThresholdSec) _lagStreak++;
             else _lagStreak = 0;
             if (_lagStreak < ResyncStreakNeeded) return false;
@@ -2196,7 +2198,8 @@ namespace Hearbud
 
         private long EnsureRingCapacity_NoLog_NeedsLock(int roomNeeded)
         {
-            if (_micRing.Length - _micCount >= roomNeeded) return 0;
+            Debug.Assert(roomNeeded >= 0, "EnsureRingCapacity_NoLog roomNeeded must be >= 0");
+            if (_micRing.Length - _micCount >= roomNeeded) { Debug.Assert(_micCount <= _micRing.Length, "micCount must not exceed ring length"); return 0; }
             int cap = Math.Max(_micRing.Length, _outRate * _outChannels * 2);
             int want = _micCount + roomNeeded;
             if (want <= cap)
@@ -2209,6 +2212,7 @@ namespace Hearbud
                 _micRing = newBuf;
                 _micR = 0;
                 _micW = _micCount;
+                Debug.Assert(_micCount <= _micRing.Length, "micCount must not exceed ring length");
                 return 0;
             }
             int drop = want - cap;
@@ -2216,6 +2220,7 @@ namespace Hearbud
             if (drop > 0) { _micR = (_micR + drop) % _micRing.Length; _micCount -= drop; }
             long dropped = want - cap;
             Interlocked.Add(ref _micOverrunBlocks, dropped);
+            Debug.Assert(_micCount <= _micRing.Length, "micCount must not exceed ring length");
             return dropped;
         }
 
@@ -2290,7 +2295,8 @@ namespace Hearbud
         // Returns samples dropped; caller Warns outside the lock.
         private long EnsureRingCapacity(int roomNeeded)
         {
-            if (_micRing.Length - _micCount >= roomNeeded) return 0;
+            Debug.Assert(roomNeeded >= 0, "EnsureRingCapacity roomNeeded must be >= 0");
+            if (_micRing.Length - _micCount >= roomNeeded) { Debug.Assert(_micCount <= _micRing.Length, "micCount must not exceed ring length"); return 0; }
 
             // Bounded FIFO (~2 s at current rate): grow up to cap, then drop-oldest + count.
             // Prevents unbounded growth when mic clock runs faster than loopback (drift).
@@ -2306,6 +2312,7 @@ namespace Hearbud
                 _micRing = newBuf;
                 _micR = 0;
                 _micW = _micCount;
+                Debug.Assert(_micCount <= _micRing.Length, "micCount must not exceed ring length");
                 return 0;
             }
 
@@ -2318,6 +2325,7 @@ namespace Hearbud
             }
             long dropped = want - cap;
             Interlocked.Add(ref _micOverrunBlocks, dropped);
+            Debug.Assert(_micCount <= _micRing.Length, "micCount must not exceed ring length");
             return dropped;
         }
 
