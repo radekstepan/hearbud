@@ -394,6 +394,7 @@ MMCSS Pro Audio on writer thread + 1 ms timer; `DumpDir` taps; log cap keeps WAR
 Time/size auto-stop/split (`LimitMinutesText`/`LimitSizeMbText`, `SplitInsteadOfStopCheck`): engine `TotalMixBytesWritten`/`RecordElapsed` getters, 1 s UI poll, split = stop + `(N)` restart.
 Sound test: `TestMicBtn` samples live peak 3 s → dBFS report; `TestSysBtn` synthesizes 1 kHz/1 s tone to temp WAV, plays via `WasapiOut` on selected speaker.
 Hotkeys: `Start/Pause/StopHotkey` settings (`Ctrl+R/P/S` defaults, converter-validated), capture boxes + reset, `RebuildInputBindings` on startup/change.
+Countdown + mini-bar + tray: `CountdownSeconds` (0/3/5/10, cancellable) runs before guard/engine start; `MiniBar` Topmost window (elapsed + levels, Pause/Stop delegate, owned by main); tray Pause/Stop items + balloon tips (no icon swap: single ico).
 
 ### 6. Conditional limiter (tanh only on overs) + peak normalize
 **Decision:** Sum `s*gL + m*gM` at full level, peak-normalize the block only if peak>1, then apply `tanh` soft-knee only to samples with `|x|>1` before clamp.
