@@ -250,12 +250,62 @@ namespace Hearbud
         // Reusable scratch buffer for the resampler (Performance Fix)
         private float[] _resampleScratch = new float[BlockFrames * 8];
 
+        // Polyphase windowed-sinc table for ConvertToTargetChunked.
+        // Table[p,k] = kernel value for fractional position p/32 at tap offset
+        // d = (k - Half + 1) - p/32 (src-sample units, centre = 0).
+        private static class SincPolyphase
+        {
+            public const int Phases = 32;
+            public const int Taps = 12;
+            public const int Half = Taps / 2;       // 6: group delay, src samples
+            public const int HistFrames = Taps + 4; // 16: left-history depth
+            public const double Cutoff = 0.90;      // x src-Nyquist
+            public static readonly float[,] Table = BuildTable();
+
+            private static float[,] BuildTable()
+            {
+                // 4-term Blackman-Harris window, -92 dB sidelobes.
+                const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
+                var t = new float[Phases, Taps];
+                for (int p = 0; p < Phases; p++)
+                {
+                    double frac = (double)p / Phases;
+                    double sum = 0.0;
+                    for (int k = 0; k < Taps; k++)
+                    {
+                        double d = (k - Half + 1) - frac;
+                        double x = Cutoff * d;
+                        double sinc = Math.Abs(x) < 1e-9
+                            ? 1.0
+                            : Math.Sin(Math.PI * x) / (Math.PI * x);
+                        double u = d / Half * 0.5 + 0.5; // [-Half,Half] -> [0,1]
+                        if (u < 0.0) u = 0.0; else if (u > 1.0) u = 1.0;
+                        double w = a0
+                            - a1 * Math.Cos(2.0 * Math.PI * u)
+                            + a2 * Math.Cos(4.0 * Math.PI * u)
+                            - a3 * Math.Cos(6.0 * Math.PI * u);
+                        double h = Cutoff * sinc * w;
+                        t[p, k] = (float)h;
+                        sum += h;
+                    }
+                    // Unity DC gain per phase: flat passband, no level shift.
+                    float inv = (float)(1.0 / sum);
+                    for (int k = 0; k < Taps; k++) t[p, k] *= inv;
+                }
+                return t;
+            }
+        }
+
         // GAP-02: stateful resampler (fractional phase carry, no per-chunk click/drift).
         // Only mic needs it; loopback is passthrough at _outRate/_outChannels.
+        // Sinc version: PrevTail carries HistFrames of source history so the
+        // 12-tap kernel sees identical neighbourhoods in chunked and single-shot
+        // mode (bit-identical output); group delay Half is embraced as latency.
         private sealed class ResamplerState
         {
             public double NextSrcPos;
-            public float[] PrevTail = new float[8];
+            public float[] PrevTail = new float[SincPolyphase.HistFrames * 8];
+            public int PrevFrames;
             public int PrevCh;
             public long TotalSrcFrames;
             public long TotalDstFrames;
@@ -264,10 +314,14 @@ namespace Hearbud
             public int DstRate;
             public void Reset(int srcCh, int srcRate, int dstRate)
             {
-                NextSrcPos = 0; PrevCh = 0; TotalSrcFrames = 0; TotalDstFrames = 0;
+                NextSrcPos = 0; PrevCh = 0; PrevFrames = 0; TotalSrcFrames = 0; TotalDstFrames = 0;
                 SrcCh = srcCh; SrcRate = srcRate; DstRate = dstRate;
+                int need = SincPolyphase.HistFrames * Math.Max(1, srcCh);
+                if (PrevTail.Length < need) PrevTail = new float[need];
+                else Array.Clear(PrevTail, 0, need);
             }
-            public double DelayDstFrames => SrcRate <= 0 ? 0 : (double)DstRate / SrcRate;
+            // True FIR group delay: Half src samples -> dst frames.
+            public double DelayDstFrames => SrcRate <= 0 ? 0 : SincPolyphase.Half * (double)DstRate / SrcRate;
         }
         private readonly ResamplerState _micResamp = new();
         internal double MicResamplerDelaySec => _micResamp.DelayDstFrames / Math.Max(1, _outRate);
@@ -300,8 +354,71 @@ namespace Hearbud
         internal const double ResyncThresholdSec = 0.08;
         internal const int ResyncStreakNeeded = 3;
 
+        // TASK-3 continuous drift trim (PI corrector, RecExperts-style 1-2 ms).
+        internal const double TrimDeadbandSec = 0.002;
+        internal const double TrimTargetFrames = 1.0;
+        internal const int TrimMinSamples = 8;
+        internal const int TrimMaxSamples = 96;
+        internal const int TrimZeroCrossWindow = 32;
+        private const double TrimGainP = 0.25;
+        private const double TrimGainI = 0.02;
+        private double _driftIntegral = 0.0;
+        private const double DriftIntegralMax = 0.005;
+        private long _trimTotalDropped = 0;
+        private long _trimTotalInserted = 0;
+        private long _trimTickDropped = 0;
+        private long _trimTickInserted = 0;
+        public long TrimDropped => Interlocked.Read(ref _trimTotalDropped);
+        public long TrimInserted => Interlocked.Read(ref _trimTotalInserted);
+
         private static readonly double _tickMs = 1000.0 / Stopwatch.Frequency;
         private long _lastLoopTick = 0;
+        private long _lastMicTick = 0;
+        private long _captureGlitchBlocks = 0;
+        private const double CaptureStarvationMs = 50.0;
+        private readonly System.Collections.Concurrent.ConcurrentBag<int> _captureMmcssHandles =
+            new System.Collections.Concurrent.ConcurrentBag<int>();
+
+        /// <summary>Callback gaps &gt; 50 ms observed (WASAPI buffer-overwrite risk).</summary>
+        public long CaptureGlitches => Interlocked.Read(ref _captureGlitchBlocks);
+
+        internal void RecordCallbackTiming(bool isLoop)
+        {
+            long now = Stopwatch.GetTimestamp();
+            long prev = isLoop
+                ? Interlocked.Exchange(ref _lastLoopTick, now)
+                : Interlocked.Exchange(ref _lastMicTick, now);
+            if (prev == 0) return;
+            double gapMs = (now - prev) * _tickMs;
+            if (gapMs > CaptureStarvationMs)
+            {
+                long n = Interlocked.Increment(ref _captureGlitchBlocks);
+                Warn($"Capture starvation: {(isLoop ? "loopback" : "mic")} gap={gapMs:F1}ms (glitch #{n}) — late wakeup risks overwritten WASAPI buffer (click)");
+            }
+        }
+
+        private void EnsureCaptureBoost()
+        {
+            try
+            {
+                if (NativeTiming.IsCaptureBoosted) return;
+                int h = NativeTiming.TryBoostCaptureThread();
+                if (h != 0) _captureMmcssHandles.Add(h);
+            }
+            catch { }
+        }
+
+        private void ReleaseCaptureMmcss()
+        {
+            try
+            {
+                while (_captureMmcssHandles.TryTake(out int h))
+                {
+                    try { NativeTiming.UnboostCaptureThread(h); } catch { }
+                }
+            }
+            catch { }
+        }
         private const int LoopSilentMsThreshold = 200; 
 
         private string _loopDevName = "";
@@ -327,6 +444,7 @@ namespace Hearbud
         // GAP-01: 1 ms system timer + MMCSS "Pro Audio" for our own threads.
         // CSCore owns the WASAPI callback threads, so we pin what we own (writer thread)
         // and raise timer resolution during capture; documented in ARCHITECTURE.
+        // TASK-2: capture threads boost themselves via TryBoostCaptureThread (once per thread).
         private static class NativeTiming
         {
             [System.Runtime.InteropServices.DllImport("winmm.dll")]
@@ -337,9 +455,43 @@ namespace Hearbud
             private static extern int AvSetMmThreadCharacteristicsW(string taskName, ref uint taskIndex);
             [System.Runtime.InteropServices.DllImport("avrt.dll")]
             private static extern bool AvRevertMmThreadCharacteristics(int handle);
+            [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+            private static extern IntPtr GetCurrentThread();
+            [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+            private static extern bool SetThreadPriority(IntPtr hThread, int nPriority);
+            private const int THREAD_PRIORITY_TIME_CRITICAL = 15;
 
-            public static void Begin1Ms() { try { if (OperatingSystem.IsWindows()) timeBeginPeriod(1); } catch { } }
-            public static void End1Ms() { try { if (OperatingSystem.IsWindows()) timeEndPeriod(1); } catch { } }
+            private static int s_timerRef = 0;
+
+            private static readonly ThreadLocal<int> s_captureHandle =
+                new ThreadLocal<int>(() => 0, trackAllValues: true);
+            private static readonly ThreadLocal<string?> s_captureTask =
+                new ThreadLocal<string?>(() => null, trackAllValues: true);
+
+            public static bool IsCaptureBoosted => s_captureTask.Value != null;
+
+            public static void Begin1Ms()
+            {
+                try
+                {
+                    if (!OperatingSystem.IsWindows()) return;
+                    if (Interlocked.Increment(ref s_timerRef) == 1) timeBeginPeriod(1);
+                }
+                catch { }
+            }
+            public static void End1Ms()
+            {
+                try
+                {
+                    if (!OperatingSystem.IsWindows()) return;
+                    if (Interlocked.Decrement(ref s_timerRef) <= 0)
+                    {
+                        Interlocked.Exchange(ref s_timerRef, 0);
+                        timeEndPeriod(1);
+                    }
+                }
+                catch { }
+            }
             public static int BoostCurrentThread()
             {
                 try
@@ -353,6 +505,55 @@ namespace Hearbud
             public static void Unboost(int handle)
             {
                 try { if (OperatingSystem.IsWindows() && handle != 0) AvRevertMmThreadCharacteristics(handle); } catch { }
+            }
+
+            public static int TryBoostCaptureThread()
+            {
+                try
+                {
+                    if (!OperatingSystem.IsWindows()) return 0;
+                    if (s_captureTask.Value != null) return s_captureHandle.Value;
+                    int h = 0;
+                    try
+                    {
+                        uint idx = 0;
+                        h = AvSetMmThreadCharacteristicsW("Pro Audio", ref idx);
+                    }
+                    catch { h = 0; }
+                    try { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL); } catch { }
+                    if (h != 0)
+                    {
+                        s_captureHandle.Value = h;
+                        s_captureTask.Value = "Pro Audio";
+                    }
+                    return h;
+                }
+                catch { return 0; }
+            }
+
+            public static void UnboostCaptureThread(int handle)
+            {
+                try
+                {
+                    if (OperatingSystem.IsWindows() && handle != 0)
+                        AvRevertMmThreadCharacteristics(handle);
+                }
+                catch { }
+                finally
+                {
+                    try
+                    {
+                        if (s_captureHandle.IsValueCreated && s_captureHandle.Value == handle)
+                            s_captureHandle.Value = 0;
+                    }
+                    catch { }
+                    try
+                    {
+                        if (s_captureTask.IsValueCreated && s_captureHandle.Value == 0)
+                            s_captureTask.Value = null;
+                    }
+                    catch { }
+                }
             }
         }
         private FileStream? _dumpMic;
@@ -458,6 +659,8 @@ namespace Hearbud
             _micUnderrunBlocks = 0;
             _micOverrunBlocks = 0;
             _loopOverrunBlocks = 0;
+            _lastMicTick = 0;
+            Interlocked.Exchange(ref _captureGlitchBlocks, 0);
             _silencedSamples = 0;
             _loopBlockCounter = 0;
             _masterFramesEmitted = 0;
@@ -654,6 +857,7 @@ namespace Hearbud
 
             lock (_devLock) { _reopenCts?.Cancel(); _loopLost = _micLost = false; }
             FinalizeWavFiles();
+            ReleaseCaptureMmcss();
             NativeTiming.End1Ms();
 
             // Stop the write queue if it's still running. 
@@ -961,6 +1165,8 @@ namespace Hearbud
                 _activeMicDeviceId  = "";
             }
 
+            ReleaseCaptureMmcss();
+
             if (fullStop) Info("Stopped.");
         }
 
@@ -1093,7 +1299,9 @@ namespace Hearbud
 
         private void OnMicData(object? sender, DataAvailableEventArgs e)
         {
+            EnsureCaptureBoost();
             if (_micSrc == null || _micIn == null || _micCap == null) return;
+            RecordCallbackTiming(isLoop: false);
             try
             {
                 int blockAlignBytes = _micIn.WaveFormat.BlockAlign; 
@@ -1228,11 +1436,12 @@ namespace Hearbud
 
         private void OnLoopbackData(object? sender, DataAvailableEventArgs e)
         {
+            EnsureCaptureBoost();
             if (_loopSrc == null || _loopCap == null || _loopIn == null) return;
+            RecordCallbackTiming(isLoop: true);
 
             try
             {
-                _lastLoopTick = Stopwatch.GetTimestamp();
 
                 int bytesPerFrame = _loopIn.WaveFormat.BlockAlign; 
                 if (bytesPerFrame <= 0) return;
@@ -1306,8 +1515,9 @@ namespace Hearbud
                         Warn($"Loop ring overrun: dropped {loopDropped} samples (total {totalLoop})");
                 }
 
-                // --- Diagnostics + master-clock resync ---
+                // --- Diagnostics + continuous drift trim + master-clock resync ---
                 double backlogSec = MicBacklogSec();
+                if (!_paused) backlogSec = TryGentleTrim(backlogSec);
                 int snapshotMicCount;
                 lock (_micRingLock) snapshotMicCount = _micCount;
                 _lastMicBacklogSec = backlogSec;
@@ -1336,7 +1546,11 @@ namespace Hearbud
                     long over = Interlocked.Read(ref _micOverrunBlocks);
                     long under = Interlocked.Read(ref _micUnderrunBlocks);
                     long loopOver = Interlocked.Read(ref _loopOverrunBlocks);
-                    Info($"lagTime={backlogSec:F3}s micDepth={snapshotMicCount} over={over} loopOver={loopOver} under={under} silenced={_silencedSamples} backlogMax={_micBacklogSecMax:F3}s masterFrames={_masterFramesEmitted} resyncs={_resyncCount} lagWatch={(backlogSec > 0.08 ? "LAG" : "ok")}");
+                    long trimD = Interlocked.Exchange(ref _trimTickDropped, 0);
+                    long trimI = Interlocked.Exchange(ref _trimTickInserted, 0);
+                    long trimDTot = Interlocked.Read(ref _trimTotalDropped);
+                    long trimITot = Interlocked.Read(ref _trimTotalInserted);
+                    Info($"lagTime={backlogSec:F3}s micDepth={snapshotMicCount} over={over} loopOver={loopOver} under={under} silenced={_silencedSamples} backlogMax={_micBacklogSecMax:F3}s masterFrames={_masterFramesEmitted} resyncs={_resyncCount} trim={trimD}/{trimI}/s trimTot={trimDTot}/{trimITot} lagWatch={(backlogSec > 0.08 ? "LAG" : "ok")}");
                 }
                 else if (_loopBlockCounter % BacklogLogEveryNBlocks == 0)
                 {
@@ -1423,25 +1637,56 @@ namespace Hearbud
                 EnsureCapacity(ref scratch, Math.Max(1, srcCh * dstFrames));
                 temp = scratch;
 
+                const int Taps = SincPolyphase.Taps;
+                const int Half = SincPolyphase.Half;
+                const int Phases = SincPolyphase.Phases;
+                var table = SincPolyphase.Table; // local alias, no per-tap static lookup
+
                 double ratio = (double)srcRate / dstRate;
                 int di = 0;
                 for (int f = 0; f < dstFrames; f++)
                 {
-                    double sp = st.NextSrcPos + f * ratio;
-                    int i0 = (int)Math.Floor(sp);
-                    double t = sp - i0;
-                    int i1 = i0 + 1;
+                    // Linear-phase kernel centred Half src samples in the past:
+                    // every tap is causal in [history|chunk], so chunked and
+                    // single-shot read identical sample values (bit-identical).
+                    double cp = st.NextSrcPos + f * ratio - Half;
+                    int i0 = (int)Math.Floor(cp);
+                    double frac = cp - i0;
+                    int ph = (int)(frac * Phases);
+                    if (ph < 0) ph = 0; else if (ph >= Phases) ph = Phases - 1;
+                    int baseIdx = i0 - Half + 1;
                     for (int c = 0; c < srcCh; c++)
                     {
-                        float s0 = i0 < 0 ? st.PrevTail[c] : src[i0 * srcCh + c];
-                        float s1 = i1 >= srcFrames ? src[(srcFrames - 1) * srcCh + c] : src[i1 * srcCh + c];
-                        temp[di++] = (float)(s0 + (s1 - s0) * t);
+                        double acc = 0.0;
+                        for (int k = 0; k < Taps; k++)
+                        {
+                            int idx = baseIdx + k;
+                            float s;
+                            if (idx >= 0)
+                                s = idx < srcFrames ? src[idx * srcCh + c] : src[(srcFrames - 1) * srcCh + c];
+                            else
+                            {
+                                int h = st.PrevFrames + idx;
+                                s = h >= 0 ? st.PrevTail[h * srcCh + c] : 0f;
+                            }
+                            acc += s * table[ph, k];
+                        }
+                        temp[di++] = (float)acc;
                     }
                 }
                 tempFrames = dstFrames;
                 st.NextSrcPos = (st.NextSrcPos + dstFrames * ratio) - srcFrames;
-                if (st.PrevTail.Length < srcCh) Array.Resize(ref st.PrevTail, srcCh);
-                Array.Copy(src, (srcFrames - 1) * srcCh, st.PrevTail, 0, srcCh);
+                // Carry the last HistFrames source frames (merge-shift handles
+                // chunks shorter than the history window). Zero heap allocs on
+                // the steady-state path unless the channel count grows.
+                int needTail = SincPolyphase.HistFrames * srcCh;
+                if (st.PrevTail.Length < needTail) Array.Resize(ref st.PrevTail, needTail);
+                int copyFrames = Math.Min(srcFrames, SincPolyphase.HistFrames);
+                int keepFrames = Math.Min(st.PrevFrames, SincPolyphase.HistFrames - copyFrames);
+                if (keepFrames > 0)
+                    Array.Copy(st.PrevTail, (st.PrevFrames - keepFrames) * srcCh, st.PrevTail, 0, keepFrames * srcCh);
+                Array.Copy(src, (srcFrames - copyFrames) * srcCh, st.PrevTail, keepFrames * srcCh, copyFrames * srcCh);
+                st.PrevFrames = keepFrames + copyFrames;
                 st.PrevCh = srcCh;
                 st.TotalSrcFrames += srcFrames;
                 st.TotalDstFrames += dstFrames;
@@ -1694,6 +1939,123 @@ namespace Hearbud
                 return true;
             }
             return false;
+        }
+
+        private double TryGentleTrim(double backlogSec)
+        {
+            int ch = Math.Max(1, _outChannels);
+            int rate = Math.Max(1, _outRate);
+            double targetSec = TrimTargetFrames * FixedFramesPerChannel / (double)rate + MicResamplerDelaySec;
+            double errorSec = backlogSec - targetSec;
+            double aerr = errorSec < 0 ? -errorSec : errorSec;
+            if (aerr < TrimDeadbandSec) return backlogSec;
+            if (aerr >= ResyncThresholdSec) return backlogSec;
+            _driftIntegral = _driftIntegral * 0.999 + errorSec;
+            if (_driftIntegral > DriftIntegralMax) _driftIntegral = DriftIntegralMax;
+            else if (_driftIntegral < -DriftIntegralMax) _driftIntegral = -DriftIntegralMax;
+            double corrFloats = errorSec * rate * ch * TrimGainP
+                             + _driftIntegral * rate * ch * TrimGainI;
+            int want = (int)(corrFloats < 0 ? corrFloats - 0.5 : corrFloats + 0.5);
+            int mag = want < 0 ? -want : want;
+            if (mag < TrimMinSamples) want = want < 0 ? -TrimMinSamples : TrimMinSamples;
+            else if (mag > TrimMaxSamples) want = want < 0 ? -TrimMaxSamples : TrimMaxSamples;
+            want -= want % ch;
+            if (want == 0) want = errorSec > 0 ? ch : -ch;
+            mag = want < 0 ? -want : want;
+            if (mag > TrimMaxSamples) want = want < 0 ? -(TrimMaxSamples / ch * ch) : (TrimMaxSamples / ch * ch);
+            int dropped = 0, inserted = 0;
+            lock (_micRingLock)
+            {
+                if (want > 0)
+                {
+                    int drop = want;
+                    if (drop > _micCount) drop = (_micCount / ch) * ch;
+                    if (drop > 0)
+                    {
+                        drop = FindZeroCrossDrop(_micRing, _micR, _micCount, drop, ch);
+                        if (drop > TrimMaxSamples) drop = (TrimMaxSamples / ch) * ch;
+                        _micR = (_micR + drop) % _micRing.Length;
+                        _micCount -= drop;
+                        dropped = drop;
+                    }
+                }
+                else
+                {
+                    int ins = -want;
+                    EnsureRingCapacity_NoLog_NeedsLock(ins);
+                    if (ins > _micRing.Length - _micCount) ins = ((_micRing.Length - _micCount) / ch) * ch;
+                    if (ins > 0)
+                    {
+                        float last = _micCount > 0
+                            ? _micRing[(_micW - 1 + _micRing.Length) % _micRing.Length]
+                            : 0f;
+                        for (int i = 0; i < ins; i++)
+                        {
+                            float t = (float)(i + 1) / ins;
+                            _micRing[_micW] = last * (1f - t);
+                            _micW = (_micW + 1) % _micRing.Length;
+                            _micCount++;
+                        }
+                        inserted = ins;
+                    }
+                }
+                backlogSec = (double)_micCount / (ch * rate) + MicResamplerDelaySec;
+            }
+            if (dropped > 0) { Interlocked.Add(ref _trimTotalDropped, dropped); Interlocked.Add(ref _trimTickDropped, dropped); }
+            if (inserted > 0) { Interlocked.Add(ref _trimTotalInserted, inserted); Interlocked.Add(ref _trimTickInserted, inserted); }
+            return backlogSec;
+        }
+
+        private int FindZeroCrossDrop(float[] ring, int r, int count, int nominal, int ch)
+        {
+            int half = TrimZeroCrossWindow / 2;
+            int lo = ((nominal - half) / ch) * ch;
+            int hi = ((nominal + half) / ch) * ch;
+            if (lo < ch) lo = ch;
+            if (hi > count) hi = (count / ch) * ch;
+            if (hi <= lo) return (nominal / ch) * ch;
+            int best = (nominal / ch) * ch;
+            int bestQ = int.MaxValue;
+            for (int cand = lo; cand <= hi; cand += ch)
+            {
+                int idx = (r + cand) % ring.Length;
+                float a = ring[idx] < 0 ? -ring[idx] : ring[idx];
+                float m = a;
+                if (ch > 1)
+                {
+                    float s = ring[(idx + 1) % ring.Length];
+                    float b = s < 0 ? -s : s;
+                    if (b > m) m = b;
+                }
+                int q = (int)(m * 32768f);
+                if (q < bestQ) { bestQ = q; best = cand; if (q == 0) break; }
+            }
+            return best;
+        }
+
+        private long EnsureRingCapacity_NoLog_NeedsLock(int roomNeeded)
+        {
+            if (_micRing.Length - _micCount >= roomNeeded) return 0;
+            int cap = Math.Max(_micRing.Length, _outRate * _outChannels * 2);
+            int want = _micCount + roomNeeded;
+            if (want <= cap)
+            {
+                int newLen = Math.Min(cap, NextPow2(want));
+                if (newLen <= _micRing.Length) return 0;
+                var newBuf = new float[newLen];
+                for (int i = 0; i < _micCount; i++)
+                    newBuf[i] = _micRing[(_micR + i) % _micRing.Length];
+                _micRing = newBuf;
+                _micR = 0;
+                _micW = _micCount;
+                return 0;
+            }
+            int drop = want - cap;
+            drop = Math.Min(drop, _micCount);
+            if (drop > 0) { _micR = (_micR + drop) % _micRing.Length; _micCount -= drop; }
+            long dropped = want - cap;
+            Interlocked.Add(ref _micOverrunBlocks, dropped);
+            return dropped;
         }
 
         private void EmitFixedMix(float[] loopFrame, float[] micFrame, int n)

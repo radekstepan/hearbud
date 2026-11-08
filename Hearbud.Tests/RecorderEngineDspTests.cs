@@ -914,4 +914,258 @@ public class RecorderEngineDspTests
         Assert.False((bool)m.Invoke(engine, new object[] { 0.01 })!);
         Assert.Equal(0L, Field<long>(engine, "_resyncCount"));
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TASK-1 sinc resampler (SincPolyphase + ResamplerState)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static Type SincType()
+    {
+        var t = EngineType.GetNestedType("SincPolyphase",
+            BindingFlags.NonPublic | BindingFlags.Public);
+        Assert.True(t != null, "Nested type 'SincPolyphase' not found.");
+        return t!;
+    }
+
+    [Fact]
+    public void Sinc_Table_Dimensions_And_DC_Normalized()
+    {
+        var t = SincType();
+        Assert.Equal(32, (int)t.GetField("Phases")!.GetValue(null)!);
+        Assert.Equal(12, (int)t.GetField("Taps")!.GetValue(null)!);
+        Assert.Equal(6, (int)t.GetField("Half")!.GetValue(null)!);
+        var table = (float[,])t.GetField("Table")!.GetValue(null)!;
+        Assert.Equal(32, table.GetLength(0));
+        Assert.Equal(12, table.GetLength(1));
+        // Each phase must have unity DC gain (flat passband, no level shift).
+        for (int p = 0; p < 32; p++)
+        {
+            double sum = 0;
+            for (int k = 0; k < 12; k++) sum += table[p, k];
+            Assert.InRange(sum, 0.999, 1.001);
+        }
+    }
+
+    [Fact]
+    public void Sinc_DelayDstFrames_ReflectsHalf()
+    {
+        // Half=6 src samples -> dst frames: 6 * dst/src.
+        var st = NewResamplerState(1, 16000, 48000);
+        var prop = st.GetType().GetProperty("DelayDstFrames")!;
+        double delay = (double)prop.GetValue(st)!;
+        Assert.Equal(6.0 * 48000 / 16000, delay, precision: 6);
+    }
+
+    [Fact]
+    public void Sinc_ChunkedVsSingle_BitIdentical()
+    {
+        // 16 kHz mono sine, chunked vs single-shot must be bit-identical
+        // (linear-phase kernel centred in the past; old linear impl failed this).
+        var srcFmt = new CSCore.WaveFormat(16000, 16, 1);
+        int total = 4800;
+        var src = new float[total];
+        for (int i = 0; i < total; i++) src[i] = (float)Math.Sin(2 * Math.PI * 1000 * i / 16000);
+
+        float[] dstSingle = new float[20000];
+        float[] scrSingle = new float[20000];
+        int nSingle = InvokeConvertToTarget(src, total, srcFmt, 48000, 1, ref dstSingle, ref scrSingle);
+
+        var st = NewResamplerState(1, 16000, 48000);
+        var chunked = new System.Collections.Generic.List<float>();
+        int chunk = 160;
+        for (int off = 0; off < total; off += chunk)
+        {
+            int n = Math.Min(chunk, total - off);
+            var piece = new float[n];
+            Array.Copy(src, off, piece, 0, n);
+            float[] d = new float[1000];
+            float[] s = new float[1000];
+            int got = InvokeChunked(piece, n, srcFmt, 48000, 1, ref d, ref s, st);
+            for (int i = 0; i < got; i++) chunked.Add(d[i]);
+        }
+
+        Assert.Equal(nSingle, chunked.Count);
+        double maxDiff = 0;
+        for (int i = 0; i < nSingle; i++)
+            maxDiff = Math.Max(maxDiff, Math.Abs(dstSingle[i] - chunked[i]));
+        Assert.True(maxDiff == 0.0, $"sinc chunked vs single must be bit-identical, got {maxDiff}");
+    }
+
+    [Fact]
+    public void Sinc_ShortChunks_HistoryMerge_StillIdentical()
+    {
+        // Chunks shorter than HistFrames (16) exercise the merge-shift path.
+        var srcFmt = new CSCore.WaveFormat(16000, 16, 1);
+        int total = 480;
+        var src = new float[total];
+        for (int i = 0; i < total; i++) src[i] = (float)Math.Sin(2 * Math.PI * 500 * i / 16000);
+
+        float[] dstSingle = new float[4000];
+        float[] scrSingle = new float[4000];
+        int nSingle = InvokeConvertToTarget(src, total, srcFmt, 48000, 1, ref dstSingle, ref scrSingle);
+
+        var st = NewResamplerState(1, 16000, 48000);
+        var chunked = new System.Collections.Generic.List<float>();
+        int chunk = 8; // < HistFrames
+        for (int off = 0; off < total; off += chunk)
+        {
+            int n = Math.Min(chunk, total - off);
+            var piece = new float[n];
+            Array.Copy(src, off, piece, 0, n);
+            float[] d = new float[500];
+            float[] s = new float[500];
+            int got = InvokeChunked(piece, n, srcFmt, 48000, 1, ref d, ref s, st);
+            for (int i = 0; i < got; i++) chunked.Add(d[i]);
+        }
+
+        Assert.Equal(nSingle, chunked.Count);
+        double maxDiff = 0;
+        for (int i = 0; i < nSingle; i++)
+            maxDiff = Math.Max(maxDiff, Math.Abs(dstSingle[i] - chunked[i]));
+        Assert.True(maxDiff == 0.0, $"short-chunk history merge must stay bit-identical, got {maxDiff}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TASK-3 continuous drift trim (TryGentleTrim)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static double InvokeTrim(object engine, double backlogSec)
+        => (double)GetInstance("TryGentleTrim").Invoke(engine, new object[] { backlogSec })!;
+
+    [Fact]
+    public void Trim_Deadband_NoOp()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        // Target with zero resampler delay = 1 frame = 960 floats = 0.01 s.
+        SetField(engine, "_micCount", 960);
+        long before = engine.TrimDropped + engine.TrimInserted;
+        double outBacklog = InvokeTrim(engine, 0.01);
+        Assert.Equal(0.01, outBacklog, precision: 9);
+        Assert.Equal(before, engine.TrimDropped + engine.TrimInserted);
+    }
+
+    [Fact]
+    public void Trim_SmallPositive_DropsBounded_AndCounts()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        var ring = Field<float[]>(engine, "_micRing");
+        Assert.True(ring.Length >= 1920);
+        SetField(engine, "_micR", 0);
+        SetField(engine, "_micW", 1920 % ring.Length);
+        SetField(engine, "_micCount", 1920); // backlog 0.02 s, 10 ms over target
+        double outBacklog = InvokeTrim(engine, 0.02);
+        // Must trim 8..96 floats (frame-aligned), never burst-drop to one frame.
+        long dropped = engine.TrimDropped;
+        Assert.InRange(dropped, 8, 96);
+        Assert.Equal(1920 - (int)dropped, Field<int>(engine, "_micCount"));
+        Assert.True(outBacklog < 0.02 && outBacklog >= 0.018);
+        Assert.Equal(0L, Field<long>(engine, "_resyncCount"));
+    }
+
+    [Fact]
+    public void Trim_LargeBacklog_Passthrough_ToResync()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        var ring = Field<float[]>(engine, "_micRing");
+        int fill = Math.Min(ring.Length - 1, 48000);
+        SetField(engine, "_micR", 0);
+        SetField(engine, "_micW", fill % ring.Length);
+        SetField(engine, "_micCount", fill);
+        double outBacklog = InvokeTrim(engine, 0.5);
+        Assert.Equal(0.5, outBacklog, precision: 9); // >=80 ms: leave to CheckLagResync
+        Assert.Equal(0L, engine.TrimDropped);
+        Assert.Equal(fill, Field<int>(engine, "_micCount"));
+    }
+
+    [Fact]
+    public void Trim_Negative_InsertsFade_AndCounts()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        SetField(engine, "_micR", 0);
+        SetField(engine, "_micW", 0);
+        SetField(engine, "_micCount", 0); // backlog 0, 10 ms under target
+        double outBacklog = InvokeTrim(engine, 0.0);
+        long inserted = engine.TrimInserted;
+        Assert.InRange(inserted, 8, 96);
+        Assert.Equal((int)inserted, Field<int>(engine, "_micCount"));
+        Assert.True(outBacklog > 0.0 && outBacklog <= 0.002);
+    }
+
+    [Fact]
+    public void Trim_ZeroCrossDrop_IsFrameAligned_WithinWindow()
+    {
+        using var engine = new RecorderEngine();
+        var m = GetInstance("FindZeroCrossDrop");
+        var ring = new float[4096];
+        for (int i = 0; i < ring.Length; i++)
+            ring[i] = (float)Math.Sin(2 * Math.PI * 440 * i / 48000);
+        int got = (int)m.Invoke(engine, new object[] { ring, 100, 2000, 90, 2 })!;
+        Assert.Equal(0, got % 2); // frame-aligned for stereo
+        Assert.InRange(got, 90 - 16, 90 + 16);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TASK-2 capture scheduling (RecordCallbackTiming / MMCSS helpers)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Capture_RecordTiming_FirstCall_NoGlitch_ThenGap_Counts()
+    {
+        using var engine = new RecorderEngine();
+        var m = GetInstance("RecordCallbackTiming");
+        // First call per source: prev == 0, no delta yet.
+        SetField(engine, "_lastMicTick", 0L);
+        m.Invoke(engine, new object[] { false });
+        Assert.Equal(0L, engine.CaptureGlitches);
+
+        // Simulate a 60 ms gap on loopback by back-dating the tick.
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        long sixtyMs = (long)(System.Diagnostics.Stopwatch.Frequency * 0.06);
+        SetField(engine, "_lastLoopTick", now - sixtyMs);
+        m.Invoke(engine, new object[] { true });
+        Assert.Equal(1L, engine.CaptureGlitches);
+
+        // Immediate follow-up (<50 ms) must not count again.
+        m.Invoke(engine, new object[] { true });
+        Assert.Equal(1L, engine.CaptureGlitches);
+    }
+
+    [Fact]
+    public void Capture_BoostAndRelease_AreSafe_Idempotent()
+    {
+        using var engine = new RecorderEngine();
+        var ensure = GetInstance("EnsureCaptureBoost");
+        var release = GetInstance("ReleaseCaptureMmcss");
+        // Must never throw, even on Linux where MMCSS is a no-op (returns 0).
+        ensure.Invoke(engine, null);
+        ensure.Invoke(engine, null);
+        release.Invoke(engine, null);
+        release.Invoke(engine, null);
+        Assert.True(engine.CaptureGlitches >= 0);
+    }
+
+    [Fact]
+    public void NativeTiming_BeginEnd_RefCounted_Idempotent()
+    {
+        var nested = EngineType.GetNestedType("NativeTiming",
+            BindingFlags.NonPublic | BindingFlags.Public)!;
+        var begin = nested.GetMethod("Begin1Ms",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)!;
+        var end = nested.GetMethod("End1Ms",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)!;
+        // Unbalanced extra End must not throw nor underflow (idempotent drain).
+        begin.Invoke(null, null);
+        begin.Invoke(null, null);
+        end.Invoke(null, null);
+        end.Invoke(null, null);
+        end.Invoke(null, null);
+    }
 }
