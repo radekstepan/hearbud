@@ -393,6 +393,7 @@ MMCSS Pro Audio on writer thread + 1 ms timer; `DumpDir` taps; log cap keeps WAR
 **Decision:** `Pause()`/`Resume()`/`IsPaused` keep files open and emit silence frames (timeline preserved, meters frozen, resync skipped, loop clock re-armed on resume). Source checkboxes gate device IDs (`null` = disabled); Start requires at-least-one ("Keep system audio or microphone on"). Loopback is optional in `OpenDevicesAsync` (mic drives clock, format derived from mic). Pre-start `CheckDiskSpaceAndWritable` probes folder + zero-byte write, warns <500 MB and blocks <100 MB.
 Time/size auto-stop/split (`LimitMinutesText`/`LimitSizeMbText`, `SplitInsteadOfStopCheck`): engine `TotalMixBytesWritten`/`RecordElapsed` getters, 1 s UI poll, split = stop + `(N)` restart.
 Sound test: `TestMicBtn` samples live peak 3 s → dBFS report; `TestSysBtn` synthesizes 1 kHz/1 s tone to temp WAV, plays via `WasapiOut` on selected speaker.
+Hotkeys: `Start/Pause/StopHotkey` settings (`Ctrl+R/P/S` defaults, converter-validated), capture boxes + reset, `RebuildInputBindings` on startup/change.
 
 ### 6. Conditional limiter (tanh only on overs) + peak normalize
 **Decision:** Sum `s*gL + m*gM` at full level, peak-normalize the block only if peak>1, then apply `tanh` soft-knee only to samples with `|x|>1` before clamp.
