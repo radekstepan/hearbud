@@ -221,6 +221,87 @@ namespace Hearbud
             }
         }
 
+        private const long FreeSpaceWarnBytes = 500L * 1024 * 1024;
+        private const long FreeSpaceBlockBytes = 100L * 1024 * 1024;
+
+        /// <summary>
+        /// GAP-09 pre-flight: verifies the output folder exists/is writable (zero-byte probe
+        /// file create+delete) and checks free space on its volume. Warns below 500 MB,
+        /// blocks below 100 MB. Returns false when recording must not start.
+        /// UNC paths (no DriveInfo) skip the space check but still get the probe.
+        /// </summary>
+        private bool CheckDiskSpaceAndWritable(string outDir)
+        {
+            try
+            {
+                Directory.CreateDirectory(outDir);
+            }
+            catch (Exception ex)
+            {
+                WpfMessageBox.Show(
+                    $"Cannot create output folder:\n{outDir}\n{ex.Message}",
+                    "Folder Not Writable",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                return false;
+            }
+
+            try
+            {
+                var probe = Path.Combine(outDir, ".hearbud-write-test.tmp");
+                File.WriteAllBytes(probe, Array.Empty<byte>());
+                File.Delete(probe);
+            }
+            catch (Exception ex)
+            {
+                WpfMessageBox.Show(
+                    $"Cannot write to output folder:\n{outDir}\n{ex.Message}\n\nCheck permissions or choose another folder.",
+                    "Folder Not Writable",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                return false;
+            }
+
+            try
+            {
+                var root = Path.GetPathRoot(Path.GetFullPath(outDir));
+                if (!string.IsNullOrEmpty(root))
+                {
+                    var drive = new DriveInfo(root);
+                    if (drive.IsReady && (drive.DriveType == DriveType.Fixed || drive.DriveType == DriveType.Removable))
+                    {
+                        long free = drive.AvailableFreeSpace;
+                        double freeMb = free / (1024.0 * 1024.0);
+                        if (free < FreeSpaceBlockBytes)
+                        {
+                            WpfMessageBox.Show(
+                                $"Only {freeMb:F0} MB free on {drive.Name}. Recording is blocked below 100 MB to avoid corrupt/truncated files.\n\nFree up space or choose another folder.",
+                                "Disk Full",
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Error);
+                            return false;
+                        }
+                        if (free < FreeSpaceWarnBytes)
+                        {
+                            var answer = WpfMessageBox.Show(
+                                $"Only {freeMb:F0} MB free on {drive.Name} (warning threshold 500 MB).\nA 1-hour stereo session can use ~1.4 GB (mix only) or ~2.8 GB (with stems).\n\nContinue anyway?",
+                                "Low Disk Space",
+                                MessageBoxButton.YesNo,
+                                MessageBoxImage.Warning);
+                            if (answer != MessageBoxResult.Yes)
+                                return false;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Non-fatal: UNC/network paths or DriveInfo failures skip the space check (probe already passed).
+            }
+
+            return true;
+        }
+
         private async void OnStart(object? sender, RoutedEventArgs? e)
         {
             try
@@ -253,6 +334,14 @@ namespace Hearbud
                         MessageBoxImage.Warning);
                     return;
                 }
+
+                // GAP-09 free-space / permission guard (UI-only pre-flight; engine disk path untouched).
+                // Worst-case write rate: mix float32 stereo @48kHz = 48000*2*4 = 384 kB/s (~23 MB/min),
+                // plus 2x int16 stems adds another ~384 kB/s when WriteStems is on (~46 MB/min total,
+                // ~2.8 GB for a 1 h session). Thresholds are conservative fixed floors, not estimates:
+                // warn below 500 MB (~20 min headroom), block below 100 MB (a few minutes + MP3 temp).
+                if (!CheckDiskSpaceAndWritable(outDir))
+                    return;
 
                 var micName = MicCombo.SelectedItem as string;
                 var spkName = SpeakerCombo.SelectedItem as string;
