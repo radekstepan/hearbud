@@ -4,8 +4,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="Hearbud" Height="518" Width="960"
-        MinHeight="518" MinWidth="900"
+        Title="Hearbud" Height="590" Width="960"
+        MinHeight="590" MinWidth="900"
         ResizeMode="CanMinimize"
         Background="{StaticResource AppBackground}"
         Foreground="{StaticResource ControlForeground}"
@@ -69,7 +69,20 @@
                     <CheckBox x:Name="WriteStemsCheck" Content="Save separate mic/system stems"
                               IsChecked="True" Margin="0,12,0,0"/>
                     <CheckBox x:Name="IncludeMicCheck" Content="Include microphone"
-                              IsChecked="True" Margin="0,4,0,0"/>
+                               IsChecked="True" Margin="0,4,0,0"/>
+                    <!-- GAP-09: optional auto-stop / auto-split limits (0 = off).
+                         Time is wall-clock (pause does not stop it); size counts mix payload bytes. -->
+                    <TextBlock Text="Auto-stop / split limits (0 = off)" Margin="0,12,0,0" FontWeight="SemiBold"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0" VerticalAlignment="Center">
+                        <TextBox x:Name="LimitMinutesText" Width="50" VerticalAlignment="Center"
+                                 AutomationProperties.Name="Auto-stop time limit in minutes"/>
+                        <TextBlock Text="min" Margin="4,0,12,0" VerticalAlignment="Center"/>
+                        <TextBox x:Name="LimitSizeMbText" Width="60" VerticalAlignment="Center"
+                                 AutomationProperties.Name="Auto-stop size limit in megabytes of mix audio"/>
+                        <TextBlock Text="MB (mix)" Margin="4,0,0,0" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <CheckBox x:Name="SplitInsteadOfStopCheck" Content="Split into new file instead of stopping"
+                               Margin="0,4,0,0"/>
                 </StackPanel>
             </GroupBox>
 

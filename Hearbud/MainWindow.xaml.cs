@@ -11,6 +11,7 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Controls; // ComboBoxItem
+using System.Windows.Threading;
 
 using WpfMessageBox = System.Windows.MessageBox;
 using WinFormsFolderBrowserDialog = System.Windows.Forms.FolderBrowserDialog;
@@ -24,6 +25,19 @@ namespace Hearbud
     private readonly System.Timers.Timer _uiTimer = new(100);
     private TaskbarIcon? _trayIcon;
     private MMDeviceEnumerator? _notifEnumerator;
+
+    // GAP-09 auto-stop / auto-split state. Polled on the UI thread once per
+    // second while recording. Timer stops on Stopped status (re-entrancy guard:
+    // _autoActionRunning ensures one trigger at a time).
+    private readonly DispatcherTimer _limitTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private double _limitMinutes;
+    private long _limitSizeBytes;
+    private bool _splitMode;
+    private string _splitOutDir = "";
+    private string _splitBaseName = "";
+    private int _splitIndex = 1;
+    private bool _autoActionRunning;
+    private bool _suppressStopUi;
 
     private AppSettings _settings = AppSettings.Load();
         private readonly Dictionary<string, MMDevice> _micDict = new();
@@ -83,6 +97,8 @@ namespace Hearbud
 
                 _uiTimer.Elapsed += (_, __) => Dispatcher.Invoke(UpdateMeters);
                 _uiTimer.Start();
+
+                _limitTimer.Tick += OnLimitTimerTick;
             }
             catch (Exception ex)
             {
@@ -370,15 +386,18 @@ namespace Hearbud
                 _engine.MicGain = MicGain.Value;   // meters & mix balance
                 _engine.LoopGain = LoopGain.Value; // meters & mix balance
 
-                await _engine.StartAsync(new RecorderStartOptions
-                {
-                    OutputPath = Path.Combine(outDir, baseName),
-                    LoopbackDeviceId = wantSys && spkName != null ? _spkDict[spkName].DeviceID : null,
-                    MicDeviceId = wantMic && micName != null ? _micDict[micName].DeviceID : null,
-                    Mp3BitrateKbps = GetSelectedBitrateKbps(),
-                    IncludeMic = wantMic,
-                    WriteStems = WriteStemsCheck.IsChecked ?? true
-                });
+                await _engine.StartAsync(BuildStartOptions(outDir, baseName));
+
+                // GAP-09: arm optional time/size limits (0 = off; unparsable = off).
+                _splitOutDir = outDir;
+                _splitBaseName = baseName;
+                _splitIndex = 1;
+                _limitMinutes = ParseNonNegativeMinutes(LimitMinutesText.Text);
+                _limitSizeBytes = ParseNonNegativeSizeBytes(LimitSizeMbText.Text);
+                _splitMode = SplitInsteadOfStopCheck.IsChecked ?? false;
+                _autoActionRunning = false;
+                _suppressStopUi = false;
+                _limitTimer.Start();
 
                 StartBtn.IsEnabled = false;
                 PauseBtn.IsEnabled = true;
@@ -393,11 +412,122 @@ namespace Hearbud
             }
         }
 
+        private RecorderStartOptions BuildStartOptions(string outDir, string baseName)
+        {
+            var micName = MicCombo.SelectedItem as string;
+            var spkName = SpeakerCombo.SelectedItem as string;
+            bool wantMic = IncludeMicCheck.IsChecked ?? true;
+            bool wantSys = RecordSysCheck.IsChecked ?? true;
+            return new RecorderStartOptions
+            {
+                OutputPath = Path.Combine(outDir, baseName),
+                LoopbackDeviceId = wantSys && spkName != null ? _spkDict[spkName].DeviceID : null,
+                MicDeviceId = wantMic && micName != null ? _micDict[micName].DeviceID : null,
+                Mp3BitrateKbps = GetSelectedBitrateKbps(),
+                IncludeMic = wantMic,
+                WriteStems = WriteStemsCheck.IsChecked ?? true
+            };
+        }
+
+        private static double ParseNonNegativeMinutes(string? text)
+        {
+            if (double.TryParse(text, out var v) && !double.IsNaN(v) && v > 0)
+                return Math.Min(v, 24 * 60);
+            return 0;
+        }
+
+        private static long ParseNonNegativeSizeBytes(string? text)
+        {
+            if (double.TryParse(text, out var v) && !double.IsNaN(v) && v > 0)
+                return (long)Math.Min(v * 1024 * 1024, (double)long.MaxValue);
+            return 0;
+        }
+
+        /// <summary>
+        /// GAP-09: 1 s poll of time/size limits while recording. Either limit at 0
+        /// means off. Time is wall-clock via engine.RecordElapsed (pause does NOT
+        /// stop it — simplest counting, documented in UI comment). Size compares
+        /// engine.TotalMixBytesWritten (queued mix payload, WAV header excluded).
+        /// Guarded by _autoActionRunning so a slow Stop/Start cannot retrigger.
+        /// </summary>
+        private async void OnLimitTimerTick(object? sender, EventArgs e)
+        {
+            if (!_engine.IsRecording || _autoActionRunning) return;
+            if (_limitMinutes <= 0 && _limitSizeBytes <= 0) return;
+            bool timeHit = _limitMinutes > 0 && _engine.RecordElapsed.TotalMinutes >= _limitMinutes;
+            bool sizeHit = _limitSizeBytes > 0 && _engine.TotalMixBytesWritten >= _limitSizeBytes;
+            if (!timeHit && !sizeHit) return;
+
+            _autoActionRunning = true;
+            try
+            {
+                string reason = timeHit
+                    ? $"time limit ({_limitMinutes:g} min)"
+                    : $"size limit ({_limitSizeBytes / (1024.0 * 1024.0):g} MB mix)";
+                if (_splitMode)
+                    await SplitRecordingAsync(reason);
+                else
+                {
+                    StatusText.Text = $"Auto-stop: {reason} reached — stopping…";
+                    _limitTimer.Stop();
+                    await _engine.StopAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("AutoStop", ex);
+            }
+            finally
+            {
+                _autoActionRunning = false;
+            }
+        }
+
+        /// <summary>
+        /// GAP-09 split: StopAsync finalizes the current files, then StartAsync
+        /// opens a new set with an incremented " (2)", " (3)" suffix. NOT
+        /// sample-accurate: there is a short gap covering queue drain + MP3 encode
+        /// of the finished part (StopAsync posts the Stopped status, suppressed
+        /// here so no "saved" dialog pops mid-session).
+        /// </summary>
+        private async Task SplitRecordingAsync(string reason)
+        {
+            _suppressStopUi = true;
+            _limitTimer.Stop();
+            try
+            {
+                StatusText.Text = $"Auto-split: {reason} reached — starting new file…";
+                await _engine.StopAsync();
+                _splitIndex++;
+                string newBase = $"{_splitBaseName} ({_splitIndex})";
+                BaseNameText.Text = newBase;
+                _engine.MicGain = MicGain.Value;
+                _engine.LoopGain = LoopGain.Value;
+                await _engine.StartAsync(BuildStartOptions(_splitOutDir, newBase));
+                StartBtn.IsEnabled = false;
+                PauseBtn.IsEnabled = true;
+                PauseBtn.Content = "Pause (Ctrl+P)";
+                StopBtn.IsEnabled = true;
+                StatusText.Text = "Recording...";
+                _limitTimer.Start();
+            }
+            finally
+            {
+                _suppressStopUi = false;
+            }
+            UpdateTrayTooltip();
+        }
+
         private async void OnStop(object? sender, RoutedEventArgs? e)
         {
+            // GAP-09: an auto-stop/split is already driving StopAsync; a concurrent
+            // manual Stop could double-encode the MP3. The auto path finishes the
+            // stop (or split, after which Stop stays available) on its own.
+            if (_autoActionRunning) return;
             StopBtn.IsEnabled = false;
             PauseBtn.IsEnabled = false;
             PauseBtn.Content = "Pause (Ctrl+P)";
+            _limitTimer.Stop();
             try 
             {
                 await _engine.StopAsync(); 
@@ -514,8 +644,13 @@ namespace Hearbud
                 }
                 else if (e.Kind == EngineStatusKind.Stopped)
                 {
+                    _limitTimer.Stop();
                     EncodingProgressBar.Visibility = Visibility.Collapsed;
                     EncodingProgressText.Visibility = Visibility.Collapsed;
+
+                    // GAP-09 auto-split handoff: the next StartAsync rearms UI;
+                    // skip the saved-dialog, folder open, and auto-monitor here.
+                    if (_suppressStopUi) return;
 
                     StartBtn.IsEnabled = true;
                     StopBtn.IsEnabled = false;
@@ -660,6 +795,9 @@ namespace Hearbud
                 _settings.WriteStems = WriteStemsCheck.IsChecked ?? true;
                 _settings.IncludeMic = IncludeMicCheck.IsChecked ?? true;
                 _settings.IncludeSystem = RecordSysCheck.IsChecked ?? true;
+                _settings.AutoStopMinutes = ParseNonNegativeMinutes(LimitMinutesText.Text);
+                _settings.AutoStopSizeMb = ParseNonNegativeSizeBytes(LimitSizeMbText.Text) / (1024.0 * 1024.0);
+                _settings.SplitInsteadOfStop = SplitInsteadOfStopCheck.IsChecked ?? false;
                 _settings.Save();
             }
             catch { /* best-effort */ }
@@ -698,6 +836,9 @@ namespace Hearbud
                 WriteStemsCheck.IsChecked = _settings.WriteStems;
                 IncludeMicCheck.IsChecked = _settings.IncludeMic;
                 RecordSysCheck.IsChecked = _settings.IncludeSystem;
+                LimitMinutesText.Text = _settings.AutoStopMinutes > 0 ? _settings.AutoStopMinutes.ToString() : "";
+                LimitSizeMbText.Text = _settings.AutoStopSizeMb > 0 ? _settings.AutoStopSizeMb.ToString() : "";
+                SplitInsteadOfStopCheck.IsChecked = _settings.SplitInsteadOfStop;
             }
             catch (Exception ex)
             {

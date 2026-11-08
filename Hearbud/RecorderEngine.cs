@@ -162,6 +162,34 @@ namespace Hearbud
         /// </summary>
         public bool IsRecording => _recording;
 
+        /// <summary>
+        /// GAP-09: total mix bytes enqueued for writing this session (size-limit source).
+        /// Reflection-friendly public getter; no behavior change.
+        /// </summary>
+        public long TotalMixBytesWritten => Interlocked.Read(ref _totalMixBytesWritten);
+
+        /// <summary>
+        /// GAP-09: total fixed frames emitted on the master clock this session.
+        /// Reflection-friendly public getter; no behavior change.
+        /// </summary>
+        public long MasterFramesEmitted => Interlocked.Read(ref _masterFramesEmitted);
+
+        /// <summary>
+        /// GAP-09: wall-clock elapsed since the current recording started.
+        /// Counts paused time too (simplest; pause does not stop the clock).
+        /// Zero when not recording. Reflection-friendly public getter.
+        /// </summary>
+        public TimeSpan RecordElapsed
+        {
+            get
+            {
+                long start = Volatile.Read(ref _masterStartTick);
+                if (!_recording || start == 0) return TimeSpan.Zero;
+                double ms = (Stopwatch.GetTimestamp() - start) * _tickMs;
+                return ms <= 0 ? TimeSpan.Zero : TimeSpan.FromMilliseconds(ms);
+            }
+        }
+
         public event EventHandler<LevelChangedEventArgs>? LevelChanged;
         public event EventHandler<EngineStatusEventArgs>? Status;
         public event EventHandler<int>? EncodingProgress; 
@@ -189,6 +217,9 @@ namespace Hearbud
         private Task? _writeTask;
         private long _droppedBlocks = 0;
         private Exception? _writerException;
+        // GAP-09 auto-stop/split: cumulative mix payload bytes handed to the write
+        // queue this session (WAV container overhead excluded; close enough for limits).
+        private long _totalMixBytesWritten = 0;
 
         private string _pathSys = "";
         private string _pathMic = "";
@@ -424,6 +455,7 @@ namespace Hearbud
             _loopBlockCounter = 0;
             _masterFramesEmitted = 0;
             _masterStartTick = Stopwatch.GetTimestamp();
+            _totalMixBytesWritten = 0;
             _lagStreak = 0;
             _resyncCount = 0;
             _preRollRemaining = 2;
@@ -759,6 +791,9 @@ namespace Hearbud
             {
                 if (!added) ArrayPool<byte>.Shared.Return(rented);
             }
+
+            if (added && target == AudioFileTarget.Mix)
+                Interlocked.Add(ref _totalMixBytesWritten, count);
 
             if (!added)
             {

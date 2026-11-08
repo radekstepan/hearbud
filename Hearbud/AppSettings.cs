@@ -29,6 +29,11 @@ namespace Hearbud
         public bool IncludeSystem { get; set; } = true;
         public bool WriteStems { get; set; } = true;
 
+        // GAP-09 auto-stop / auto-split limits. 0 = off.
+        public double AutoStopMinutes { get; set; } = 0;
+        public double AutoStopSizeMb { get; set; } = 0;
+        public bool SplitInsteadOfStop { get; set; } = false;
+
         private static string ConfigPath =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".hearbud_config.json");
 
@@ -63,6 +68,11 @@ namespace Hearbud
             MicGain = Math.Clamp(MicGain, 0.0, 10.0);
             LoopGain = Math.Clamp(LoopGain, 0.0, 10.0);
             Mp3BitrateKbps = Mp3BitrateKbps == 0 ? 0 : Math.Clamp(Mp3BitrateKbps, 64, 320);
+
+            if (double.IsNaN(AutoStopMinutes) || AutoStopMinutes < 0) AutoStopMinutes = 0;
+            else AutoStopMinutes = Math.Min(AutoStopMinutes, 24 * 60);
+            if (double.IsNaN(AutoStopSizeMb) || AutoStopSizeMb < 0) AutoStopSizeMb = 0;
+            else AutoStopSizeMb = Math.Min(AutoStopSizeMb, 100_000);
 
             if (string.IsNullOrWhiteSpace(OutputDir))
                 OutputDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings");
