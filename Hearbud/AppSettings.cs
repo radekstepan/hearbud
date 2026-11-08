@@ -26,6 +26,7 @@ namespace Hearbud
         public double MicGain { get; set; } = 1.0;
         public double LoopGain { get; set; } = 1.0;
         public bool IncludeMic { get; set; } = true;
+        public bool WriteStems { get; set; } = true;
 
         private static string ConfigPath =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".hearbud_config.json");

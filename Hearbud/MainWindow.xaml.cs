@@ -257,7 +257,7 @@ namespace Hearbud
                         MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
                 }
-                if (micName == null)
+                if (micName == null && (IncludeMicCheck.IsChecked ?? true))
                 {
                     WpfMessageBox.Show("Select a microphone.", "Missing device",
                         MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -273,8 +273,10 @@ namespace Hearbud
                 {
                     OutputPath = Path.Combine(outDir, baseName),
                     LoopbackDeviceId = loopDevice!.DeviceID,
-                    MicDeviceId = _micDict[micName].DeviceID,
-                    Mp3BitrateKbps = GetSelectedBitrateKbps()
+                    MicDeviceId = (IncludeMicCheck.IsChecked ?? true) && micName != null ? _micDict[micName].DeviceID : null,
+                    Mp3BitrateKbps = GetSelectedBitrateKbps(),
+                    IncludeMic = IncludeMicCheck.IsChecked ?? true,
+                    WriteStems = WriteStemsCheck.IsChecked ?? true
                 });
 
                 StartBtn.IsEnabled = false;
@@ -523,6 +525,8 @@ namespace Hearbud
                 _settings.MicGain = MicGain.Value;
                 _settings.LoopGain = LoopGain.Value;
                 _settings.Mp3BitrateKbps = GetSelectedBitrateKbps();
+                _settings.WriteStems = WriteStemsCheck.IsChecked ?? true;
+                _settings.IncludeMic = IncludeMicCheck.IsChecked ?? true;
                 _settings.Save();
             }
             catch { /* best-effort */ }
@@ -557,6 +561,9 @@ namespace Hearbud
                 // If desired value isn't in the list, fall back to 192.
                 if (OutputQualityCombo.SelectedItem as ComboBoxItem == null)
                     OutputQualityCombo.SelectedValue = 192;
+
+                WriteStemsCheck.IsChecked = _settings.WriteStems;
+                IncludeMicCheck.IsChecked = _settings.IncludeMic;
             }
             catch (Exception ex)
             {

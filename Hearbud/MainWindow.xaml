@@ -64,6 +64,10 @@
                         <ComboBoxItem Content="256 kbps (MP3)" Tag="256"/>
                         <ComboBoxItem Content="320 kbps (MP3)" Tag="320"/>
                     </ComboBox>
+                    <CheckBox x:Name="WriteStemsCheck" Content="Save separate mic/system stems"
+                              IsChecked="True" Margin="0,12,0,0"/>
+                    <CheckBox x:Name="IncludeMicCheck" Content="Include microphone"
+                              IsChecked="True" Margin="0,4,0,0"/>
                 </StackPanel>
             </GroupBox>
 
