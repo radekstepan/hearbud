@@ -133,6 +133,7 @@
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="80"/>
                             <ColumnDefinition Width="50"/>
+                            <ColumnDefinition Width="90"/>
                         </Grid.ColumnDefinitions>
                         <TextBlock Grid.Column="0" Text="Mic" VerticalAlignment="Center" FontWeight="SemiBold"/>
                         <ProgressBar Grid.Column="1" x:Name="MicBar" Minimum="0" Maximum="100" Margin="10,0"
@@ -140,6 +141,8 @@
                                      AutomationProperties.LiveSetting="Polite"/>
                         <TextBlock Grid.Column="2" x:Name="MicDb" TextAlignment="Right" FontFamily="Consolas" VerticalAlignment="Center"/>
                         <TextBlock Grid.Column="3" x:Name="MicClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="Center" Margin="8,0,0,0" FontWeight="Bold"/>
+                        <Button Grid.Column="4" x:Name="TestMicBtn" Content="Test Mic" Click="OnTestMic" Margin="8,0,0,0"
+                                AutomationProperties.Name="Test microphone"/>
                     </Grid>
 
                     <!-- System meter -->
@@ -149,11 +152,14 @@
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="80"/>
                             <ColumnDefinition Width="50"/>
+                            <ColumnDefinition Width="90"/>
                         </Grid.ColumnDefinitions>
                         <TextBlock Grid.Column="0" Text="System" VerticalAlignment="Center" FontWeight="SemiBold"/>
                         <ProgressBar Grid.Column="1" x:Name="SysBar" Minimum="0" Maximum="100" Margin="10,0"/>
                         <TextBlock Grid.Column="2" x:Name="SysDb" TextAlignment="Right" FontFamily="Consolas" VerticalAlignment="Center"/>
                         <TextBlock Grid.Column="3" x:Name="SysClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="center" Margin="8,0,0,0" FontWeight="Bold"/>
+                        <Button Grid.Column="4" x:Name="TestSysBtn" Content="Test System" Click="OnTestSys" Margin="8,0,0,0"
+                                AutomationProperties.Name="Test system output"/>
                     </Grid>
                 </StackPanel>
             </GroupBox>

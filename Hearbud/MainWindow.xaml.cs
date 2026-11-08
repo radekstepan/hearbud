@@ -588,6 +588,147 @@ namespace Hearbud
             LoopGainLabel.Text = Dbfs.FormatGain(LoopGain.Value);
         }
 
+        // GAP-09 #3: sound-test slice. No engine change, nothing persisted.
+        private bool _micTestRunning;
+        private bool _sysTestRunning;
+
+        /// <summary>
+        /// Mic self-test: ensures the live monitor is running (same path as the
+        /// auto-monitor on startup) and samples the existing MicBar/MicDb peak
+        /// for 3 s. Reports the peak dBFS; the engine is left untouched.
+        /// </summary>
+        private async void OnTestMic(object sender, RoutedEventArgs e)
+        {
+            if (_micTestRunning) return;
+            try
+            {
+                if (!(IncludeMicCheck.IsChecked ?? true))
+                {
+                    WpfMessageBox.Show("Tick \"Include microphone\" so the monitor opens the mic.",
+                        "Test Mic", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                if (MicCombo.SelectedItem as string == null)
+                {
+                    WpfMessageBox.Show("Select a microphone first.",
+                        "Test Mic", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                _micTestRunning = true;
+                TestMicBtn.IsEnabled = false;
+                TryStartAutoMonitor(); // no-op when already monitoring/recording
+                await Task.Delay(400);
+                StatusText.Text = "Mic test: speak for 3 s…";
+                float peak = 0f;
+                var until = DateTime.UtcNow.AddSeconds(3);
+                while (DateTime.UtcNow < until)
+                {
+                    if (_micPeak > peak) peak = _micPeak;
+                    await Task.Delay(50);
+                }
+                double db = Dbfs.ToDbfs(peak);
+                StatusText.Text = $"Mic test peak: {db:0.0} dBFS";
+                WpfMessageBox.Show($"Mic test peak: {db:0.0} dBFS ({peak * 100.0:0}%).\n\nWatch the live Mic meter while speaking; raise Mic Gain if too quiet, lower it on CLIP.",
+                    "Test Mic", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("OnTestMic", ex);
+            }
+            finally
+            {
+                _micTestRunning = false;
+                TestMicBtn.IsEnabled = true;
+            }
+        }
+
+        /// <summary>
+        /// System self-test: synthesizes a 1 kHz / 1 s sine (with 10 ms edge
+        /// fades) to a temp WAV and plays it through the selected Speaker
+        /// device via CSCore WasapiOut. No assets shipped, no engine change.
+        /// </summary>
+        private async void OnTestSys(object sender, RoutedEventArgs e)
+        {
+            if (_sysTestRunning) return;
+            try
+            {
+                var spkName = SpeakerCombo.SelectedItem as string;
+                if (string.IsNullOrEmpty(spkName) || !_spkDict.TryGetValue(spkName, out var device) || device == null)
+                {
+                    WpfMessageBox.Show("Select an output device to capture first.",
+                        "Test System", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                _sysTestRunning = true;
+                TestSysBtn.IsEnabled = false;
+                StatusText.Text = "Playing test tone (1 kHz, 1 s)…";
+                string tmp = Path.Combine(Path.GetTempPath(), "hearbud-test-tone.wav");
+                WriteTestToneWav(tmp, freqHz: 1000.0, seconds: 1.0);
+                try
+                {
+                    // Kept on the UI thread (async waits only): the MMDevice RCW
+                    // comes from the UI-thread enumerator, so don't hop threads.
+                    using var reader = new CSCore.Codecs.WAV.WaveFileReader(tmp);
+                    using var wasapi = new CSCore.SoundOut.WasapiOut() { Device = device };
+                    wasapi.Initialize(reader);
+                    wasapi.Play();
+                    var deadline = DateTime.UtcNow.AddSeconds(6);
+                    while (wasapi.PlaybackState == CSCore.SoundOut.PlaybackState.Playing
+                           && DateTime.UtcNow < deadline)
+                        await Task.Delay(50);
+                    try { wasapi.Stop(); } catch { }
+                    StatusText.Text = "Test tone played (1 kHz, 1 s).";
+                }
+                finally
+                {
+                    try { File.Delete(tmp); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("OnTestSys", ex);
+                StatusText.Text = "Test tone failed (see log).";
+            }
+            finally
+            {
+                _sysTestRunning = false;
+                TestSysBtn.IsEnabled = true;
+            }
+        }
+
+        /// <summary>Writes a 16-bit stereo PCM WAV sine with short edge fades (click-free).</summary>
+        private static void WriteTestToneWav(string path, double freqHz, double seconds, int sampleRate = 44100, short channels = 2)
+        {
+            int frames = Math.Max(1, (int)(sampleRate * seconds));
+            const short bits = 16;
+            int blockAlign = channels * bits / 8;
+            int dataBytes = frames * blockAlign;
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+            using var w = new BinaryWriter(fs);
+            w.Write(System.Text.Encoding.ASCII.GetBytes("RIFF"));
+            w.Write(36 + dataBytes);
+            w.Write(System.Text.Encoding.ASCII.GetBytes("WAVE"));
+            w.Write(System.Text.Encoding.ASCII.GetBytes("fmt "));
+            w.Write(16);
+            w.Write((short)1); // PCM
+            w.Write(channels);
+            w.Write(sampleRate);
+            w.Write(sampleRate * blockAlign);
+            w.Write((short)blockAlign);
+            w.Write(bits);
+            w.Write(System.Text.Encoding.ASCII.GetBytes("data"));
+            w.Write(dataBytes);
+            const double amp = 0.5; // -6 dBFS: clearly audible, headroom before clip
+            int fadeFrames = Math.Max(1, (int)(sampleRate * 0.01));
+            for (int n = 0; n < frames; n++)
+            {
+                double env = Math.Min(1.0, Math.Min(n, frames - 1 - n) / (double)fadeFrames);
+                double s = amp * env * Math.Sin(2.0 * Math.PI * freqHz * n / sampleRate);
+                short v = (short)Math.Clamp((int)Math.Round(s * short.MaxValue), short.MinValue, short.MaxValue);
+                for (int c = 0; c < channels; c++) w.Write(v);
+            }
+        }
+
         private volatile float _micPeak;
         private volatile float _sysPeak;
         private DateTime _micClipUntil = DateTime.MinValue;
