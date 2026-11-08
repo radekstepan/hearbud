@@ -154,6 +154,26 @@ resumed after >200ms silence, causing old audio to
 play over new system audio.
 ```
 
+### Changesets
+
+Every non-`[skip ci]` push on a non-master branch includes one
+`.changeset/<kebab>.md` file with `"hearbud": patch` front-matter:
+
+```markdown
+---
+"hearbud": patch
+---
+
+<Title>
+
+- What: changed files and behavior.
+- Why: reason for the change.
+- Verification: what was run (or "CI gate" if not runnable locally).
+```
+
+Changesets are consumed on merge to master (release flow owns
+versioning there); master itself is exempt from the changeset gate.
+
 ---
 
 ## Code Style and Conventions
@@ -531,6 +551,22 @@ Hearbud writes session logs alongside output files (e.g., `rec-20250623_143022.t
 - `INFO` - Normal operations
 - `WARN` - Non-fatal issues (underruns, near-clip)
 - `ERROR` - Exception/failure
+
+### Logging Discipline
+
+Audio and engine hot paths log transitions only:
+
+- No per-frame or per-callback logging. Steady-state work stays silent;
+  log when state changes (start/stop, device lost/regained, resync,
+  first underrun in a window — not every tick).
+- Severity: routine transitions are INFO; degraded-but-recoverable is
+  WARN; failures are ERROR. Cap log tails (summarize counts, do not
+  dump unbounded buffers).
+- Backlog/lag counters (ring backlog, overrun/underrun blocks, resyncs)
+  are logged at most at 1 Hz as a one-line summary, not per tick.
+- Include thread/tick context: callback name (`OnLoopbackData`,
+  `OnMicData`), tick or timestamp, and the relevant counter values, so
+  a log line is diagnosable without a debugger attached.
 
 ### Crash Logs
 

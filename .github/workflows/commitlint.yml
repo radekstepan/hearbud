@@ -1,0 +1,36 @@
+name: commitlint
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  lint-subject:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commit subject
+        shell: bash
+        run: |
+          set -euo pipefail
+          subject="$(git log -1 --format=%s)"
+          echo "subject: $subject"
+          if [[ "$subject" == *"[skip ci]"* ]]; then
+            echo "[skip ci]: commitlint skipped"
+            exit 0
+          fi
+          if [[ "${GITHUB_REF:-}" == "refs/heads/master" && "$subject" =~ ^chore:\ bump\ version ]]; then
+            echo "master version-bump: commitlint skipped"
+            exit 0
+          fi
+          if [[ "$subject" =~ ^(feat|fix|refactor|perf|docs|style|test|chore)(\(.+\))?:\ .+ ]]; then
+            echo "commitlint passed"
+            exit 0
+          fi
+          echo "::error::Commit subject must match conventional commits: <type>(<scope>): <subject> with type feat|fix|refactor|perf|docs|style|test|chore"
+          exit 1
