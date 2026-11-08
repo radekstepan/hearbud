@@ -700,15 +700,20 @@ public class RecorderEngineDspTests
             writeLog.Invoke(engine, new object?[] { "WARN", "still visible after cap", null });
             writeLog.Invoke(engine, new object?[] { "INFO", "Mic ring underruns: 3. Overruns: 1", null });
 
+            var logField = EngineType.GetField("_log",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            Assert.NotNull(logField.GetValue(engine));
+
+            // Close the handle before reading: the log FileStream is opened
+            // with FileShare.Read only, which blocks even File.ReadAllText
+            // while the StreamWriter is alive. Dispose is idempotent.
+            engine.Dispose();
+
             var content = File.ReadAllText(tempLog);
             Assert.Contains("LOG TRUNCATED", content);
             Assert.Contains("still visible after cap", content);
             Assert.DoesNotContain("routine noise after cap", content);
             Assert.Contains("underruns", content);
-
-            var logField = EngineType.GetField("_log",
-                BindingFlags.NonPublic | BindingFlags.Instance)!;
-            Assert.NotNull(logField.GetValue(engine));
         }
         finally
         {
