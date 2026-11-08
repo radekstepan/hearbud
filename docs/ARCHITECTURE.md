@@ -368,20 +368,24 @@ StopAsync() called
 - Pooling is a standard .NET optimization for high-frequency buffers
 - **Memory Safety:** `EnqueueWrite` uses a `try/finally` block to ensure rented buffers are always returned to the pool, preventing memory leaks if adding to the queue fails or an exception occurs.
 
-### 5. Bounded mic FIFO + stateful resample (GAP-01/02/08)
+### 5. Dual-FIFO fixed-frame tick + master-clock resync (GAP-01/02/08)
 **Decision:** Mic goes through stateful `ConvertToTargetChunked` (phase carry, no seam clicks,
-cumulative length +-1 frame/s, ITU fold with LFE excluded) into a bounded FIFO (~2 s cap,
-drop-oldest + `_micOverrunBlocks`). Loopback ticks pull fixed mix; underruns zero-fill +
-`_micUnderrunBlocks`/`_silencedSamples`; 1 Hz `lagTime` wall-clock line (depth/over/under/
-silenced/max, LAG>80 ms); pre-roll 2 blocks; MMCSS Pro Audio on writer thread + 1 ms timer;
-`DumpDir` taps (microphoneIn/speakerIn/mixOut.pcm); log cap keeps WARN/ERROR + session tail.
+cumulative length +-1 frame/s, ITU fold with LFE excluded) into a bounded mic FIFO (~2 s cap,
+drop-oldest + `_micOverrunBlocks`). Loopback also buffers into a bounded loop FIFO
+(`_loopOverrunBlocks`); the mix emits fixed 480-frame quanta (960 floats stereo) via
+`TryPopFixedFrame`/`EmitFixedMix`. Mic-only sessions drain fixed frames via `EmitMicOnlyFixed`.
+Master clock = `_masterFramesEmitted`; sustained backlog >80 ms over 3 ticks triggers
+`CheckLagResync` (drop mic to one frame, `_resyncCount`, Warn); 1 Hz `lagTime` line logs
+depth/over/loopOver/under/silenced/max/masterFrames/resyncs. Pre-roll 2 fixed frames;
+MMCSS Pro Audio on writer thread + 1 ms timer; `DumpDir` taps; log cap keeps WARN/ERROR + tail.
 
 **Rationale:**
 - Handles mic/loopback sample rate differences on arrival (not lazily at mix)
-- Bounded FIFO prevents unbounded growth on crystal drift; counters make drift visible
+- Bounded FIFOs absorb WASAPI jitter/bursts; fixed emit keeps mix clock stable
+- Resync bounds drift instead of growing backlog; counters make drift visible
 - Pre-roll avoids frame-0 silence + spurious underrun
 
-**Sync Edge Case:** When loopback resumes after silence, existing mic backlog is dropped. This prevents "old mic over new system" echo effect.
+**Sync Edge Case:** When loopback resumes after silence, mic backlog beyond one fixed frame is dropped on sustained >80 ms lag. This prevents "old mic over new system" echo effect.
 
 ### 6. Conditional limiter (tanh only on overs) + peak normalize
 **Decision:** Sum `s*gL + m*gM` at full level, peak-normalize the block only if peak>1, then apply `tanh` soft-knee only to samples with `|x|>1` before clamp.
