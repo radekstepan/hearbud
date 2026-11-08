@@ -14,8 +14,9 @@ concurrency:
 permissions:
   contents: write
 
-# NOTE: actions are pinned to major versions (v4) mirroring the ere-core
-# pinning approach. Keep actions/*@v4; do not float or unpin.
+# NOTE: actions are pinned to full commit SHAs (trailing `# v4` comment notes
+# the human tag) against supply-chain tag-moves. Keep SHA pins; do not float
+# back to bare tags.
 jobs:
   # Runs on GitHub-hosted ubuntu-latest (no self-hosted dependency) so PRs
   # get fast feedback even when the Windows runner is busy/offline.
@@ -23,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -41,18 +42,19 @@ jobs:
             echo "[skip ci]: changeset gate skipped"
             exit 0
           fi
+          git fetch origin master --depth=100
           shopt -s nullglob
           count=0
-          for f in .changeset/*.md; do
+          while IFS= read -r f; do
             base="$(basename "$f")"
             if [[ "$base" == "README.md" ]]; then
               continue
             fi
             count=$((count + 1))
             echo "found: $f"
-          done
+          done < <(git diff --name-only origin/master...HEAD -- .changeset/)
           if [[ "$count" -eq 0 ]]; then
-            echo "::error::Missing changeset: add a .changeset/<name>.md (\"hearbud\": patch) or include [skip ci] in the commit message. Master is exempt."
+            echo "::error::Missing changeset: add a .changeset/<name>.md (\"hearbud\": patch) that differs from origin/master, or include [skip ci] in the commit message. Master is exempt."
             exit 1
           fi
           echo "changeset gate passed ($count file(s))"
@@ -62,7 +64,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           clean: true
           fetch-depth: 0
@@ -161,9 +163,11 @@ jobs:
           "version=$newVersion" >> $env:GITHUB_OUTPUT
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
-          dotnet-version: 8.0.x
+          # Band must match global.json (8.0.100 + rollForward latestPatch):
+          # 8.0.1xx keeps the SDK in the 8.0.100 feature band.
+          dotnet-version: 8.0.1xx
         env:
           # The self-hosted runner runs as NETWORK SERVICE: Program Files is
           # not writable, so install the SDK into the runner tool cache.
@@ -204,7 +208,7 @@ jobs:
 
       - name: Upload artifact
         if: github.ref == 'refs/heads/master'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Hearbud-${{ steps.bump.outputs.version }}-windows
           path: dist/win-x64
