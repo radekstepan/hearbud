@@ -1454,7 +1454,7 @@ namespace Hearbud
         {
             try
             {
-                if (sender is TextBox tb)
+                if (sender is System.Windows.Controls.TextBox tb)
                 {
                     tb.SelectAll();
                     StatusText.Text = "Press the new shortcut (Esc cancels)…";
@@ -1468,7 +1468,7 @@ namespace Hearbud
             try
             {
                 // Restore canonical text in case focus left mid-capture.
-                if (sender is TextBox tb && tb.Tag is string tag)
+                if (sender is System.Windows.Controls.TextBox tb && tb.Tag is string tag)
                     tb.Text = HotkeyFor(tag);
             }
             catch { /* best-effort */ }
@@ -1489,9 +1489,9 @@ namespace Hearbud
         /// actions warn and keep the old value; otherwise the new gesture is
         /// persisted and bindings are rebuilt.
         /// </summary>
-        private void OnHotkeyCapturePreviewKeyDown(object sender, KeyEventArgs e)
+        private void OnHotkeyCapturePreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
-            if (sender is not TextBox tb || tb.Tag is not string tag)
+            if (sender is not System.Windows.Controls.TextBox tb || tb.Tag is not string tag)
                 return;
             try
             {
