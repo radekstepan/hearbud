@@ -35,6 +35,8 @@
                               AutomationProperties.HelpText="Select the microphone to record from"/>
                     <TextBlock Text="Audio Output (to capture)" Margin="0,12,0,0" FontWeight="SemiBold"/>
                     <ComboBox x:Name="SpeakerCombo" Margin="0,4,0,0"/>
+                    <CheckBox x:Name="RecordSysCheck" Content="Include system audio"
+                              IsChecked="True" Margin="0,4,0,0"/>
                 </StackPanel>
             </GroupBox>
 

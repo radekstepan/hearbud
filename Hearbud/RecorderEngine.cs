@@ -96,7 +96,7 @@ namespace Hearbud
     public sealed class RecorderStartOptions
     {
         public string OutputPath { get; set; } = ""; 
-        public string LoopbackDeviceId { get; set; } = "";
+        public string? LoopbackDeviceId { get; set; } = "";
         public string? MicDeviceId { get; set; }
         public bool IncludeMic { get; set; } = true; 
         public int Mp3BitrateKbps { get; set; } = 192;
@@ -345,10 +345,10 @@ namespace Hearbud
 
             if (!_monitoring)
             {
-                _loopIn!.DataAvailable += OnLoopbackData;
+                if (_loopIn != null) _loopIn.DataAvailable += OnLoopbackData;
                 if (_micIn != null) _micIn.DataAvailable += OnMicData;
 
-                _loopCap!.Start();
+                _loopCap?.Start();
                 _micCap?.Start();
 
                 _monitoring = true;
@@ -778,13 +778,20 @@ namespace Hearbud
 
         private async Task OpenDevicesAsync(RecorderStartOptions opts)
         {
-            bool needReopen =
-                _loopCap == null ||
-                _loopCap.Device.DeviceID != opts.LoopbackDeviceId ||
-                ((_micCap == null) != !string.IsNullOrWhiteSpace(opts.MicDeviceId)) ||
-                (_micCap != null && _micCap.Device.DeviceID != (opts.MicDeviceId ?? ""));
+            // GAP-09: either source may be disabled (null/empty/whitespace id).
+            bool wantLoop = !string.IsNullOrWhiteSpace(opts.LoopbackDeviceId);
+            bool wantMic  = !string.IsNullOrWhiteSpace(opts.MicDeviceId);
+            if (!wantLoop && !wantMic)
+                throw new InvalidOperationException("At least one audio source (system or microphone) is required.");
 
-            if (!needReopen) return;
+            bool loopMismatch = wantLoop
+                ? (_loopCap == null || _loopCap.Device.DeviceID != opts.LoopbackDeviceId)
+                : (_loopCap != null);
+            bool micMismatch = wantMic
+                ? (_micCap == null || _micCap.Device.DeviceID != opts.MicDeviceId)
+                : (_micCap != null);
+
+            if (!loopMismatch && !micMismatch) return;
 
             Info("Opening devices…");
 
@@ -804,25 +811,37 @@ namespace Hearbud
             {
                 try
                 {
-                    MMDevice loopDev;
+                    MMDevice? loopDev = null;
                     MMDevice? micDev = null;
                     using (var mmde = new MMDeviceEnumerator())
                     {
-                        loopDev = mmde.GetDevice(opts.LoopbackDeviceId);
-                        if (!string.IsNullOrWhiteSpace(opts.MicDeviceId))
+                        if (wantLoop)
+                            loopDev = mmde.GetDevice(opts.LoopbackDeviceId!);
+                        if (wantMic)
                             micDev = mmde.GetDevice(opts.MicDeviceId!);
                     }
 
-                    _loopDevName = loopDev?.FriendlyName ?? "";
+                    _loopDevName = loopDev?.FriendlyName ?? "(none)";
                     _micDevName  = micDev?.FriendlyName ?? "(none)";
 
-                    _loopCap = new WasapiLoopbackCapture { Device = loopDev };
-                    _loopCap.Initialize();
-                    _outRate     = _loopCap.WaveFormat.SampleRate;
-                    _outChannels = _loopCap.WaveFormat.Channels;
+                    if (loopDev != null)
+                    {
+                        _loopCap = new WasapiLoopbackCapture { Device = loopDev };
+                        _loopCap.Initialize();
+                        _outRate     = _loopCap.WaveFormat.SampleRate;
+                        _outChannels = _loopCap.WaveFormat.Channels;
 
-                    _loopIn  = new SoundInSource(_loopCap) { FillWithZeros = true };
-                    _loopSrc = _loopIn.ToSampleSource();
+                        _loopIn  = new SoundInSource(_loopCap) { FillWithZeros = true };
+                        _loopSrc = _loopIn.ToSampleSource();
+                    }
+                    else
+                    {
+                        // GAP-09: system capture disabled — mic drives the clock,
+                        // loop ring stays empty, loopSilent is permanently true.
+                        _loopCap = null;
+                        _loopIn  = null;
+                        _loopSrc = null;
+                    }
 
                     if (micDev != null)
                     {
@@ -834,14 +853,22 @@ namespace Hearbud
 
                         lock (_micRingLock) { _micR = _micW = _micCount = 0; }
                         _micResamp.Reset(_micSrc.WaveFormat.Channels, _micSrc.WaveFormat.SampleRate, _outRate);
+
+                        if (!wantLoop)
+                        {
+                            // No loopback clock: derive output format from the mic.
+                            _outRate     = _micSrc.WaveFormat.SampleRate;
+                            _outChannels = _micSrc.WaveFormat.Channels;
+                            _micResamp.Reset(_micSrc.WaveFormat.Channels, _micSrc.WaveFormat.SampleRate, _outRate);
+                        }
                     }
-                    else
+                    else if (wantMic)
                     {
                         RaiseStatus(EngineStatusKind.Error, "Microphone device not found/selected.");
                     }
 
                     // Record which devices are now active so disconnect detection can check them.
-                    _activeLoopDeviceId = opts.LoopbackDeviceId;
+                    _activeLoopDeviceId = opts.LoopbackDeviceId ?? "";
                     _activeMicDeviceId  = opts.MicDeviceId ?? "";
 
                     return;
@@ -872,7 +899,7 @@ namespace Hearbud
         {
             if (_monitoring)
             {
-                try { _loopIn!.DataAvailable -= OnLoopbackData; } catch { }
+                try { if (_loopIn != null) _loopIn.DataAvailable -= OnLoopbackData; } catch { }
                 try { if (_micIn != null) _micIn.DataAvailable -= OnMicData; } catch { }
 
                 TryDispose(ref _loopIn);
@@ -1042,7 +1069,8 @@ namespace Hearbud
 
                 long nowTicksA = Stopwatch.GetTimestamp();
                 double msSinceLoop = (nowTicksA - _lastLoopTick) * _tickMs;
-                bool loopSilent = msSinceLoop > LoopSilentMsThreshold;
+                // GAP-09: no loopback device → mic permanently drives the mix.
+                bool loopSilent = _loopCap == null || msSinceLoop > LoopSilentMsThreshold;
 
                 // --- Metering ---
                 float blockPeak = 0f;

@@ -156,15 +156,19 @@ namespace Hearbud
             {
                 var micName = MicCombo.SelectedItem as string;
                 var spkName = SpeakerCombo.SelectedItem as string;
-                if (spkName == null || micName == null) return;
+                bool wantMic = IncludeMicCheck.IsChecked ?? true;
+                bool wantSys = RecordSysCheck.IsChecked ?? true;
+                if (!wantMic && !wantSys) return;
+                if (wantMic && micName == null) return;
+                if (wantSys && spkName == null) return;
 
                 _engine.MicGain = MicGain.Value;
                 _engine.LoopGain = LoopGain.Value;
 
                 await _engine.MonitorAsync(new RecorderStartOptions
                 {
-                    LoopbackDeviceId = _spkDict[spkName]!.DeviceID,
-                    MicDeviceId = _micDict[micName].DeviceID
+                    LoopbackDeviceId = wantSys && spkName != null ? _spkDict[spkName].DeviceID : null,
+                    MicDeviceId = wantMic && micName != null ? _micDict[micName].DeviceID : null
                 });
                 StatusText.Text = "Monitoring...";
             });
@@ -252,21 +256,27 @@ namespace Hearbud
 
                 var micName = MicCombo.SelectedItem as string;
                 var spkName = SpeakerCombo.SelectedItem as string;
+                bool wantMic = IncludeMicCheck.IsChecked ?? true;
+                bool wantSys = RecordSysCheck.IsChecked ?? true;
 
-                if (spkName == null)
+                if (!wantMic && !wantSys)
+                {
+                    WpfMessageBox.Show("Keep system audio or microphone on to record.", "Nothing to record",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                if (wantSys && spkName == null)
                 {
                     WpfMessageBox.Show("Select an output device to capture.", "Missing device",
                         MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
                 }
-                if (micName == null && (IncludeMicCheck.IsChecked ?? true))
+                if (wantMic && micName == null)
                 {
                     WpfMessageBox.Show("Select a microphone.", "Missing device",
                         MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
                 }
-
-                MMDevice? loopDevice = _spkDict[spkName];
 
                 _engine.MicGain = MicGain.Value;   // meters & mix balance
                 _engine.LoopGain = LoopGain.Value; // meters & mix balance
@@ -274,10 +284,10 @@ namespace Hearbud
                 await _engine.StartAsync(new RecorderStartOptions
                 {
                     OutputPath = Path.Combine(outDir, baseName),
-                    LoopbackDeviceId = loopDevice!.DeviceID,
-                    MicDeviceId = (IncludeMicCheck.IsChecked ?? true) && micName != null ? _micDict[micName].DeviceID : null,
+                    LoopbackDeviceId = wantSys && spkName != null ? _spkDict[spkName].DeviceID : null,
+                    MicDeviceId = wantMic && micName != null ? _micDict[micName].DeviceID : null,
                     Mp3BitrateKbps = GetSelectedBitrateKbps(),
-                    IncludeMic = IncludeMicCheck.IsChecked ?? true,
+                    IncludeMic = wantMic,
                     WriteStems = WriteStemsCheck.IsChecked ?? true
                 });
 
@@ -560,6 +570,7 @@ namespace Hearbud
                 _settings.Mp3BitrateKbps = GetSelectedBitrateKbps();
                 _settings.WriteStems = WriteStemsCheck.IsChecked ?? true;
                 _settings.IncludeMic = IncludeMicCheck.IsChecked ?? true;
+                _settings.IncludeSystem = RecordSysCheck.IsChecked ?? true;
                 _settings.Save();
             }
             catch { /* best-effort */ }
@@ -597,6 +608,7 @@ namespace Hearbud
 
                 WriteStemsCheck.IsChecked = _settings.WriteStems;
                 IncludeMicCheck.IsChecked = _settings.IncludeMic;
+                RecordSysCheck.IsChecked = _settings.IncludeSystem;
             }
             catch (Exception ex)
             {
