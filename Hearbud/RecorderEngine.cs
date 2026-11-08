@@ -107,7 +107,7 @@ namespace Hearbud
     }
 
     // --- ASYNC WRITER DEFINITIONS ---
-    internal enum AudioFileTarget { System, Mic, Mix }
+    public enum AudioFileTarget { System, Mic, Mix }
 
     internal readonly struct AudioWriteJob
     {
