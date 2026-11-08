@@ -21,6 +21,7 @@ public class HistoryRepairTests : IDisposable
     public void Dispose()
     {
         try { Directory.Delete(_tmp, true); } catch { }
+        GC.SuppressFinalize(this);
     }
 
     private string StorePath => Path.Combine(_tmp, "history.json");

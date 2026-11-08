@@ -11,7 +11,7 @@ public class RecorderEngineWatchdogTests : IDisposable
 {
     private readonly RecorderEngine _engine = new();
     private static readonly Type T = typeof(RecorderEngine);
-    public void Dispose() => _engine.Dispose();
+    public void Dispose() { _engine.Dispose(); GC.SuppressFinalize(this); }
 
     private static long MsAgo(double ms) => Stopwatch.GetTimestamp() - (long)(ms * Stopwatch.Frequency / 1000.0);
     private void Set(string field, object? v) => T.GetField(field, BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(_engine, v);

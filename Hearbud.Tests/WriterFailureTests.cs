@@ -18,7 +18,7 @@ public class WriterFailureTests : IDisposable
         _tmp = Path.Combine(Path.GetTempPath(), "hearbud-wf-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_tmp);
     }
-    public void Dispose() { try { Directory.Delete(_tmp, true); } catch { } }
+    public void Dispose() { try { Directory.Delete(_tmp, true); } catch { } GC.SuppressFinalize(this); }
 
     [Theory]
     [InlineData(unchecked((int)0x80070070), true)]

@@ -12,7 +12,7 @@ public class RecorderEnginePublicTests : IDisposable
 {
     private readonly RecorderEngine _engine = new();
 
-    public void Dispose() => _engine.Dispose();
+    public void Dispose() { _engine.Dispose(); GC.SuppressFinalize(this); }
 
     // ── Construction ──────────────────────────────────────────────────────────
 

@@ -23,7 +23,7 @@ public class RecorderEngineChaosTests : IDisposable
         Directory.CreateDirectory(_tmp);
     }
 
-    public void Dispose() { try { Directory.Delete(_tmp, true); } catch { } }
+    public void Dispose() { try { Directory.Delete(_tmp, true); } catch { } GC.SuppressFinalize(this); }
 
     private static readonly Type EngineType = typeof(RecorderEngine);
 

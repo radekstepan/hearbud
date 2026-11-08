@@ -34,6 +34,7 @@ public class AppSettingsTests : IDisposable
             File.WriteAllText(ConfigPath, _backup);
         else if (File.Exists(ConfigPath))
             File.Delete(ConfigPath);
+        GC.SuppressFinalize(this);
     }
 
     // ── Default values ────────────────────────────────────────────────────────
