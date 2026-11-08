@@ -9,8 +9,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <NoWarn>NU1701</NoWarn>
     <!-- Test method names use the Unit_State_Expected convention with underscores;
-         they are never public API, so CA1707 (identifier naming) is not applicable. -->
-    <NoWarn>$(NoWarn);CA1707</NoWarn>
+         they are never public API, so CA1707 (identifier naming) is not applicable.
+         Small inline `new[]` literals at assert sites are intentional for readability;
+         hoisting them to fields (CA1861) would obscure the tests for zero benefit. -->
+    <NoWarn>$(NoWarn);CA1707;CA1861</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
