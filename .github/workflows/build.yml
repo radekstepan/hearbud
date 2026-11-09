@@ -188,6 +188,7 @@ jobs:
             }
             $v = $Matches[0]
           }
+          Write-Host "resolved version: $v"
           "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Set up .NET
