@@ -186,7 +186,7 @@ jobs:
             if ($text -notmatch '<Version>(\d+\.\d+\.\d+)</Version>') {
               throw 'No <Version> found in Directory.Build.props'
             }
-            $v = $Matches[0]
+            $v = $Matches[1]
           }
           Write-Host "resolved version: $v"
           "version=$v" >> $env:GITHUB_OUTPUT
