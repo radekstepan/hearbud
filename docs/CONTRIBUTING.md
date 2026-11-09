@@ -745,11 +745,13 @@ Release notes come from the `.changeset/` entries merged since the last release 
 - Compact main window with footer transport; crash diagnostics without log file
 ```
 
-### Git Tag
+### Git Tag (publishes the GitHub Release)
+
+Pushing a `vX.Y.Z` tag runs the `release` job: it checks the tag matches `<Version>` in `Directory.Build.props`, then builds, tests, publishes win-x64, and creates the GitHub Release with a `Hearbud-X.Y.Z-win-x64.zip` asset (auto-generated notes):
 
 ```bash
-git tag -a v0.3.3 -m "Release v0.3.3"
-git push origin v0.3.3
+git tag -a v0.4.0 -m "Release v0.4.0"
+git push origin v0.4.0
 ```
 
 ---

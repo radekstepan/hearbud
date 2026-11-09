@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: ['**']
+    tags: ['v*']
   workflow_dispatch:
 
 # Serialize runs per branch so concurrent master pushes can't race the version bump.
@@ -34,6 +35,10 @@ jobs:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag: changeset gate skipped (release flow)"
+            exit 0
+          fi
           if [[ "${GITHUB_REF}" == "refs/heads/master" ]]; then
             echo "master: changeset gate skipped (release flow owns versioning there)"
             exit 0
@@ -60,6 +65,7 @@ jobs:
           echo "changeset gate passed ($count file(s))"
 
   build-windows:
+    if: github.ref_type == 'branch'
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     steps:
@@ -241,3 +247,145 @@ jobs:
         with:
           name: Hearbud-${{ steps.version.outputs.version }}-windows
           path: dist/win-x64
+
+  # Tag releases: pushing vX.Y.Z builds, tests, and publishes the win-x64
+  # exe, then creates the GitHub Release with a zip asset. The tag must
+  # match <Version> in Directory.Build.props (checked below).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+
+      - name: Preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            throw 'missing: git (install Git for Windows machine-wide)'
+          }
+          $vc = Join-Path $env:SystemRoot 'System32\vcruntime140.dll'
+          if (-not (Test-Path $vc)) {
+            throw 'missing: vcruntime140.dll (install the VC++ Redistributable)'
+          }
+          try {
+            [Net.Dns]::GetHostEntry('api.nuget.org') | Out-Null
+          } catch {
+            throw 'no usable network: cannot resolve api.nuget.org'
+          }
+          # Informational only: the SDK comes from setup-dotnet later, so an
+          # absent/stale SDK here must not fail the job — just warn.
+          $dotnetCmd = Get-Command dotnet -ErrorAction SilentlyContinue
+          if ($dotnetCmd) {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $sdks = dotnet --list-sdks 2>$null
+            if ($sdks -match '8\.0\.1\d\d') {
+              Write-Host 'dotnet SDK 8.0.1xx present pre-setup'
+            } else {
+              Write-Warning 'dotnet SDK 8.0.1xx not found pre-setup; setup-dotnet will install it (DOTNET_INSTALL_DIR=$env:RUNNER_TOOL_CACHE\dotnet)'
+            }
+          } else {
+            Write-Warning 'dotnet not on PATH pre-setup; setup-dotnet will install SDK 8 into the runner tool cache'
+          }
+          $drive = Get-PSDrive -Name C -ErrorAction Stop
+          $freeGB = [math]::Round($drive.Free / 1GB, 2)
+          Write-Host "C: free ${freeGB}GB"
+          if ($drive.Free -lt 5GB) {
+            throw "insufficient disk space on C: (${freeGB}GB free, need >= 5GB; free space or expand the volume)"
+          }
+          $toolCache = $env:RUNNER_TOOL_CACHE
+          if ([string]::IsNullOrWhiteSpace($toolCache)) {
+            throw 'missing: RUNNER_TOOL_CACHE env var (runner misconfigured; setup-dotnet install target unknown)'
+          }
+          if (-not (Test-Path $toolCache)) {
+            throw "missing: RUNNER_TOOL_CACHE dir '$toolCache' does not exist (runner misconfigured)"
+          }
+          $probe = Join-Path $toolCache '.hearbud-write-probe'
+          try {
+            [IO.File]::WriteAllText($probe, 'ok')
+            Remove-Item $probe -Force
+          } catch {
+            throw "not writable: RUNNER_TOOL_CACHE '$toolCache' is not writable by the runner service account (check ACLs / service identity)"
+          }
+          git --version
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $text = [IO.File]::ReadAllText('Directory.Build.props')
+          if ($text -notmatch '<Version>(\d+\.\d+\.\d+)</Version>') {
+            throw 'No <Version> found in Directory.Build.props'
+          }
+          $v = $Matches[1]
+          if ("v$v" -ne "${{ github.ref_name }}") {
+            throw "Tag/tree mismatch: tag is ${{ github.ref_name }} but tree version is $v"
+          }
+          Write-Host "resolved version: $v"
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          # Band must match global.json (8.0.100 + rollForward latestPatch):
+          # 8.0.1xx keeps the SDK in the 8.0.100 feature band.
+          dotnet-version: 8.0.1xx
+        env:
+          # The self-hosted runner runs as NETWORK SERVICE: Program Files is
+          # not writable, so install the SDK into the runner tool cache.
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}\dotnet
+
+      - name: Verify .NET
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+            throw 'missing: dotnet after setup-dotnet'
+          }
+          dotnet --list-sdks
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            if ($attempt -gt 1) {
+              # Drop possibly truncated downloads before retrying.
+              dotnet nuget locals http-cache --clear | Out-Null
+              Start-Sleep -Seconds 30
+            }
+            dotnet restore Hearbud.sln
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw 'dotnet restore failed after 3 attempts' }
+          }
+
+      - name: Test
+        shell: pwsh
+        run: dotnet test Hearbud.sln -c Release --no-restore
+
+      - name: Publish win-x64
+        shell: pwsh
+        run: dotnet publish Hearbud/Hearbud.csproj -c Release -r win-x64 --self-contained -o ./dist/win-x64
+
+      - name: Zip exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "Hearbud-${{ steps.version.outputs.version }}-win-x64.zip"
+          Compress-Archive -Path dist/win-x64/* -DestinationPath $zip -Force
+          Write-Host "created: $zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Hearbud ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: Hearbud-${{ steps.version.outputs.version }}-win-x64.zip
