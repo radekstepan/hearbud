@@ -382,10 +382,50 @@ jobs:
           Write-Host "created: $zip"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Hearbud ${{ steps.version.outputs.version }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: Hearbud-${{ steps.version.outputs.version }}-win-x64.zip
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # No third-party release action on purpose (a softprops pin broke
+          # workflow startup; API calls need no allowlist): create the
+          # release and upload the zip via the REST API.
+          # Idempotent: reuses the release if the tag run is retried and
+          # replaces an asset with the same name.
+          $tag = "${{ github.ref_name }}"
+          $version = "${{ steps.version.outputs.version }}"
+          $zip = "Hearbud-$version-win-x64.zip"
+          if (-not (Test-Path $zip)) { throw "missing asset: $zip" }
+          $api = "https://api.github.com/repos/${{ github.repository }}"
+          $h = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          try {
+            $rel = Invoke-RestMethod -Uri "$api/releases/tags/$tag" -Headers $h
+            Write-Host "release exists: id=$($rel.id)"
+          } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            if ($status -eq 404) {
+              $body = @{
+                tag_name = $tag
+                name = "Hearbud $version"
+                generate_release_notes = $true
+              } | ConvertTo-Json
+              $rel = Invoke-RestMethod -Uri "$api/releases" -Method Post -Headers $h -Body $body -ContentType 'application/json'
+              Write-Host "created release: id=$($rel.id)"
+            } else { throw }
+          }
+          foreach ($a in $rel.assets) {
+            if ($a.name -eq $zip) {
+              Write-Host "deleting existing asset: $($a.name)"
+              Invoke-RestMethod -Uri "$api/releases/assets/$($a.id)" -Method Delete -Headers $h | Out-Null
+            }
+          }
+          $uploadUrl = $rel.upload_url -replace '\{\?.*$', "?name=$zip"
+          Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'Content-Type' = 'application/zip'
+          } -InFile $zip | Out-Null
+          Write-Host "uploaded: $zip"
