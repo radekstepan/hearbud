@@ -121,10 +121,12 @@ jobs:
           }
           git --version
 
-      - name: Bump patch version
+      - name: Bump version
         id: bump
         if: github.ref == 'refs/heads/master'
         shell: pwsh
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
@@ -140,12 +142,18 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'git reset failed' }
 
             # Source of truth: Directory.Build.props (<Version>X.Y.Z</Version>).
+            # Default is a patch bump; [minor]/[major] in the head commit
+            # message bump minor/major instead ([major] wins if both present).
             $props = 'Directory.Build.props'
             $text = [IO.File]::ReadAllText($props)
             if ($text -notmatch '<Version>(\d+)\.(\d+)\.(\d+)</Version>') {
               throw "No <Version> found in $props"
             }
-            $newVersion = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+            $major, $minor, $patch = [int]$Matches[1], [int]$Matches[2], [int]$Matches[3]
+            $msg = [string]$env:COMMIT_MSG
+            if ($msg.Contains('[major]')) { $newVersion = "$($major + 1).0.0" }
+            elseif ($msg.Contains('[minor]')) { $newVersion = "$major.$($minor + 1).0" }
+            else { $newVersion = "$major.$minor.$($patch + 1)" }
             # NOTE: -replace must stay in its own statement. Inside a method
             # call the comma would split into a third argument and fail with
             # "Cannot find an overload for WriteAllText and the argument count: 3".

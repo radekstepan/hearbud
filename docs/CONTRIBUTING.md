@@ -683,10 +683,15 @@ Audio callbacks are on background threads. Use thread-aware debugging:
 The version lives in `Directory.Build.props` (single source of truth) and is bumped automatically by CI on every push to master — do not bump it by hand in feature branches:
 
 ```xml
-<Version>0.3.3</Version>
+<Version>0.4.0</Version>
 ```
 
-Version format: `Major.Minor.Build` (no revision)
+Version format: `Major.Minor.Build` (no revision). The auto-bump is a patch bump by default; put `[minor]` or `[major]` in the pushed head commit message for a minor/major release instead (`[major]` wins if both are present):
+
+- `[minor]`: `0.3.3` → `0.4.0`
+- `[major]`: `0.3.3` → `1.0.0`
+
+The bumped version is committed back to master (`chore: bump version to X.Y.Z [skip ci]`), then the Windows job builds, tests, publishes, and uploads the `Hearbud-X.Y.Z-windows` artifact with the exe.
 
 **Update Criteria:**
 - Major Breaking changes, major features
