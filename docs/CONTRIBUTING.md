@@ -686,12 +686,14 @@ The version lives in `Directory.Build.props` (single source of truth) and is bum
 <Version>0.4.0</Version>
 ```
 
-Version format: `Major.Minor.Build` (no revision). The auto-bump is a patch bump by default; put `[minor]` or `[major]` in the pushed head commit message for a minor/major release instead (`[major]` wins if both are present):
+Version format: `Major.Minor.Build` (no revision). The auto-bump is a patch bump by default; put `[minor]` or `[major]` in the pushed head commit **subject line** for a minor/major release instead (`[major]` wins if both are present; body text never counts, so bodies can mention the markers freely):
 
 - `[minor]`: `0.3.3` → `0.4.0`
 - `[major]`: `0.3.3` → `1.0.0`
 
-The bumped version is committed back to master (`chore: bump version to X.Y.Z [skip ci]`), then the Windows job builds, tests, publishes, and uploads the `Hearbud-X.Y.Z-windows` artifact with the exe.
+To publish the tree version exactly as-is (e.g. to correct a bad bump), set `<Version>` by hand and put `[no-bump]` in the head commit message: CI skips the bump commit and builds, tests, publishes, and uploads that exact version.
+
+Otherwise the bumped version is committed back to master (`chore: bump version to X.Y.Z [skip ci]`), then the Windows job builds, tests, publishes, and uploads the `Hearbud-X.Y.Z-windows` artifact with the exe.
 
 **Update Criteria:**
 - Major Breaking changes, major features
