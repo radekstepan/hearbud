@@ -27,19 +27,35 @@ This document provides guidelines for contributing to Hearbud, including setup, 
 hearbud/
 ├── build.sh                          # Build script
 ├── Hearbud.sln                       # Visual Studio solution
+├── Directory.Build.props             # Shared MSBuild props (app version lives here)
+├── global.json                       # Pinned .NET SDK
+├── .changeset/                       # Pending release notes (one file per change)
 ├── Hearbud/                          # Main project directory
-│   ├── App.xaml                      # App entry point and global handlers
-│   ├── App.xaml.cs
+│   ├── App.xaml / .xaml.cs           # App entry point and global handlers
 │   ├── AppSettings.cs                # Settings persistence
 │   ├── Dbfs.cs                       # Audio level calculations
 │   ├── Hearbud.csproj                # Project file
 │   ├── MainWindow.xaml               # Main UI window layout
-│   ├── MainWindow.cs                 # Main window code-behind
+│   ├── MainWindow.xaml.cs            # Main window code-behind
+│   ├── SettingsWindow.xaml           # Settings dialog layout
+│   ├── SettingsWindow.xaml.cs        # Settings dialog code-behind
 │   ├── RecorderEngine.cs             # Core audio engine
+│   ├── UsbTopology.cs                # Shared-USB-hub probe
+│   ├── UiDiagnostics.cs              # UI-health diagnostics helpers
+│   ├── HistoryStore.cs               # Session history JSON (unwired from UI)
+│   ├── SessionManifest.cs            # Crash bookkeeping
+│   ├── WavRepair.cs                  # WAV header fix / recovery
+│   ├── WriterHealth.cs               # Disk-full / high-water tracking
 │   └── hearbud.ico                   # App icon
+├── Hearbud.Tests/                    # xUnit test project (net8.0-windows)
 ├── docs/                             # Documentation
 │   ├── ARCHITECTURE.md               # Architecture overview
 │   ├── WORKING_WITH_AUDIO.md         # Audio/DSP specifics
+│   ├── EDGE_CASES.md                 # Edge-case matrix (rule/test/probe)
+│   ├── LLM_QUICK_REFERENCE.md        # Condensed LLM reference
+│   ├── TROUBLESHOOTING.md            # Common issues and solutions
+│   ├── WINDOWS-RUNNER.md             # Self-hosted runner notes
+│   ├── README.md                     # Docs index
 │   └── CONTRIBUTING.md               # This file
 └── README.md                          # Project README
 ```
@@ -190,13 +206,14 @@ Hearbud follows standard .NET conventions with some project-specific rules:
 | Methods | PascalCase | `StartRecording()`, `EnqueueWrite()` |
 | Properties | PascalCase | `MicGain`, `LoopGain` |
 | Fields (private) | _camelCase | `_micIn`, `_wavMix`, `_disposed` |
-| Fields (readonly) | _CAMEL_CASE | `LOOP_SILENT_MS_THRESHOLD` (constants) |
+| Constants | PascalCase | `LoopSilentMsThreshold`, `FixedFramesPerChannel` |
+| Fields (private static readonly) | _camelCase | `_rng` |
 | Local variables | camelCase | `blockPeak`, `conv`, `srcCh` |
 | Parameters | camelCase | `opts`, `sourceData`, `count` |
 | Events | PascalCase | `LevelChanged`, `Status`, `EncodingProgress` |
 | Enums | PascalCase | `LevelSource`, `EngineStatusKind` |
 | Interfaces | IPascalCase | (No interfaces currently in Hearbud) |
-| Private methods | camelCase | `OnLoopbackData()`, `ConvertToTarget()` |
+| Private methods | PascalCase | `OnLoopbackData()`, `ConvertToTargetChunked()` |
 
 ### File Organization
 
@@ -415,14 +432,14 @@ private void OnLoopbackData(object? sender, DataAvailableEventArgs e)
     // ✗ NO: allocations, I/O, locks (unless quick), exceptions
     // ✗ NO: LINQ (allocates), reflection, serialization
 
-    // Good
+    // Good (straight sum; the real mix then normalizes only on overs)
     for (int i = 0; i < count; i++)
     {
-        _mixBufF[i] = (_loopBufF[i] * LoopGain + _micBufF[i] * MicGain) * 0.5f;
+        _mixBufF[i] = (float)(_loopBufF[i] * LoopGain + _micBufF[i] * MicGain);
     }
 
     // Bad (allocates)
-    var mixed = _loopBufF.Zip(_micBufF, (l, m) => (l + m) * 0.5f).ToArray();
+    var mixed = _loopBufF.Zip(_micBufF, (l, m) => l + m).ToArray();
 }
 ```
 
@@ -489,10 +506,10 @@ Since Hearbud is a desktop app interacting with audio hardware, testing requires
 
 #### MP3 Encoding
 
-- [ ] Set quality to "192 kbps (MP3)"
+- [ ] Set Settings → Output Format to "WAV + MP3", bitrate to "192 kbps"
 - [ ] Record, verify `*.mp3` file created
 - [ ] Compare mix.wav and mix.mp3: should sound similar
-- [ ] Test "Original (WAV)": Only WAVs, no MP3
+- [ ] Test "WAV master" format: Only WAVs, no MP3
 - [ ] Verify progress bar shows during encoding
 
 #### Edge Cases
@@ -542,10 +559,12 @@ Since Hearbud is a desktop app interacting with audio hardware, testing requires
 Hearbud writes session logs alongside output files (e.g., `rec-20250623_143022.txt`):
 
 ```
-[2025-12-23 14:30:22.123] INFO Start: Recording started
-[2025-12-23 14:30:22.456] INFO OnLoopbackData: Mic ring backlog: 0.0523 s (max 0.1200 s)
-[2025-12-23 14:30:25.789] WARN OnMicData: Mic underrun detected
+[2026-11-08 14:30:22.123] INFO Info: Recording started
+[2026-11-08 14:30:22.456] INFO Info: lagTime=0.052s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.120s masterFrames=… resyncs=0 trim=… lagWatch=ok
+[2026-11-08 14:30:25.789] WARN Warn: Master-clock resync: dropped 4800 mic samples (backlog 0.100s > 0.08s, resync #1)
 ```
+
+(The doubled `INFO Info:` / `WARN Warn:` tag is real: the `Info()`/`Warn()`/`Error()` wrappers forward to `WriteLog`, whose `[CallerMemberName]` captures the wrapper name, not the original call site.)
 
 **Log Categories:**
 - `INFO` - Normal operations
@@ -568,18 +587,13 @@ Audio and engine hot paths log transitions only:
   `OnMicData`), tick or timestamp, and the relevant counter values, so
   a log line is diagnosable without a debugger attached.
 
-### Crash Logs
+### Crash Diagnostics
 
-Crashes and diagnostics are logged to `logs.txt` in the output folder
-(same folder as the per-session logs), falling back to
-`%LocalAppData%\Hearbud\logs.txt` when the output folder is unset or
-unwritable:
-
-```
-[2025-12-23 14:35:10] ERROR AppDomain.UnhandledException:
-System.NullReferenceException: Object reference not set to an instance of an object.
-   at Hearbud.RecorderEngine.OnLoopbackData(Object sender, DataAvailableEventArgs e)
-```
+Hearbud does not write crash or diagnostic log files. Fatal errors are shown
+in the crash dialog with the full exception text, and diagnostic output is
+routed to the debugger only (`System.Diagnostics.Debug.WriteLine`). Per-session
+recording logs (`<base>.txt`) are separate and still written next to the audio
+files.
 
 ### Visual Studio Debugging
 
@@ -666,10 +680,10 @@ Audio callbacks are on background threads. Use thread-aware debugging:
 
 ### Bumping Version
 
-Update version in `Hearbud/Hearbud.csproj`:
+The version lives in `Directory.Build.props` (single source of truth) and is bumped automatically by CI on every push to master — do not bump it by hand in feature branches:
 
 ```xml
-<Version>0.2.7</Version>
+<Version>0.3.3</Version>
 ```
 
 Version format: `Major.Minor.Build` (no revision)
@@ -695,40 +709,40 @@ dotnet publish Hearbud/Hearbud.csproj -c Release -r win-arm64 \
 ```
 
 **Output:**
-- `dist/win-x64/Hearbud.exe` (self-contained, ~30 MB)
-- `dist/win-arm64/Hearbud.exe` (self-contained, ~30 MB)
+- `dist/win-x64/Hearbud.exe` (self-contained single file)
+- `dist/win-arm64/Hearbud.exe` (self-contained single file)
 
 ### Creating Release Archive
 
 ```powershell
-# Create .zip for distribution
-Compress-Archive -Path dist/win-x64\* -DestinationPath Hearbud-v0.2.7-win-x64.zip
-Compress-Archive -Path dist/win-arm64\* -DestinationPath Hearbud-v0.2.7-win-arm64.zip
+# Create .zip for distribution (use the current version from Directory.Build.props)
+Compress-Archive -Path dist/win-x64\* -DestinationPath Hearbud-v0.3.3-win-x64.zip
+Compress-Archive -Path dist/win-arm64\* -DestinationPath Hearbud-v0.3.3-win-arm64.zip
 ```
 
-### Updating README
+### Release Notes
 
-Add release notes to `README.md`:
+Release notes come from the `.changeset/` entries merged since the last release (see [Changesets](#changesets)), not from a hand-edited changelog:
 
 ```markdown
-## [0.2.7] - 2025-12-23
+## [0.3.3] - 2026-11-08
 
 ### Added
-- MP3 bitrate selector (96-320 kbps)
-- Better meter rendering (smoothed interpolation)
+- Settings dialog (output format, auto-stop limits, countdown, hotkeys)
+- USB shared-hub warning banner
 
 ### Fixed
-- Mic sync issues when loopback resumes after silence
+- Include-checkbox glitch (soft-mute instead of device restart)
 
 ### Changed
-- Deprecated "Audio Quality" string setting, replaced with numeric bitmask
+- Compact main window with footer transport; crash diagnostics without log file
 ```
 
 ### Git Tag
 
 ```bash
-git tag -a v0.2.7 -m "Release v0.2.7: MP3 improvements"
-git push origin v0.2.7
+git tag -a v0.3.3 -m "Release v0.3.3"
+git push origin v0.3.3
 ```
 
 ---

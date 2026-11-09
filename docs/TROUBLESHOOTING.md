@@ -142,12 +142,23 @@ Get-Service -Name "AudioSrv"
 
 **Diagnosis:** Check session log (`*.txt`) for errors:
 ```
-[...] ERROR OnLoopbackData: CSCore.CoreAudioAPI.MMDeviceException
+[...] ERROR Error: OnLoopbackData: CSCore.CoreAudioAPI.MMDeviceException
 ```
 
 **Solution:**
 - Avoid unplugging devices during recording
 - Use robust connections (USB hub with stable power, etc.)
+
+### "Mic and Mouse Share a USB Hub" Warning
+
+**Symptom:** Amber banner in the Devices group saying the microphone and a mouse sit behind the same USB hub, plus one tray balloon.
+
+**Cause:** Hearbud probes the USB device tree at startup (and on Refresh Devices). A mic and mouse behind one generic hub has been observed to swallow mouse clicks before Windows delivers them — the app then looks frozen even though its UI thread is healthy. No software can recover input the OS never received.
+
+**Solution:**
+- Plug the mic (or the mouse) into a different USB port, ideally directly on the PC rather than through the shared hub
+- Click Refresh Devices to re-run the probe without restarting
+- The check is best-effort: if it cannot read the topology it stays silent rather than erroring
 
 ### Virtual Audio Drivers Not Detected
 
@@ -291,19 +302,19 @@ Get-Service -Name "AudioSrv"
 
 **Cause:** Clock drift between microphone ADC and system DAC
 
-**Normal Behavior:** Small drift (≤50 ms) is expected and compensated by ring buffer.
+**Normal Behavior:** Small drift (≤50 ms) is expected and absorbed by the trim loop and FIFOs.
 
 **If large delay (>100 ms):**
 
 #### Check Session Log
 
 ```text
-[...] INFO OnLoopbackData: Mic ring backlog: 0.1523 s (max 0.2000 s)
+[...] INFO Info: lagTime=0.152s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.200s masterFrames=… resyncs=2 trim=… lagWatch=LAG
 ```
 
-- `backlog`: ~0.1s is normal sync
-- `backlog` consistently near 0: Mic is too slow (underruns)
-- `backlog` consistently near max (4s): Mic is too fast (overruns)
+- `lagWatch=ok` with small `lagTime`: normal sync
+- `under`/`silenced` climbing: Mic is too slow (underruns)
+- `over` climbing or backlogs past 80 ms (`LAG`, `resyncs` counting): Mic is too fast or drift too large for trim
 
 **Workarounds:**
 - Record silence-only first to see drift direction
@@ -457,7 +468,7 @@ Get-Service -Name "AudioSrv"
 
 **Solution (for developers):**
 - Offload work to `Task.Run` or background threads
-- Use `Dispatcher.Invoke` only for minimal UI updates
+- Meters run on a UI-thread `DispatcherTimer` tick; marshal to the UI with `BeginInvoke` and keep the tick handler minimal
 
 #### Timer Disabled
 
@@ -465,7 +476,7 @@ Get-Service -Name "AudioSrv"
 
 **Solution (for developers):**
 - Ensure timer not accidentally `Stop()`-ed
-- Check timer interval: Should be 100 ms (set in MainWindow ctor)
+- Check timer interval: Should be 100 ms (set in the `_uiTimer` field initializer)
 
 ### High Memory Usage
 
@@ -513,20 +524,20 @@ Get-Service -Name "AudioSrv"
 
 **Causes:**
 
-#### Quality Set to "Original (WAV)"
+#### Format Set to "WAV master" (MP3 Off)
 
-**Diagnosis:** Output Quality dropdown shows "Original (WAV)" selected
+**Diagnosis:** Settings → Output Format shows "WAV master" selected
 
 **Solution:**
-- Select a bit rate (e.g., "192 kbps (MP3)")
+- Select "WAV + MP3" and a bit rate (e.g., "192 kbps")
 - `Mp3BitrateKbps` becomes > 0, enables encoding
 
 #### MP3 Encoding Failed
 
 **Diagnosis:** Session log shows:
 ```
-[...] INFO Encoding MP3: ... @ 192kbps
-[...] ERROR MP3 encode: CSCore.MediaFoundation.MediaFoundationException
+[...] INFO Info: Encoding MP3: ... @ 192kbps
+[...] ERROR Error: MP3 encode: CSCore.MediaFoundation.MediaFoundationException
 ```
 
 **Solution:**
@@ -540,7 +551,7 @@ Get-Service -Name "AudioSrv"
 
 **Solution:**
 - Increase bit rate: 192 kbps minimum for music, 128 kbps for speech
-- Check "Output Quality" dropdown
+- Check Settings → MP3 Bitrate (96–320 kbps)
 
 **Bit Rate Guide:**
 - 96 kbps: Acceptable for speech, low-quality music
@@ -580,19 +591,10 @@ Get-Service -Name "AudioSrv"
 
 **Actions:**
 
-1. **Check Crash Log:**
-   - Location: `%LocalAppData%\Hearbud\logs.txt`
-   - Example: `C:\Users\YourName\AppData\Local\Hearbud\logs.txt`
+1. **Read the crash dialog:** Hearbud shows the full exception and stack
+   trace there and does not write a `logs.txt` file.
 
-2. **Example Crash Log:**
-   ```
-   [2025-12-23 14:35:10] ERROR AppDomain.UnhandledException:
-   System.NullReferenceException: Object reference not set to an instance of an object.
-      at Hearbud.RecorderEngine.OnLoopbackData(Object sender, DataAvailableEventArgs e)
-      at CSCore.SoundInSource..cctor()
-   ```
-
-3. **Analyze Stack Trace:**
+2. **Analyze Stack Trace:**
    - Method name: Where crash occurred
    - Exception type: What kind of error
    - Common exceptions:
@@ -617,18 +619,18 @@ Session log (`*.txt` in output folder) is invaluable for diagnosing:
 #### Mic Sync Issues
 
 ```text
-[...] INFO OnLoopbackData: Mic ring backlog: 0.1523 s (max 0.2000 s)
-[...] WARN OnLoopbackData: Mic underrun detected
+[...] INFO Info: lagTime=0.152s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.200s masterFrames=… resyncs=2 trim=… lagWatch=LAG
+[...] WARN Warn: Master-clock resync: dropped 4800 mic samples (backlog 0.100s > 0.08s, resync #1)
 ```
 
-- Consistently low backlog (<0.05 s): Mic slow
-- Consistently high backlog (>0.2 s): Mic fast
-- Frequent underruns: Clock mismatch or device issue
+- `under`/`silenced` climbing: Mic slow (underruns)
+- `over` climbing or `lagWatch=LAG` with `resyncs` counting: Mic fast or excessive drift
+- Frequent resyncs: Clock mismatch or device issue
 
 #### Write Queue Issues
 
 ```text
-[...] WARN DiskWriteLoop: Disk write error: The device is not ready
+[...] WARN Warn: Disk write failed (Mix): The device is not ready …
 ```
 
 - Disk failure, network drive offline, etc.
@@ -636,7 +638,7 @@ Session log (`*.txt` in output folder) is invaluable for diagnosing:
 #### Encoding Errors
 
 ```text
-[...] ERROR MP3 encode: CSCore.MediaFoundation.MediaFoundationException: HRESULT 0xC00D36E4
+[...] ERROR Error: MP3 encode: CSCore.MediaFoundation.MediaFoundationException: HRESULT 0xC00D36E4
 ```
 
 - Code indicates specific Media Foundation failure
@@ -743,7 +745,7 @@ Use WPT (Windows Performance Toolkit) for GPU, disk, DPC analysis.
    - Windows version (10/11, build number)
    - Audio hardware (mic, speakers, drivers)
    - Steps to reproduce
-   - Log files (`logs.txt`, session `*.txt`)
+   - Session log files (`*.txt` next to the recordings)
 3. **Post issue** with clear title and reproduction steps
 
 Thanks for using Hearbud! 🎧

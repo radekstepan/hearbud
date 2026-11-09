@@ -35,7 +35,7 @@ Welcome to the Hearbud documentation hub. This directory contains comprehensive 
 ## Key Concepts to Understand
 
 ### Architecture
-- **Three Parallel WAV Files:** System, mic, and mix are always written separately
+- **Parallel WAV Files:** Mix is always written; system/mic stems are optional (`WriteStems`)
 - **Loopback as Clock Source:** System audio drives timing; mic is buffered and synchronized
 - **Async I/O with Pooling:** Disk writes offloaded to background thread, buffer pooling prevents GC pressure
 
@@ -67,6 +67,9 @@ Each documentation file serves a specific purpose:
 | WORKING_WITH_AUDIO.md | Devs, LLMs | Audio/DSP theory, WASAPI specifics, math, sync, metering, dithering |
 | CONTRIBUTING.md | Devs, contributors | Build setup, coding style, testing, releasing |
 | TROUBLESHOOTING.md | Users, devs | Common problems, error meanings, solutions, log analysis |
+| EDGE_CASES.md | Devs, LLMs | Edge-case matrix: rule, pinning test, manual probe |
+| LLM_QUICK_REFERENCE.md | LLMs, devs | Condensed codebase reference for quick lookup |
+| WINDOWS-RUNNER.md | Maintainers | Self-hosted Windows runner notes |
 
 ## Conventions Used in Documentation
 
@@ -84,6 +87,6 @@ Each documentation file serves a specific purpose:
 
 ---
 
-**Last Updated:** December 23, 2025
+**Last Updated:** November 8, 2026
 
-**Hearbud Version:** 0.2.7
+**Hearbud Version:** 0.3.3

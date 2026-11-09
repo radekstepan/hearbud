@@ -1,0 +1,133 @@
+<Window x:Class="Hearbud.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Settings" Height="560" Width="480"
+        MinHeight="440" MinWidth="420"
+        ResizeMode="CanResize"
+        Background="{StaticResource AppBackground}"
+        Foreground="{StaticResource ControlForeground}"
+        UseLayoutRounding="True"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False">
+    <DockPanel LastChildFill="True" Margin="16">
+        <StackPanel Orientation="Horizontal" DockPanel.Dock="Bottom"
+                    HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button x:Name="OkBtn" Content="OK" Width="90" Click="OnOk"
+                    Style="{StaticResource AccentButton}"
+                    AutomationProperties.Name="Save settings"/>
+            <Button x:Name="CancelBtn" Content="Cancel" Width="90" Margin="8,0,0,0"
+                    Click="OnCancel" IsCancel="True"
+                    AutomationProperties.Name="Cancel settings"/>
+        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <GroupBox Header="Output Format" Margin="0,0,0,8">
+                    <StackPanel Margin="6">
+                        <TextBlock Text="Output Format" FontWeight="SemiBold"/>
+                        <ComboBox x:Name="OutputFormatCombo" Margin="0,4,0,0"
+                                  SelectedValuePath="Tag"
+                                  SelectionChanged="OnOutputFormatChanged"
+                                  AutomationProperties.Name="Output format">
+                            <ComboBoxItem Content="WAV master" Tag="wav"/>
+                            <ComboBoxItem Content="WAV + MP3" Tag="mp3"/>
+                        </ComboBox>
+                        <TextBlock Text="MP3 Bitrate" Margin="0,12,0,0" FontWeight="SemiBold"/>
+                        <ComboBox x:Name="OutputQualityCombo" Margin="0,4,0,0"
+                                  SelectedValuePath="Tag"
+                                  AutomationProperties.Name="MP3 bitrate">
+                            <ComboBoxItem Content="96 kbps"  Tag="96"/>
+                            <ComboBoxItem Content="128 kbps" Tag="128"/>
+                            <ComboBoxItem Content="160 kbps" Tag="160"/>
+                            <ComboBoxItem Content="192 kbps" Tag="192"/>
+                            <ComboBoxItem Content="224 kbps" Tag="224"/>
+                            <ComboBoxItem Content="256 kbps" Tag="256"/>
+                            <ComboBoxItem Content="320 kbps" Tag="320"/>
+                        </ComboBox>
+                        <CheckBox x:Name="WriteStemsCheck" Content="Save separate mic/system stems"
+                                  IsChecked="True" Margin="0,12,0,0"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="Auto-stop / split limits (0 = off)" Margin="0,0,0,8">
+                    <StackPanel Margin="6">
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0" VerticalAlignment="Center">
+                            <TextBox x:Name="LimitMinutesText" Width="50" VerticalAlignment="Center"
+                                     AutomationProperties.Name="Auto-stop time limit in minutes"/>
+                            <TextBlock Text="min" Margin="4,0,12,0" VerticalAlignment="Center"/>
+                            <TextBox x:Name="LimitSizeMbText" Width="60" VerticalAlignment="Center"
+                                     AutomationProperties.Name="Auto-stop size limit in megabytes of mix audio"/>
+                            <TextBlock Text="MB (mix)" Margin="4,0,0,0" VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <CheckBox x:Name="SplitInsteadOfStopCheck" Content="Split into new file instead of stopping"
+                                   Margin="0,8,0,0"/>
+                        <TextBlock Text="Time is wall-clock (pause does not stop it); size counts mix payload bytes."
+                                   Opacity="0.6" Margin="0,4,0,0"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="Countdown" Margin="0,0,0,8">
+                    <StackPanel Margin="6">
+                        <TextBlock Text="Countdown before recording" FontWeight="SemiBold"/>
+                        <ComboBox x:Name="CountdownCombo" Margin="0,4,0,0"
+                                  SelectedValuePath="Tag"
+                                  AutomationProperties.Name="Countdown before recording">
+                            <ComboBoxItem Content="Off" Tag="0"/>
+                            <ComboBoxItem Content="3 s" Tag="3"/>
+                            <ComboBoxItem Content="5 s" Tag="5"/>
+                            <ComboBoxItem Content="10 s" Tag="10"/>
+                        </ComboBox>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="Keyboard Shortcuts (window-focused)" Margin="0,0,0,0">
+                    <StackPanel Margin="6">
+                        <Grid Margin="0,4,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Start" Opacity="0.7"/>
+                            <TextBlock Grid.Row="0" Grid.Column="1" Text="Pause" Opacity="0.7" Margin="4,0,0,0"/>
+                            <TextBlock Grid.Row="0" Grid.Column="2" Text="Stop" Opacity="0.7" Margin="4,0,0,0"/>
+                            <TextBox Grid.Row="1" Grid.Column="0" x:Name="StartHotkeyBox" Margin="0,2,0,0"
+                                     IsReadOnly="True" Focusable="True"
+                                     ToolTip="Click, then press the new Start shortcut"
+                                     AutomationProperties.Name="Start hotkey"
+                                     Tag="Start"
+                                     GotFocus="OnHotkeyBoxGotFocus"
+                                     LostFocus="OnHotkeyBoxLostFocus"
+                                     PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
+                            <TextBox Grid.Row="1" Grid.Column="1" x:Name="PauseHotkeyBox" Margin="4,2,0,0"
+                                     IsReadOnly="True" Focusable="True"
+                                     ToolTip="Click, then press the new Pause shortcut"
+                                     AutomationProperties.Name="Pause hotkey"
+                                     Tag="Pause"
+                                     GotFocus="OnHotkeyBoxGotFocus"
+                                     LostFocus="OnHotkeyBoxLostFocus"
+                                     PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
+                            <TextBox Grid.Row="1" Grid.Column="2" x:Name="StopHotkeyBox" Margin="4,2,0,0"
+                                     IsReadOnly="True" Focusable="True"
+                                     ToolTip="Click, then press the new Stop shortcut"
+                                     AutomationProperties.Name="Stop hotkey"
+                                     Tag="Stop"
+                                     GotFocus="OnHotkeyBoxGotFocus"
+                                     LostFocus="OnHotkeyBoxLostFocus"
+                                     PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
+                            <Button Grid.Row="1" Grid.Column="3" x:Name="ResetHotkeysBtn" Content="Reset"
+                                    Click="OnResetHotkeys" Margin="4,2,0,0"
+                                    ToolTip="Restore Ctrl+R / Ctrl+P / Ctrl+S"
+                                    AutomationProperties.Name="Reset hotkeys"/>
+                        </Grid>
+                        <TextBlock Text="Click a box, press keys to capture (Esc cancels)." Opacity="0.6" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </GroupBox>
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+</Window>

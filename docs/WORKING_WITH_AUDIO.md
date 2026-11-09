@@ -154,13 +154,13 @@ Raw PCM (WASAPI)
     ↓
 Float Samples (CSCore ToSampleSource)
     ↓
-ConvertToTarget (resample/remix to common format)
+ConvertToTargetChunked (windowed-sinc resample/remix to common format)
     ↓
 Gain Application (multiply by MicGain or LoopGain)
     ↓
-Mixing: s + m * 0.5 (average of system + mic)
+Mixing: s + m, normalize only on overs (bit-transparent otherwise)
     ↓
-Soft Clipping (tanh)
+Soft Clipping (tanh, only above ±1)
     ↓
 PCM Conversion (FloatToPcm16 or FloatToPcm32)
     ↓
@@ -189,24 +189,24 @@ gain_multiplier = 10^(dB / 20)
 
 ### Mixing Algorithm
 
-Hearbud uses a simple average mix:
+Hearbud uses a straight sum with conditional normalization (`ComputeMixScale`):
 
 ```
-mixed_sample = (system_sample * LoopGain + mic_sample * MicGain) * 0.5
+mixed_sample = system_sample * LoopGain + mic_sample * MicGain
+if block_peak > 1.0: mixed_sample /= block_peak   // normalize only on overs
 ```
 
-**Why * 0.5?**
-- Summing two audio sources can exceed ±1.0 (clipping)
-- Multiplying by 0.5 ensures headroom before soft clipping
-- Equivalent to -6 dB attenuation on each source
+**Why normalize instead of averaging?**
+- A fixed `* 0.5` average would attenuate everything by -6 dB even when the sum never clips
+- Normalizing only on overs keeps the mix bit-transparent at/below full scale, then `tanh` soft-clips any residual overs
 
-**Alternative Mix Formulas:**
+**Alternative Mix Formulas (not used):**
 ```
 // Equal power mix (more perceived volume gain)
 mixed_sample = (s + m) * 0.707  // 0.707 ≈ sqrt(0.5)
 
-// No headroom preservation (clips often)
-mixed_sample = (s + m)
+// Fixed average (constant -6 dB penalty, even when nothing clips)
+mixed_sample = (s + m) * 0.5
 
 // Weighted mix
 mixed_sample = s * 0.7 + m * 0.3  // System louder than mic
@@ -214,10 +214,10 @@ mixed_sample = s * 0.7 + m * 0.3  // System louder than mic
 
 ### Soft Clipping (tanh)
 
-Tan hyperbolic (tanh) provides natural non-linear limiting:
+Tan hyperbolic (tanh) provides natural non-linear limiting. Hearbud applies it conditionally (`SoftClipIfNeeded`): passthrough inside ±1 so quiet passages stay untouched, tanh soft-knee only on true overs (plus NaN → silence as a safety net):
 
 ```
-x = tanh(x)  // Continuous non-linear curve for entire signal
+x = (|x| <= 1) ? x : sign(x) * tanh(|x|)
 ```
 
 **Math:**
@@ -236,7 +236,7 @@ tanh(x) = (e^x - e^(-x)) / (e^x + e^(-x))
 - Hard clipping (clamp) produces harsh, digital distortion
 - tanh is similar to analog tape/electronic limiting (more musical)
 - Preserves transients while controlling peaks
-- **Applied consistently to entire signal** to prevent audible "pops" or clicks caused by discontinuities
+- Applied only where needed (above ±1): no curve means no coloration or level shift on in-range audio
 
 ---
 
@@ -251,43 +251,22 @@ Microphone and loopback devices may have different formats:
 
 **Solution:** Hearbud converts all mic audio to match loopback format.
 
-### Linear Interpolation Resampling
+### Windowed-Sinc Resampling
 
-Hearbud implements simple linear interpolation for sample rate conversion:
+Hearbud resamples with a 12-tap polyphase windowed-sinc kernel (`SincPolyphase` table in `ConvertToTargetChunked`):
 
 ```
-source_frame_index = destination_frame * (source_rate / dest_rate)
-fractional_part = source_frame_index - floor(source_frame_index)
-interpolated = sample[floor_index] * (1 - fractional_part) + sample[floor_index + 1] * fractional_part
+output_frame = Σ_k input[base + k] * h(phase, k)   // k over 12 taps, h = windowed sinc
 ```
 
-**Code Implementation:**
-```csharp
-float ratio = (float)srcRate / dstRate;
-int outputFrame = f;
-float inputPos = f * ratio;
-int i0 = (int)inputPos;
-int i1 = Math.Min(i0 + 1, srcFrames - 1);
-float t = inputPos - i0;
-
-for (int c = 0; c < srcChannels; c++)
-{
-    float s0 = src[i0 * srcCh + c];
-    float s1 = src[i1 * srcCh + c];
-    output[outputIndex++] = s0 + (s1 - s0) * t;
-}
-```
+Fractional phase is carried across callbacks in `ResamplerState`, so chunk boundaries never click, and cumulative output length stays within ±1 frame/s of ideal.
 
 **Trade-offs:**
-- [✓] Fast, minimal CPU overhead
-- [✓] Preserves low frequencies well
-- [✗] Anti-aliasing not implemented (minor high-freq artifacts, acceptable for speech)
-- [✗] No phase correction (minor timing shifts)
+- [✓] High quality with anti-aliasing (proper low-pass at the target Nyquist)
+- [✓] No seam clicks (phase carry across variable-size WASAPI packets)
+- [✗] More CPU than linear interpolation (12 taps × table lookup per output frame)
 
-**Better Resamplers (not implemented):**
-- Cubic/spline interpolation (smoother)
-- Sinc-based resampling (highest quality, high CPU cost)
-- Polyphase implementations (efficient high-quality)
+**Simpler alternative (not used):** linear interpolation is cheaper but aliases high frequencies and shifts phase — audibly worse on music.
 
 ### Channel Conversion
 
@@ -414,8 +393,8 @@ float abs = MathF.Abs(sample);
 if (abs > 1.0) clipped = true;
 ```
 
-Hearbud tracks clipping **per interval** (reset after each update):
-- Flash UI red indicator if any sample clipped in last 50 ms
+Hearbud tracks clipping **per interval** (reset after each level event, ~50 ms):
+- The engine flags `Clipped` if any sample exceeded ±1.0 in the interval; the UI lights the red CLIP indicator for 1.5 s per flag
 - Helps user identify gain issues
 
 ---
@@ -541,26 +520,25 @@ mic_rate_adjustment = 1.0 + PID_controller(ring_buffer_ideal_depth - ring_buffer
 adjusted_mic_samples = resample(mic_raw, mic_rate_adjustment)
 ```
 
-**Hearbud's Simpler Approach:**
-- Small ring buffer (4 sec at 48 kHz) absorbs drift
-- Overruns/underruns happen but are brief and perceptually minimal
-- Trade-off: Complexity vs. simplicity for typical use cases
+**Hearbud's Approach:**
+- Dual FIFOs (mic ring ≈ 2 s stereo @ 48 kHz) absorb drift and WASAPI bursts/jitter
+- Both sources are consumed in fixed 480-frame quanta per master tick; a gentle trim loop absorbs slow drift, sustained >80 ms backlog triggers a resync (drop to one frame)
+- Trade-off: small bounded latency for a click-free, drift-proof mix
 
 ### Session Log Diagnostics
 
-Hearbud logs sync issues in `*.txt` session log:
+Hearbud logs sync state in the `*.txt` session log as a 1 Hz `lagTime` line:
 
 ```
-[2025-12-23 14:30:00.123] INFO OnLoopbackData: Mic ring backlog: 0.0523 s (max 0.1200 s)
-[2025-12-23 14:30:05.456] INFO OnLoopbackData: Mic ring backlog: 0.0487 s (max 0.1200 s)
+[2026-11-08 14:30:00.123] INFO Info: lagTime=0.052s micDepth=… over=0 loopOver=0 under=12 silenced=480 backlogMax=0.120s masterFrames=… resyncs=0 trim=… lagWatch=ok
 ```
+
+(A shorter legacy `Mic ring backlog: X s (max Y s)` line still appears every 50 loopback blocks when the 1 Hz line doesn't fire.)
 
 **Interpretation:**
-- `backlog`: Current mic buffer depth in seconds (lower = underrun risk, higher = overrun risk)
-- `max backlog`: Peak observed (useful for ring buffer sizing)
-- Stable backlog ~0.1s = good sync
-- Consistent 0.0s backlog = underruns (mic is too slow)
-- Consistent near-max backlog = overruns (mic is too fast)
+- `lagTime`: Current mic backlog in seconds (lower = underrun risk, higher = overrun risk)
+- `backlogMax`: Peak observed (useful for FIFO sizing); `over`/`loopOver`/`under`/`silenced`: cumulative over/underrun counters
+- `lagWatch=ok` = healthy sync; `LAG` = backlog over 80 ms (see `resyncs=` for resync count, `trim=` for gentle-trim activity)
 
 ### When Loopback is Silent
 
@@ -590,7 +568,7 @@ When loopback **resumes**:
 | Linear to dB (amplitude) | `dB = 20 * log10(amplitude)` | Voltage/amplitude, not power |
 | dB to Linear (amplitude) | `amp = 10^(dB / 20)` | |
 | Power to dB | `dB = 10 * log10(power)` | Power, not voltage |
-| Two-source average mix | `out = (s1 + s2) * 0.5` | Preserves headroom |
+| Two-source sum + normalize | `out = (s1 + s2) * (peak>1 ? 1/peak : 1)` | Bit-transparent unless overs |
 | RMS calculation | `sqrt(sum(x^2) / N)` | N samples in interval |
 | Soft clip (tanh) | `tanh(x)` or `x / sqrt(1 + x^2)` | Many approximations exist |
 | Resampling ratio | `src_rate / dst_rate` | Multiplier for index calculations |

@@ -49,9 +49,10 @@ The app produces three files:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      MainWindow (WPF)                       │
-│  - Device selection, gain controls, output settings         │
-│  - UI level meter updates via timer (100ms)                 │
+│              MainWindow (WPF) + Settings dialog             │
+│  - Device selection, gain controls, basic output            │
+│    (format/limits/countdown/hotkeys in Settings…)           │
+│  - UI level meters via DispatcherTimer (100ms, UI thread)   │
 └──────────────────────┬──────────────────────────────────────┘
                        │
                        │ Events: LevelChanged, Status, EncodingProgress
@@ -78,7 +79,7 @@ The app produces three files:
 
 ### Threading Model
 
-1. **UI Thread** - WPF main thread, handles user input and timer-based meter updates (100ms interval)
+1. **UI Thread** - WPF main thread, handles user input and `DispatcherTimer` meter updates (100ms interval, no cross-thread invoke in the tick path)
 2. **Audio Threads** - CSCore-managed threads calling `DataAvailable` callbacks (~100-150 times/sec)
 3. **Disk Writer Thread** - Background thread consuming from `BlockingCollection< AudioWriteJob>` queue
 4. **MP3 Encoding Thread** - Thread pool task during post-processing
@@ -94,32 +95,32 @@ The app produces three files:
 
 **Key Responsibilities:**
 - Global crash handlers (AppDomain unhandled exceptions, dispatcher unhandled exceptions, task scheduler unobserved exceptions)
-- Crash logging to `%LocalAppData%\Hearbud\logs.txt`
+- Crash reporting via dialog + debugger output (no log file)
 
 **Important Notes:**
 - `CrashLog.LogAndShow()` is the single point of failure reporting
 - All exceptions are caught to provide user-friendly crash messages before app termination
 
-### 2. MainWindow / MainWindow.xaml + .cs
+### 2. MainWindow / MainWindow.xaml + .xaml.cs
 **Purpose:** Main UI window providing controls and feedback
 
 **Key Responsibilities:**
-- Device enumeration and selection (mic + speaker)
-- Gain sliders (independent mic and system gains)
-- Output settings (location, base filename, MP3 quality/bitrate)
-- Real-time level meters (RMS + Peak with clip indication)
-- Status messages and encoding progress
-- Keyboard shortcuts: Ctrl+R (start), Ctrl+S (stop)
-- System tray icon integration
+- Device enumeration and selection (mic + speaker) with include checkboxes (unchecked = soft-mute + disabled combo)
+- Gain sliders (independent mic and system gains) and real-time level meters (RMS + Peak with clip indication) in one Audio group
+- Basic output (save location, base filename); transport (Start/Pause/Stop) in the footer with elapsed time while recording
+- Status messages, countdown cancel, and encoding progress in the footer
+- Keyboard shortcuts: Ctrl+R (start), Ctrl+P (pause/resume), Ctrl+S (stop) — remappable in Settings
+- System tray icon integration (Pause/Stop items follow the same enable rule as the buttons; balloon tips for auto-stop/split and USB warnings)
 
 **UI State Management:**
 - `_uiReady` flag guards UI updates during initialization
 - `_engine` (RecorderEngine) instance lives for window lifetime
-- Device dictionaries (`_micDict`, `_spkDict`) hold `MMDevice` objects for quick access
+- Device dictionaries (`_micDict`, `_spkDict`) hold `MMDevice` objects for quick access; refresh disposes prior instances before clearing
+- Window auto-sizes to content (`SizeToContent="Height"`), opens centered (`CenterScreen`)
 
 **Timer Behavior:**
-- 100ms timer (`_uiTimer`) updates meters via `Dispatcher.Invoke()`
-- Throttling prevents excessive UI redraws while still being responsive
+- 100ms `DispatcherTimer` (`_uiTimer`, UI thread) updates meters and Pause/Stop enable state; brushes resolved once, no per-tick invoke
+- 1s `DispatcherTimer` (`_limitTimer`) polls auto-stop/split limits while recording
 
 ### 3. RecorderEngine
 **Purpose:** Core audio processing engine handling capture, mixing, and output
@@ -147,16 +148,18 @@ public sealed class RecorderEngine : IDisposable
 
 #### Public API Methods
 
-##### `Monitor(RecorderStartOptions opts)`
-- Opens audio devices (if needed)
-- Starts audio streams (but no file output)
+##### `MonitorAsync(RecorderStartOptions opts)`
+- Full restart: tears down devices, reopens from `opts`, restarts streams (no file output)
 - Activates level metering
-- Auto-restarts if monitoring already active
+- Used by refresh/auto-monitor/start paths — not by the include checkboxes
 
-##### `Start(RecorderStartOptions opts)`
-- Calls `Monitor()` first (ensures devices open)
-- Generates unique output file paths (handles name collisions like `rec (1).wav`)
-- Opens 3 parallel WAV files and 1 log file
+##### `MonitorSourcesAsync(RecorderStartOptions opts)`
+- Idle re-target used by the include checkboxes: applies software mute (`SetChannelMute`) for unchecked sources, opens a wanted side only when it is missing — never stops/restarts a running capture
+
+##### `StartAsync(RecorderStartOptions opts)`
+- Calls `MonitorAsync()` first (ensures devices open), clears idle mutes
+- Generates unique output file paths (`UniquePath`: `rec (1).wav`, `rec (2).wav`, …)
+- Opens mix + optional stems (3 WAVs when `WriteStems`, else mix only) and 1 session log file
 - Initializes async write queue and background writer thread
 - Resets mic ring buffer and counters
 
@@ -165,7 +168,7 @@ public sealed class RecorderEngine : IDisposable
 - Drains write queue: calls `_writeQueue.CompleteAdding()` and awaits `_writeTask`
 - **Critical:** WAV headers are finalized on `Dispose` after queue drains
 - Encodes MP3 (post-process) on thread pool thread
-- Closes log file
+- Closes session log file
 
 ##### `Dispose()`
 - Disposes all capture devices and file writers
@@ -182,8 +185,8 @@ public sealed class RecorderEngine : IDisposable
 - `OutputDir` - Default save folder
 - `Mp3BitrateKbps` - MP3 encoding bitrate (0 = Original/WAV only)
 - `MicGain`, `LoopGain` - Persisted gain values
-- `IncludeMic` - Whether to include mic in recording (unchecked → MicDeviceId=null)
-- `IncludeSystem` - Whether to include system audio (unchecked → LoopbackDeviceId=null; at-least-one required)
+- `IncludeMic` - Whether to include mic (unchecked → software-mute while idle; excluded from the recording device set)
+- `IncludeSystem` - Whether to include system audio (same soft-mute/exclude behavior; at-least-one required: "Keep system audio or microphone on to record.")
 - `WriteStems` - Save separate mic/system stems (false = mix only, ~1x I/O)
 
 **Legacy Handling:**
@@ -195,8 +198,31 @@ public sealed class RecorderEngine : IDisposable
 **Purpose:** Audio level calculations and formatting
 
 **Key Methods:**
-- `FormatGain(double value)` - Converts linear gain multiplier to string (e.g., "2.00× (+6.0 dB)")
+- `FormatGain(double value)` - Converts linear gain multiplier to string (e.g., "2.00× (+6.0 dB)", "0.00× (-∞ dB)" for zero)
 - `ToDbfs(double peakLin)` - Converts linear peak to dBFS clamped to -60 dB floor
+
+### 6. SettingsWindow / SettingsWindow.xaml + .xaml.cs
+**Purpose:** Modal dialog for everything that left the main window: output format + MP3 bitrate, stems toggle, auto-stop/split limits, pre-record countdown, remappable hotkeys
+
+**Key Responsibilities:**
+- Edits the live `AppSettings` in place (hotkeys apply + save immediately on capture); OK persists the rest (`AppSettings.Save()`) and the main window rebuilds input bindings; Cancel restores the snapshot taken at open
+- Hotkey capture boxes + reset-to-defaults live here (window-focused scope only)
+
+### 7. UsbTopology (UsbTopologyProbe)
+**Purpose:** Best-effort detection of a mic and mouse sharing one non-root USB hub (a topology observed to swallow clicks before Windows sees them)
+
+**Key Responsibilities:**
+- `Check(endpointId, friendlyName)` runs once at startup (pool thread, after the window is up) and again from Refresh Devices; any native/COM failure means "no warning", never an error
+- On a shared hub: inline warning banner in the Devices group + mic tooltip + one tray balloon, logged via `CrashLog` (`UiDiagnostics.Usb`)
+- `FindSharedHub` is pure topology math over parent/service maps (unit-tested); `Describe` dumps the resolved hub chains; the probe also reports USB selective-suspend state
+
+### 8. UiDiagnostics
+**Purpose:** Small UI-health helpers whose output goes to the debugger via `CrashLog` (no log file)
+
+**Key Members:**
+- `BuildEnvReport` - one-shot environment report (OS, render tier, remote/tablet/DPI) at startup
+- `InputEventRing` / `LagTracker` - recent input events and UI-thread lag stats, summarised at close
+- MainWindow adds first-frame/close timings and a render-thread frame counter around these
 
 ---
 
@@ -259,8 +285,9 @@ public sealed class RecorderEngine : IDisposable
                  └─────────┬──────────┘
                            │
                  ┌─────────▼──────────┐
-                 │ Mix: s + m * 0.5   │  ← Apply gains in both loops
-                 │ + SoftClipIfNeeded │
+                 │ Mix: s + m          │  ← Gains pre-mix
+                 │ scale iff peak>1    │
+                 │ + SoftClipIfNeeded  │
                  └─────────┬──────────┘
                            │
           ┌────────────────┼────────────────┐
@@ -390,7 +417,7 @@ MMCSS Pro Audio on writer thread + 1 ms timer; `DumpDir` taps; log cap keeps WAR
 **Sync Edge Case:** When loopback resumes after silence, mic backlog beyond one fixed frame is dropped on sustained >80 ms lag. This prevents "old mic over new system" echo effect.
 
 ### 5b. Pause, source toggles, disk guard (GAP-09 p1-p4)
-**Decision:** `Pause()`/`Resume()`/`IsPaused` keep files open and emit silence frames (timeline preserved, meters frozen, resync skipped, loop clock re-armed on resume). Source checkboxes gate device IDs (`null` = disabled); Start requires at-least-one ("Keep system audio or microphone on"). Loopback is optional in `OpenDevicesAsync` (mic drives clock, format derived from mic). Pre-start `CheckDiskSpaceAndWritable` probes folder + zero-byte write, warns <500 MB and blocks <100 MB.
+**Decision:** `Pause()`/`Resume()`/`IsPaused` keep files open and emit silence frames (timeline preserved, meters frozen, resync skipped, loop clock re-armed on resume). Source checkboxes soft-mute while idle (`OnIncludeSourceChanged` → `MonitorSourcesAsync` → `SetChannelMute`, no WASAPI restart; toggles are skipped while recording since sources are fixed for the running file); Start builds the recording device set from the checkboxes and requires at-least-one ("Keep system audio or microphone on to record."). Loopback is optional in `OpenDevicesAsync` (mic drives clock, format derived from mic). Pre-start `CheckDiskSpaceAndWritable` probes folder + zero-byte write, warns <500 MB and blocks <100 MB.
 
 ### 5c. AEC/AGC/NS intentionally omitted (GAP-05 accepted gap)
 **Decision:** No echo canceller, AGC, or noise suppressor in the capture path. Rationale: this tool records both sides for later listening (no live-call feedback loop); both stems exist so speaker bleed is fixable in post; a loopback reference lags the true render signal (OS mixer + silence gating), making delay estimation fragile; native WebRTC-APM interop (x64+arm64, single-file publish, AV friction) is unjustified without user evidence.
@@ -398,13 +425,12 @@ Insertion point is safe if ever needed: `TryPopFixedFrame` returns two aligned 4
 ### 5d. Out-of-process capture deferred (GAP-04)
 **Decision:** Capture stays in-process. Rationale: no evidence of long-capture reliability demand; hot-swap (GAP-06) + bounded FIFOs + 30 s drain timeout + log cap already cover the observed failure modes. Revisit only if crash/lockup reports implicate the capture process.
 
-### 5e. Limits, test, hotkeys, countdown, history (GAP-09 p5-p9)
-**Decision:** Time/size auto-stop/split (`LimitMinutesText`/`LimitSizeMbText`, `SplitInsteadOfStopCheck`): engine `TotalMixBytesWritten`/`RecordElapsed` getters, 1 s UI poll, split = stop + `(N)` restart.
-Sound test: `TestMicBtn` samples live peak 3 s → dBFS report; `TestSysBtn` synthesizes 1 kHz/1 s tone to temp WAV, plays via `WasapiOut` on selected speaker.
-Hotkeys: `Start/Pause/StopHotkey` settings (`Ctrl+R/P/S` defaults, converter-validated), capture boxes + reset, `RebuildInputBindings` on startup/change.
-Countdown + mini-bar + tray: `CountdownSeconds` (0/3/5/10, cancellable) runs before guard/engine start; `MiniBar` Topmost window (elapsed + levels, Pause/Stop delegate, owned by main); tray Pause/Stop items + balloon tips (no icon swap: single ico).
-History + repair: `HistoryStore` JSON (50 cap, every `Stopped` incl. split parts); history list open/play (OS-default player, no embedded `MediaElement`)/delete; `WavRepair` startup scan fixes RIFF/data sizes in place, delete offer for unrepairable; engine `LastRecordElapsed`.
-Format picker (#9 mapping-only): `OutputFormatCombo` (WAV master / WAV + MP3) + bitrate-only combo map to the same `Mp3BitrateKbps` (0 vs kbps); no engine change, no sample-rate override by design (loopback stays bit-exact).
+### 5e. Limits, hotkeys, countdown, settings dialog (GAP-09 p5-p9)
+**Decision:** Time/size auto-stop/split (Settings dialog: `LimitMinutesText`/`LimitSizeMbText`, `SplitInsteadOfStopCheck`): engine `TotalMixBytesWritten`/`RecordElapsed` getters, 1 s `_limitTimer` poll, split = stop + `(N)` restart.
+Hotkeys: `Start/Pause/StopHotkey` settings (`Ctrl+R/P/S` defaults, converter-validated), capture boxes + reset in the Settings dialog, `RebuildInputBindings` on startup/change.
+Countdown + in-window transport + tray: `CountdownSeconds` (0/3/5/10, cancellable via footer Cancel) runs before guard/engine start; elapsed time and Pause/Stop stay in the main window footer (no separate mini-bar window); tray Pause/Stop items + balloon tips (no icon swap: single ico).
+Format picker (#9 mapping-only, Settings dialog): `OutputFormatCombo` (WAV master / WAV + MP3) + bitrate-only combo map to the same `Mp3BitrateKbps` (0 vs kbps); no engine change, no sample-rate override by design (loopback stays bit-exact).
+Removed in the compact-window round: the mic/system sound-test buttons, the recent-sessions history list, and the startup WAV repair scan. `HistoryStore` (JSON log), `SessionManifest` (crash bookkeeping — engine still calls `Begin`/`MarkClosed`) and `WavRepair` (header fix + `ScanUnclosed`/`RepairUnclosed`) remain in the tree with test coverage, but no UI currently writes history or runs the recovery scan.
 
 ### 6. Conditional limiter (tanh only on overs) + peak normalize
 **Decision:** Sum `s*gL + m*gM` at full level, peak-normalize the block only if peak>1, then apply `tanh` soft-knee only to samples with `|x|>1` before clamp.
@@ -497,10 +523,9 @@ Format picker (#9 mapping-only): `OutputFormatCombo` (WAV master / WAV + MP3) + 
    - Migration logic in `AppSettings.Load()` parses string → int
    - `Mp3Quality` is nulled on save to prevent confusion
 
-2. **Auto-Match Loopback to Speaker**
-   - Default: loopback device selected is same as selected speaker
-   - User can manually choose different endpoint
-   - "Auto (match speaker)" option in UI
+2. **Loopback Follows the Selected Speaker**
+   - There is no separate loopback picker: loopback captures the selected speaker endpoint
+   - The `LoopbackName` setting ("Auto (match speaker)") is legacy and currently unused
 
 3. **Gain Application**
    - Gains applied **before** metering and **before** mixing
@@ -513,14 +538,14 @@ Format picker (#9 mapping-only): `OutputFormatCombo` (WAV master / WAV + MP3) + 
 - **Self-contained builds:** Include .NET runtime (no user install needed)
 - **Single-file publishing:** All resources extracted to temp at runtime
 - **Architecture support:** Both `win-x64` and `win-arm64` targets for cross-architecture support
-- **Version:** Assembly version in `Hearbud.csproj` (currently 0.2.7)
+- **Version:** Single source of truth in `Directory.Build.props` (currently 0.3.3), bumped automatically by CI on push to master
 
 ### Known Limitations
 
 1. **Windows-only** (WASAPI loopback is Windows-specific)
 2. **Max of 1 simultaneous recording** (single RecorderEngine instance per MainWindow)
 3. **No real-time effects** beyond gain/soft clip (plugins not supported)
-4. **Fixed block size** (1024 frames) - not configurable
+4. **Fixed internal quanta** (scratch buffers sized from 1024-frame blocks, mix emits fixed 480-frame quanta) - not configurable
 5. **Ring buffer capacity** is dynamic but may drop data if mic/loopback drifts severely
 
 ---

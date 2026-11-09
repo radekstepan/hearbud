@@ -4,9 +4,11 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="Hearbud" Height="790" Width="960"
-        MinHeight="740" MinWidth="900"
+        Title="Hearbud" Width="960"
+        MinHeight="440" MinWidth="900"
         ResizeMode="CanMinimize"
+        SizeToContent="Height"
+        WindowStartupLocation="CenterScreen"
         Background="{StaticResource AppBackground}"
         Foreground="{StaticResource ControlForeground}"
         UseLayoutRounding="True">
@@ -14,7 +16,6 @@
         <!-- Main content -->
         <Grid>
             <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
@@ -29,20 +30,36 @@
             <!-- Devices -->
             <GroupBox Grid.Row="0" Grid.Column="0" Header="Audio Devices" Margin="0,0,8,4">
                 <StackPanel Margin="6">
-                    <TextBlock Text="Microphone (Input)" FontWeight="SemiBold"/>
-                    <ComboBox x:Name="MicCombo" 
+                    <Border x:Name="UsbWarningBanner" Visibility="Collapsed"
+                            Margin="0,0,0,8" Padding="8,6"
+                            Background="#33EA7D24"
+                            BorderBrush="{StaticResource AccentBrush}"
+                            BorderThickness="1" CornerRadius="4">
+                        <TextBlock x:Name="UsbWarningText" TextWrapping="Wrap" FontSize="11"
+                                   Foreground="#FFFFD28A"
+                                   AutomationProperties.Name="USB layout warning"/>
+                    </Border>
+                    <CheckBox x:Name="IncludeMicCheck" Content="Microphone (Input)" FontWeight="SemiBold"
+                              IsChecked="True"
+                              Checked="OnIncludeSourceChanged" Unchecked="OnIncludeSourceChanged"
+                              ToolTip="Uncheck to mute the microphone — the input list is disabled and nothing is recorded from it"
+                              AutomationProperties.Name="Include microphone"/>
+                    <ComboBox x:Name="MicCombo"
                               Margin="0,4,0,0"
                               AutomationProperties.Name="Microphone Selection"
                               AutomationProperties.HelpText="Select the microphone to record from"/>
-                    <TextBlock Text="Audio Output (to capture)" Margin="0,12,0,0" FontWeight="SemiBold"/>
-                    <ComboBox x:Name="SpeakerCombo" Margin="0,4,0,0"/>
-                    <CheckBox x:Name="RecordSysCheck" Content="Include system audio"
-                              IsChecked="True" Margin="0,4,0,0"/>
+                    <CheckBox x:Name="RecordSysCheck" Content="Audio Output (to capture)" FontWeight="SemiBold"
+                              IsChecked="True" Margin="0,12,0,0"
+                              Checked="OnIncludeSourceChanged" Unchecked="OnIncludeSourceChanged"
+                              ToolTip="Uncheck to mute system audio — the output list is disabled and nothing is captured from it"
+                              AutomationProperties.Name="Include system audio"/>
+                    <ComboBox x:Name="SpeakerCombo" Margin="0,4,0,0"
+                              AutomationProperties.Name="Output device selection"/>
                 </StackPanel>
             </GroupBox>
 
-            <!-- Output -->
-            <GroupBox Grid.Row="0" Grid.Column="1" Header="Output Settings" Margin="8,0,0,4">
+            <!-- Output (basic only; format/limits/hotkeys live in Settings…) -->
+            <GroupBox Grid.Row="0" Grid.Column="1" Header="Output" Margin="8,0,0,4">
                 <StackPanel Margin="6">
                     <TextBlock Text="Save Location" FontWeight="SemiBold"/>
                     <DockPanel Margin="0,4,0,0">
@@ -52,233 +69,117 @@
 
                     <TextBlock Text="Base File Name (no extension)" Margin="0,12,0,0" FontWeight="SemiBold"/>
                     <TextBox x:Name="BaseNameText" Margin="0,4,0,0"/>
+                </StackPanel>
+            </GroupBox>
 
-                    <!-- GAP-09 #9 mapping slice: two controls bound to the SAME
-                         existing setting (AppSettings.Mp3BitrateKbps).
-                         Format=[WAV master|WAV + MP3], Bitrate=[96..320].
-                         No new setting, no engine change. -->
-                    <TextBlock Text="Output Format" Margin="0,12,0,0" FontWeight="SemiBold"/>
-                    <ComboBox x:Name="OutputFormatCombo" Margin="0,4,0,0"
-                              SelectedValuePath="Tag"
-                              SelectionChanged="OnOutputFormatChanged"
-                              AutomationProperties.Name="Output format">
-                        <ComboBoxItem Content="WAV master" Tag="wav"/>
-                        <ComboBoxItem Content="WAV + MP3" Tag="mp3"/>
-                    </ComboBox>
-                    <TextBlock Text="MP3 Bitrate" Margin="0,12,0,0" FontWeight="SemiBold"/>
-                    <ComboBox x:Name="OutputQualityCombo" Margin="0,4,0,0"
-                              SelectedValuePath="Tag"
-                              AutomationProperties.Name="MP3 bitrate">
-                        <ComboBoxItem Content="96 kbps"  Tag="96"/>
-                        <ComboBoxItem Content="128 kbps" Tag="128"/>
-                        <ComboBoxItem Content="160 kbps" Tag="160"/>
-                        <ComboBoxItem Content="192 kbps" Tag="192"/>
-                        <ComboBoxItem Content="224 kbps" Tag="224"/>
-                        <ComboBoxItem Content="256 kbps" Tag="256"/>
-                        <ComboBoxItem Content="320 kbps" Tag="320"/>
-                    </ComboBox>
-                    <CheckBox x:Name="WriteStemsCheck" Content="Save separate mic/system stems"
-                              IsChecked="True" Margin="0,12,0,0"/>
-                    <CheckBox x:Name="IncludeMicCheck" Content="Include microphone"
-                               IsChecked="True" Margin="0,4,0,0"/>
-                    <!-- GAP-09: optional auto-stop / auto-split limits (0 = off).
-                         Time is wall-clock (pause does not stop it); size counts mix payload bytes. -->
-                    <TextBlock Text="Auto-stop / split limits (0 = off)" Margin="0,12,0,0" FontWeight="SemiBold"/>
-                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0" VerticalAlignment="Center">
-                        <TextBox x:Name="LimitMinutesText" Width="50" VerticalAlignment="Center"
-                                 AutomationProperties.Name="Auto-stop time limit in minutes"/>
-                        <TextBlock Text="min" Margin="4,0,12,0" VerticalAlignment="Center"/>
-                        <TextBox x:Name="LimitSizeMbText" Width="60" VerticalAlignment="Center"
-                                 AutomationProperties.Name="Auto-stop size limit in megabytes of mix audio"/>
-                        <TextBlock Text="MB (mix)" Margin="4,0,0,0" VerticalAlignment="Center"/>
+            <!-- Gain + live levels, side by side in one group -->
+            <GroupBox Grid.Row="1" Grid.ColumnSpan="2" Header="Audio" Margin="0,4,0,4">
+                <Grid Margin="6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <!-- Gains -->
+                    <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                        <Grid Height="30">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="90"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="130"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="Mic Gain" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                            <Slider Grid.Column="1" x:Name="MicGain" Minimum="0.0" Maximum="3.0" Value="1.0"
+                                    ValueChanged="OnGainChanged"/>
+                            <TextBlock Grid.Column="2" x:Name="MicGainLabel" TextAlignment="Right" TextWrapping="NoWrap"
+                                       FontFamily="Consolas" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid Height="30" Margin="0,10,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="90"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="130"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="Output Gain" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                            <Slider Grid.Column="1" x:Name="LoopGain" Minimum="0.0" Maximum="3.0" Value="1.0"
+                                    ValueChanged="OnGainChanged"/>
+                            <TextBlock Grid.Column="2" x:Name="LoopGainLabel" TextAlignment="Right" TextWrapping="NoWrap"
+                                       FontFamily="Consolas" VerticalAlignment="Center"/>
+                        </Grid>
                     </StackPanel>
-                    <CheckBox x:Name="SplitInsteadOfStopCheck" Content="Split into new file instead of stopping"
-                               Margin="0,4,0,0"/>
-                    <!-- GAP-09 #4: pre-record countdown (0 = off). Delayed start only;
-                         disk-guard + engine StartAsync run after it elapses. -->
-                    <TextBlock Text="Countdown before recording" Margin="0,12,0,0" FontWeight="SemiBold"/>
-                    <ComboBox x:Name="CountdownCombo" Margin="0,4,0,0"
-                              SelectedValuePath="Tag"
-                              AutomationProperties.Name="Countdown before recording">
-                        <ComboBoxItem Content="Off" Tag="0"/>
-                        <ComboBoxItem Content="3 s" Tag="3"/>
-                        <ComboBoxItem Content="5 s" Tag="5"/>
-                        <ComboBoxItem Content="10 s" Tag="10"/>
-                    </ComboBox>
-                    <!-- GAP-09 #6: in-app remappable hotkeys (window-focused only).
-                         Click a box, then press the new shortcut to capture it. -->
-                    <TextBlock Text="Keyboard Shortcuts (window-focused)" Margin="0,12,0,0" FontWeight="SemiBold"/>
-                    <Grid Margin="0,4,0,0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="Auto"/>
-                        </Grid.RowDefinitions>
-                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Start" Opacity="0.7"/>
-                        <TextBlock Grid.Row="0" Grid.Column="1" Text="Pause" Opacity="0.7" Margin="4,0,0,0"/>
-                        <TextBlock Grid.Row="0" Grid.Column="2" Text="Stop" Opacity="0.7" Margin="4,0,0,0"/>
-                        <TextBox Grid.Row="1" Grid.Column="0" x:Name="StartHotkeyBox" Margin="0,2,0,0"
-                                 IsReadOnly="True" Focusable="True"
-                                 ToolTip="Click, then press the new Start shortcut"
-                                 AutomationProperties.Name="Start hotkey"
-                                 Tag="Start"
-                                 GotFocus="OnHotkeyBoxGotFocus"
-                                 LostFocus="OnHotkeyBoxLostFocus"
-                                 PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
-                        <TextBox Grid.Row="1" Grid.Column="1" x:Name="PauseHotkeyBox" Margin="4,2,0,0"
-                                 IsReadOnly="True" Focusable="True"
-                                 ToolTip="Click, then press the new Pause shortcut"
-                                 AutomationProperties.Name="Pause hotkey"
-                                 Tag="Pause"
-                                 GotFocus="OnHotkeyBoxGotFocus"
-                                 LostFocus="OnHotkeyBoxLostFocus"
-                                 PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
-                        <TextBox Grid.Row="1" Grid.Column="2" x:Name="StopHotkeyBox" Margin="4,2,0,0"
-                                 IsReadOnly="True" Focusable="True"
-                                 ToolTip="Click, then press the new Stop shortcut"
-                                 AutomationProperties.Name="Stop hotkey"
-                                 Tag="Stop"
-                                 GotFocus="OnHotkeyBoxGotFocus"
-                                 LostFocus="OnHotkeyBoxLostFocus"
-                                 PreviewKeyDown="OnHotkeyCapturePreviewKeyDown"/>
-                        <Button Grid.Row="1" Grid.Column="3" x:Name="ResetHotkeysBtn" Content="Reset"
-                                Click="OnResetHotkeys" Margin="4,2,0,0"
-                                ToolTip="Restore Ctrl+R / Ctrl+P / Ctrl+S"
-                                AutomationProperties.Name="Reset hotkeys"/>
-                    </Grid>
-                    <TextBlock Text="Click a box, press keys to capture (Esc cancels)." Opacity="0.6" Margin="0,2,0,0"/>
-                </StackPanel>
+
+                    <Border Grid.Column="1" Width="1" Margin="0,2"
+                            Background="{StaticResource ControlBorder}"/>
+
+                    <!-- Live levels -->
+                    <StackPanel Grid.Column="2" Margin="10,0,0,0">
+                        <Grid Height="30">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="60"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="80"/>
+                                <ColumnDefinition Width="45"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="Mic" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                            <ProgressBar Grid.Column="1" x:Name="MicBar" Minimum="0" Maximum="100" Margin="10,0"
+                                         VerticalAlignment="Center"
+                                         AutomationProperties.Name="Microphone Level"
+                                         AutomationProperties.LiveSetting="Polite"/>
+                            <TextBlock Grid.Column="2" x:Name="MicDb" TextAlignment="Right" TextWrapping="NoWrap" FontFamily="Consolas" VerticalAlignment="Center"/>
+                            <TextBlock Grid.Column="3" x:Name="MicClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="Center" Margin="8,0,0,0" FontWeight="Bold"/>
+                        </Grid>
+                        <Grid Height="30" Margin="0,10,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="60"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="80"/>
+                                <ColumnDefinition Width="45"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="System" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                            <ProgressBar Grid.Column="1" x:Name="SysBar" Minimum="0" Maximum="100" Margin="10,0"
+                                         VerticalAlignment="Center"/>
+                            <TextBlock Grid.Column="2" x:Name="SysDb" TextAlignment="Right" TextWrapping="NoWrap" FontFamily="Consolas" VerticalAlignment="Center"/>
+                            <TextBlock Grid.Column="3" x:Name="SysClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="center" Margin="8,0,0,0" FontWeight="Bold"/>
+                        </Grid>
+                    </StackPanel>
+                </Grid>
             </GroupBox>
 
-            <!-- Gains -->
-            <GroupBox Grid.Row="1" Grid.Column="0" Header="Live Gain Controls" Margin="0,4,8,4">
-                <StackPanel Margin="6">
-
-                    <!-- Mic row -->
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="100"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="150"/>
-                        </Grid.ColumnDefinitions>
-
-                        <TextBlock Grid.Column="0" Text="Mic Gain" VerticalAlignment="Center" FontWeight="SemiBold"/>
-                        <Slider x:Name="MicGain" Grid.Column="1" Minimum="0.0" Maximum="3.0" Value="1.0"
-                                ValueChanged="OnGainChanged"/>
-                        <TextBlock x:Name="MicGainLabel" Grid.Column="2" TextAlignment="Right"
-                                   FontFamily="Consolas" VerticalAlignment="Center"/>
-                    </Grid>
-
-                    <!-- Output/System row -->
-                    <Grid Margin="0,10,0,0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="100"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="150"/>
-                        </Grid.ColumnDefinitions>
-
-                        <TextBlock Grid.Column="0" Text="Output Gain" VerticalAlignment="Center" FontWeight="SemiBold"/>
-                        <Slider x:Name="LoopGain" Grid.Column="1" Minimum="0.0" Maximum="3.0" Value="1.0"
-                                ValueChanged="OnGainChanged"/>
-                        <TextBlock x:Name="LoopGainLabel" Grid.Column="2" TextAlignment="Right"
-                                   FontFamily="Consolas" VerticalAlignment="Center"/>
-                    </Grid>
-
-                </StackPanel>
-            </GroupBox>
-
-            <!-- Meters -->
-            <GroupBox Grid.Row="1" Grid.Column="1" Header="Live Levels" Margin="8,4,0,4">
-                <StackPanel Margin="6">
-                    <!-- Mic meter -->
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="70"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="80"/>
-                            <ColumnDefinition Width="50"/>
-                            <ColumnDefinition Width="90"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Mic" VerticalAlignment="Center" FontWeight="SemiBold"/>
-                        <ProgressBar Grid.Column="1" x:Name="MicBar" Minimum="0" Maximum="100" Margin="10,0"
-                                     AutomationProperties.Name="Microphone Level"
-                                     AutomationProperties.LiveSetting="Polite"/>
-                        <TextBlock Grid.Column="2" x:Name="MicDb" TextAlignment="Right" FontFamily="Consolas" VerticalAlignment="Center"/>
-                        <TextBlock Grid.Column="3" x:Name="MicClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="Center" Margin="8,0,0,0" FontWeight="Bold"/>
-                        <Button Grid.Column="4" x:Name="TestMicBtn" Content="Test Mic" Click="OnTestMic" Margin="8,0,0,0"
-                                AutomationProperties.Name="Test microphone"/>
-                    </Grid>
-
-                    <!-- System meter -->
-                    <Grid Margin="0,10,0,0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="70"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="80"/>
-                            <ColumnDefinition Width="50"/>
-                            <ColumnDefinition Width="90"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="System" VerticalAlignment="Center" FontWeight="SemiBold"/>
-                        <ProgressBar Grid.Column="1" x:Name="SysBar" Minimum="0" Maximum="100" Margin="10,0"/>
-                        <TextBlock Grid.Column="2" x:Name="SysDb" TextAlignment="Right" FontFamily="Consolas" VerticalAlignment="Center"/>
-                        <TextBlock Grid.Column="3" x:Name="SysClip" Text="CLIP" Foreground="{StaticResource ControlDisabled}" VerticalAlignment="center" Margin="8,0,0,0" FontWeight="Bold"/>
-                        <Button Grid.Column="4" x:Name="TestSysBtn" Content="Test System" Click="OnTestSys" Margin="8,0,0,0"
-                                AutomationProperties.Name="Test system output"/>
-                    </Grid>
-                </StackPanel>
-            </GroupBox>
-
-            <!-- Controls -->
+            <!-- Toolbar -->
             <StackPanel Orientation="Horizontal" Grid.Row="2" Grid.ColumnSpan="2" Margin="0,8,0,0">
                 <Button x:Name="RefreshBtn" Content="Refresh Devices" Click="OnRefreshDevices"/>
-                <Button x:Name="StartBtn" Content="Start Recording (Ctrl+R)" Click="OnStart" Margin="8,0,0,0"
-                        Style="{StaticResource AccentButton}"
-                        AutomationProperties.Name="Start Recording"
-                        AutomationProperties.AcceleratorKey="Ctrl+R"/>
-                <Button x:Name="PauseBtn" Content="Pause (Ctrl+P)" Click="OnPauseResume" IsEnabled="False" Margin="8,0,0,0"
-                        AutomationProperties.Name="Pause Recording"
-                        AutomationProperties.AcceleratorKey="Ctrl+P"/>
-                <Button x:Name="StopBtn" Content="Stop (Ctrl+S)" Click="OnStop" IsEnabled="False" Margin="8,0,0,0"
-                        Style="{StaticResource AccentButton}"/>
+                <Button x:Name="SettingsBtn" Content="Settings…" Click="OnOpenSettings" Margin="8,0,0,0"
+                        AutomationProperties.Name="Open settings"
+                        ToolTip="Output format, auto-stop limits, countdown and shortcuts"/>
             </StackPanel>
 
-            <!-- GAP-09 #8: recent-sessions history. Preview is OS-default:
-                 Play opens the file in the default player; no embedded
-                 MediaElement (full in-app player is out of scope per §12). -->
-            <GroupBox Grid.Row="3" Grid.ColumnSpan="2" Header="History (recent sessions)" Margin="0,8,0,0">
-                <DockPanel Margin="6">
-                    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,6,0,0" VerticalAlignment="Center">
-                        <Button x:Name="HistoryOpenBtn" Content="Open Folder" Click="OnHistoryOpen" Width="90"
-                                ToolTip="Reveal the selected session file in Explorer"/>
-                        <Button x:Name="HistoryPlayBtn" Content="Play" Click="OnHistoryPlay" Margin="8,0,0,0" Width="70"
-                                ToolTip="Preview with the default MP3/WAV player (OS-default preview)"/>
-                        <Button x:Name="HistoryDeleteBtn" Content="Delete" Click="OnHistoryDelete" Margin="8,0,0,0" Width="70"
-                                ToolTip="Delete the session files and remove the entry"/>
-                        <TextBlock Text="Double-click a session to reveal it. Play uses your default player."
-                                   Opacity="0.6" Margin="12,0,0,0" VerticalAlignment="Center" TextWrapping="Wrap"/>
-                    </StackPanel>
-                    <ListBox x:Name="HistoryList" Height="86" MouseDoubleClick="OnHistoryDoubleClick"
-                             ToolTip="Recent recording sessions (newest first, max 50)"/>
-                </DockPanel>
-            </GroupBox>
-
-            <!-- Status bar -->
-            <Separator Grid.Row="4" Grid.ColumnSpan="2" Margin="0,12,0,0"/>
-            <DockPanel Grid.Row="5" Grid.ColumnSpan="2" Margin="0,8,0,0">
-                <TextBlock x:Name="VersionText" DockPanel.Dock="Right" Opacity="0.5" VerticalAlignment="Center"/>
-                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock x:Name="StatusText" Text="Ready to record" Opacity="0.8" />
-                    <!-- GAP-09 #4: visible only while a start countdown is running. -->
+            <!-- Status bar + transport footer -->
+            <Separator Grid.Row="3" Grid.ColumnSpan="2" Margin="0,12,0,0"/>
+            <DockPanel Grid.Row="4" Grid.ColumnSpan="2" Margin="0,8,0,0" Height="30">
+                <TextBlock x:Name="VersionText" DockPanel.Dock="Right" Opacity="0.5" VerticalAlignment="Center" Margin="12,0,0,0"/>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center" Height="30">
+                    <Button x:Name="StartBtn" Content="Start Recording (Ctrl+R)" Click="OnStart"
+                            Style="{StaticResource AccentButton}"
+                            AutomationProperties.Name="Start Recording"
+                            AutomationProperties.AcceleratorKey="Ctrl+R"/>
+                    <Button x:Name="PauseBtn" Content="Pause (Ctrl+P)" Click="OnPauseResume" IsEnabled="False" Margin="8,0,0,0"
+                            AutomationProperties.Name="Pause Recording"
+                            AutomationProperties.AcceleratorKey="Ctrl+P"/>
+                    <Button x:Name="StopBtn" Content="Stop (Ctrl+S)" Click="OnStop" IsEnabled="False" Margin="8,0,0,0"
+                            Style="{StaticResource AccentButton}"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Height="30">
+                    <TextBlock x:Name="ElapsedText" Text="00:00" Visibility="Collapsed" Margin="0,0,12,0"
+                               FontFamily="Consolas" FontWeight="SemiBold" VerticalAlignment="Center"
+                               AutomationProperties.Name="Recording elapsed time"/>
+                    <TextBlock x:Name="StatusText" Text="Ready to record" Opacity="0.8" TextWrapping="NoWrap" VerticalAlignment="Center"/>
                     <Button x:Name="CancelCountdownBtn" Content="Cancel" Margin="8,0,0,0"
                             Visibility="Collapsed" Click="OnCancelCountdown"
                             AutomationProperties.Name="Cancel countdown"/>
-                    <ProgressBar x:Name="EncodingProgressBar" Width="120" Margin="15,0,0,0" Visibility="Collapsed" Minimum="0" Maximum="100"/>
-                    <TextBlock x:Name="EncodingProgressText" Text="0%" Margin="5,0,0,0" Visibility="Collapsed" FontFamily="Consolas"/>
+                    <ProgressBar x:Name="EncodingProgressBar" Width="90" Margin="12,0,0,0" Visibility="Collapsed" Minimum="0" Maximum="100"
+                                 VerticalAlignment="Center"/>
+                    <TextBlock x:Name="EncodingProgressText" Text="0%" Margin="5,0,0,0" Visibility="Collapsed" FontFamily="Consolas" VerticalAlignment="Center"/>
                 </StackPanel>
             </DockPanel>
         </Grid>

@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using System.Threading.Tasks;
 
 namespace Hearbud
@@ -41,39 +40,18 @@ namespace Hearbud
 
     internal static class CrashLog
     {
-        // Primary location: the same folder recordings go to (session logs live
-        // alongside). Falls back to LocalAppData when unset/unwritable so a
-        // crash report is never lost because the output folder is bad.
-        private static readonly string FallbackDir =
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Hearbud");
-
-        private static string? _logDirOverride;
-
-        private static string DefaultDir =>
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Recordings");
-
-        private static string LogDir => _logDirOverride ?? DefaultDir;
-        private static string LogPath => Path.Combine(LogDir, "logs.txt");
-
         /// <summary>
-        /// Points the log at the current output folder. Null/empty resets to
-        /// the default output folder. Never throws.
+        /// Reports a fatal error without writing a log file. Diagnostics are
+        /// routed to the debugger only; the dialog is the user-visible record.
         /// </summary>
-        public static void SetLogDirectory(string? dir)
-        {
-            try { _logDirOverride = string.IsNullOrWhiteSpace(dir) ? null : dir; }
-            catch { /* ignore */ }
-        }
-
         public static void LogAndShow(string where, Exception? ex)
         {
             string detail = ex?.ToString() ?? "(null exception)";
-            string writtenTo = LogOnly(where, detail);
+            LogOnly(where, detail);
             try
             {
                 System.Windows.MessageBox.Show(
-                    $"A fatal error occurred in {where}.\n\n{detail}\n\n" +
-                    $"A log was written to:\n{(string.IsNullOrEmpty(writtenTo) ? LogPath : writtenTo)}",
+                    $"A fatal error occurred in {where}.\n\n{detail}",
                     "Hearbud - Crash",
                     System.Windows.MessageBoxButton.OK,
                     System.Windows.MessageBoxImage.Error);
@@ -82,29 +60,12 @@ namespace Hearbud
         }
 
         /// <summary>
-        /// Appends a line to the crash log without showing any UI. Used by
-        /// low-volume diagnostics (env dump, 1 Hz lag spikes, close summary).
+        /// Writes diagnostic output to the debugger only. Kept as a single
+        /// no-file sink for the existing diagnostic call sites.
         /// </summary>
-        /// <returns>Path actually written, or "" when both locations failed.</returns>
-        public static string LogOnly(string where, string detail)
+        public static void LogOnly(string where, string detail)
         {
-            string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {where}\n{detail}\n\n";
-            try
-            {
-                Directory.CreateDirectory(LogDir);
-                string path = LogPath;
-                File.AppendAllText(path, line);
-                return path;
-            }
-            catch { /* fall through to fallback */ }
-            try
-            {
-                Directory.CreateDirectory(FallbackDir);
-                string path = Path.Combine(FallbackDir, "logs.txt");
-                File.AppendAllText(path, line);
-                return path;
-            }
-            catch { return ""; }
+            System.Diagnostics.Debug.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {where}\n{detail}");
         }
     }
 }

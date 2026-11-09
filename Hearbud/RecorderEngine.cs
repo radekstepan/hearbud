@@ -543,6 +543,12 @@ namespace Hearbud
         private CancellationTokenSource? _reopenCts;
         private int _preRollRemaining;
 
+        // Monitor-restart gap probe: armed (Stopwatch tick) whenever a monitor
+        // restart finishes; the first capture callback after that logs the
+        // restart-to-first-audio gap. 0 = not armed.
+        private long _restartTick;
+        private int _restartLogged;
+
         // GAP-01: 1 ms system timer + MMCSS "Pro Audio" for our own threads.
         // CSCore owns the WASAPI callback threads, so we pin what we own (writer thread)
         // and raise timer resolution during capture; documented in ARCHITECTURE.
@@ -681,7 +687,12 @@ namespace Hearbud
         public async Task MonitorAsync(RecorderStartOptions opts)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            long t0 = Stopwatch.GetTimestamp();
+            CrashLog.LogOnly("AudioEngine",
+                $"t={DateTime.Now:HH:mm:ss.fff} MonitorAsync entry loop={(string.IsNullOrWhiteSpace(opts.LoopbackDeviceId) ? "-" : "set")} mic={(string.IsNullOrWhiteSpace(opts.MicDeviceId) ? "-" : "set")} monitoring={_monitoring} recording={_recording} tid={Environment.CurrentManagedThreadId}");
             StopInternal(fullStop: true);
+            CrashLog.LogOnly("AudioEngine",
+                $"t={DateTime.Now:HH:mm:ss.fff} MonitorAsync StopInternal done +{(Stopwatch.GetTimestamp() - t0) * _tickMs:F0}ms");
             await OpenDevicesAsync(opts);
 
             if (!_monitoring)
@@ -700,8 +711,121 @@ namespace Hearbud
                 _rmsCountSinceLastMic = _rmsCountSinceLastSys = 0;
                 _clippedSinceLastMic = _clippedSinceLastSys = false;
 
+                Volatile.Write(ref _restartLogged, 0);
+                Volatile.Write(ref _restartTick, Stopwatch.GetTimestamp());
+                CrashLog.LogOnly("AudioEngine",
+                    $"t={DateTime.Now:HH:mm:ss.fff} MonitorAsync caps started, total +{(Stopwatch.GetTimestamp() - t0) * _tickMs:F0}ms");
+
                 RaiseStatus(EngineStatusKind.Info, "Monitoring…");
                 Info("Monitoring started");
+            }
+        }
+
+        /// <summary>
+        /// Idle include-toggle path. Unchecked sides are muted in software
+        /// (samples gated to zero, meters read 0) instead of being closed:
+        /// a click never calls WASAPI Stop/Initialize/Start, so the driver is
+        /// never disturbed and the surviving capture keeps running. A wanted
+        /// side that is not open yet (first check after launch, or a changed
+        /// device) is opened; an unwanted side is never torn down here.
+        /// Never disturbs a running recording (no-op when recording). Safe to
+        /// call from any thread; device COM work happens on the caller's thread.
+        /// </summary>
+        public Task MonitorSourcesAsync(RecorderStartOptions opts)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            long t0 = Stopwatch.GetTimestamp();
+            void log(string m) => CrashLog.LogOnly("AudioEngine",
+                $"t={DateTime.Now:HH:mm:ss.fff} +{(Stopwatch.GetTimestamp() - t0) * _tickMs:F0}ms tid={Environment.CurrentManagedThreadId} {m}");
+            bool wantLoop = !string.IsNullOrWhiteSpace(opts.LoopbackDeviceId);
+            bool wantMic = !string.IsNullOrWhiteSpace(opts.MicDeviceId);
+            log($"MonitorSources entry wantLoop={wantLoop} wantMic={wantMic} monitoring={_monitoring} recording={_recording}");
+            if (_recording || _disposed) { log("abort: recording or disposed"); return Task.CompletedTask; }
+            try
+            {
+                // Soft mute first: instant in the meters, no device I/O.
+                SetChannelMute(micMuted: !wantMic, systemMuted: !wantLoop);
+
+                bool loopMismatch = wantLoop
+                    ? (_loopCap == null || _loopCap.Device.DeviceID != opts.LoopbackDeviceId)
+                    : false;
+                bool micMismatch = wantMic
+                    ? (_micCap == null || _micCap.Device.DeviceID != opts.MicDeviceId)
+                    : false;
+                if (!loopMismatch && !micMismatch) { log("no change, survivor untouched"); return Task.CompletedTask; }
+
+                if (loopMismatch)
+                {
+                    // Only reached when a wanted side is missing or its device
+                    // changed; unchecking never comes here.
+                    long s0 = Stopwatch.GetTimestamp();
+                    try { if (_loopIn != null) _loopIn.DataAvailable -= OnLoopbackData; } catch { }
+                    TryStopDispose(ref _loopCap);
+                    TryDispose(ref _loopIn);
+                    TryDispose(ref _loopSrc);
+                    lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; }
+                    log($"loop side torn down +{(Stopwatch.GetTimestamp() - s0) * _tickMs:F0}ms");
+                    MMDevice loopDev;
+                    using (var mmde = new MMDeviceEnumerator()) loopDev = mmde.GetDevice(opts.LoopbackDeviceId!);
+                    log($"loop GetDevice ok: {loopDev.FriendlyName}");
+                    var cap = new WasapiLoopbackCapture { Device = loopDev };
+                    cap.Initialize();
+                    log("loop Initialize ok");
+                    _loopCap = cap;
+                    _outRate = _loopCap.WaveFormat.SampleRate;
+                    _outChannels = _loopCap.WaveFormat.Channels;
+                    _loopIn = new SoundInSource(_loopCap) { FillWithZeros = true };
+                    _loopSrc = _loopIn.ToSampleSource();
+                    _loopIn.DataAvailable += OnLoopbackData;
+                    _loopCap.Start();
+                    _lastLoopTick = Stopwatch.GetTimestamp();
+                    log($"loop restarted sr={_outRate} ch={_outChannels}");
+                }
+
+                if (_recording || _disposed) { log("abort mid-way: recording or disposed"); return Task.CompletedTask; }
+
+                if (micMismatch)
+                {
+                    // As above: only a missing/changed wanted source, never a mute.
+                    long s0 = Stopwatch.GetTimestamp();
+                    try { if (_micIn != null) _micIn.DataAvailable -= OnMicData; } catch { }
+                    TryStopDispose(ref _micCap);
+                    TryDispose(ref _micIn);
+                    TryDispose(ref _micSrc);
+                    lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                    try { Array.Clear(_resampleScratch, 0, _resampleScratch.Length); } catch { }
+                    log($"mic side torn down +{(Stopwatch.GetTimestamp() - s0) * _tickMs:F0}ms");
+                    MMDevice micDev;
+                    using (var mmde = new MMDeviceEnumerator()) micDev = mmde.GetDevice(opts.MicDeviceId!);
+                    log($"mic GetDevice ok: {micDev.FriendlyName}");
+                    var cap = new WasapiCapture { Device = micDev };
+                    cap.Initialize();
+                    log("mic Initialize ok");
+                    _micCap = cap;
+                    _micIn = new SoundInSource(_micCap) { FillWithZeros = true };
+                    _micSrc = _micIn.ToSampleSource();
+                    lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                    _micResamp.Reset(_micSrc.WaveFormat.Channels, _micSrc.WaveFormat.SampleRate, _outRate);
+                    _micIn.DataAvailable += OnMicData;
+                    _micCap.Start();
+                    log("mic restarted");
+                }
+
+                _activeLoopDeviceId = _loopCap == null ? "" : _loopCap.Device.DeviceID;
+                _activeMicDeviceId = _micCap == null ? "" : _micCap.Device.DeviceID;
+                _monitoring = _loopCap != null || _micCap != null;
+                if (_monitoring)
+                {
+                    Volatile.Write(ref _restartLogged, 0);
+                    Volatile.Write(ref _restartTick, Stopwatch.GetTimestamp());
+                }
+                log($"done monitoring={_monitoring}");
+                return Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                log($"EXCEPTION {ex.GetType().Name}: {ex.Message}");
+                throw;
             }
         }
 
@@ -709,6 +833,10 @@ namespace Hearbud
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             await MonitorAsync(opts); 
+
+            // Idle include toggles mute in software; a recording starts from
+            // the checkbox-derived device set, so included sides are live.
+            SetChannelMute(micMuted: false, systemMuted: false);
 
             _kbps = opts.Mp3BitrateKbps;
             _writeStems = opts.WriteStems;
@@ -1218,6 +1346,7 @@ namespace Hearbud
             {
                 try
                 {
+                    long a0 = Stopwatch.GetTimestamp();
                     MMDevice? loopDev = null;
                     MMDevice? micDev = null;
                     using (var mmde = new MMDeviceEnumerator())
@@ -1227,14 +1356,19 @@ namespace Hearbud
                         if (wantMic)
                             micDev = mmde.GetDevice(opts.MicDeviceId!);
                     }
+                    CrashLog.LogOnly("AudioEngine",
+                        $"t={DateTime.Now:HH:mm:ss.fff} OpenDevices attempt {attempt + 1} GetDevice +{(Stopwatch.GetTimestamp() - a0) * _tickMs:F0}ms loop={loopDev?.FriendlyName ?? "(none)"} mic={micDev?.FriendlyName ?? "(none)"} tid={Environment.CurrentManagedThreadId}");
 
                     _loopDevName = loopDev?.FriendlyName ?? "(none)";
                     _micDevName  = micDev?.FriendlyName ?? "(none)";
 
                     if (loopDev != null)
                     {
+                        long l0 = Stopwatch.GetTimestamp();
                         _loopCap = new WasapiLoopbackCapture { Device = loopDev };
                         _loopCap.Initialize();
+                        CrashLog.LogOnly("AudioEngine",
+                            $"t={DateTime.Now:HH:mm:ss.fff} OpenDevices loop Initialize +{(Stopwatch.GetTimestamp() - l0) * _tickMs:F0}ms sr={_loopCap.WaveFormat.SampleRate} ch={_loopCap.WaveFormat.Channels}");
                         _outRate     = _loopCap.WaveFormat.SampleRate;
                         _outChannels = _loopCap.WaveFormat.Channels;
 
@@ -1252,8 +1386,11 @@ namespace Hearbud
 
                     if (micDev != null)
                     {
+                        long m0 = Stopwatch.GetTimestamp();
                         _micCap = new WasapiCapture { Device = micDev };
                         _micCap.Initialize();
+                        CrashLog.LogOnly("AudioEngine",
+                            $"t={DateTime.Now:HH:mm:ss.fff} OpenDevices mic Initialize +{(Stopwatch.GetTimestamp() - m0) * _tickMs:F0}ms sr={_micCap.WaveFormat.SampleRate} ch={_micCap.WaveFormat.Channels}");
 
                         _micIn  = new SoundInSource(_micCap) { FillWithZeros = true };
                         _micSrc = _micIn.ToSampleSource();
@@ -1285,6 +1422,8 @@ namespace Hearbud
                     if (ex.HResult != unchecked((int)0x88890004))
                         throw;
 
+                    CrashLog.LogOnly("AudioEngine",
+                        $"t={DateTime.Now:HH:mm:ss.fff} OpenDevices attempt {attempt + 1} device-invalidated (0x{ex.HResult:X8}): {ex.Message}");
                     // Cleanup failed attempt before retry
                     TryStopDispose(ref _loopCap);
                     TryStopDispose(ref _micCap);
@@ -1304,6 +1443,8 @@ namespace Hearbud
 
         private void StopInternal(bool fullStop)
         {
+            long t0 = Stopwatch.GetTimestamp();
+            bool wasMonitoring = _monitoring;
             if (_monitoring)
             {
                 try { if (_loopIn != null) _loopIn.DataAvailable -= OnLoopbackData; } catch { }
@@ -1325,6 +1466,9 @@ namespace Hearbud
 
             ReleaseCaptureMmcss();
 
+            if (wasMonitoring)
+                CrashLog.LogOnly("AudioEngine",
+                    $"t={DateTime.Now:HH:mm:ss.fff} StopInternal fullStop={fullStop} +{(Stopwatch.GetTimestamp() - t0) * _tickMs:F0}ms");
             if (fullStop) Info("Stopped.");
         }
 
@@ -1460,6 +1604,10 @@ namespace Hearbud
             EnsureCaptureBoost();
             if (_micSrc == null || _micIn == null || _micCap == null) return;
             RecordCallbackTiming(isLoop: false);
+            long mrtMic = Volatile.Read(ref _restartTick);
+            if (mrtMic != 0 && Interlocked.Exchange(ref _restartLogged, 1) == 0)
+                CrashLog.LogOnly("AudioEngine",
+                    $"t={DateTime.Now:HH:mm:ss.fff} first post-restart mic data after {(Stopwatch.GetTimestamp() - mrtMic) * _tickMs:F0}ms tid={Environment.CurrentManagedThreadId}");
             try
             {
                 int blockAlignBytes = _micIn.WaveFormat.BlockAlign; 
@@ -1598,6 +1746,10 @@ namespace Hearbud
             EnsureCaptureBoost();
             if (_loopSrc == null || _loopCap == null || _loopIn == null) return;
             RecordCallbackTiming(isLoop: true);
+            long mrtLoop = Volatile.Read(ref _restartTick);
+            if (mrtLoop != 0 && Interlocked.Exchange(ref _restartLogged, 1) == 0)
+                CrashLog.LogOnly("AudioEngine",
+                    $"t={DateTime.Now:HH:mm:ss.fff} first post-restart loopback data after {(Stopwatch.GetTimestamp() - mrtLoop) * _tickMs:F0}ms tid={Environment.CurrentManagedThreadId}");
 
             try
             {

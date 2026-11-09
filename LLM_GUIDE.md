@@ -18,8 +18,8 @@ A Windows app that records system audio (WASAPI loopback) and microphone simulta
 
 | File | Priority | Why It Matters |
 |------|-----------|----------------|
-| `Hearbud/RecorderEngine.cs` | 🔴 CRITICAL | All audio pipeline logic (~1065 lines) |
-| `Hearbud/MainWindow.cs` | 🟡 Important | UI logic, event handlers |
+| `Hearbud/RecorderEngine.cs` | 🔴 CRITICAL | All audio pipeline logic (~2600 lines) |
+| `Hearbud/MainWindow.xaml.cs` | 🟡 Important | UI logic, event handlers |
 | `Hearbud/AppSettings.cs` | 🟢 Reference | Settings persistence |
 | `docs/ARCHITECTURE.md` | 🔴 CRITICAL | System architecture and design decisions |
 | `docs/LLM_QUICK_REFERENCE.md` | 🟡 Important | Condensed reference, quick lookup |
@@ -49,7 +49,7 @@ OnLoopbackData()                    OnMicData()
       ↓                                    ↓
   Metering → Queue Write            Ring Buffer → Queue Write
       ↓                                    ↓
-                   Mix (system + mic * 0.5)
+                   Mix (system + mic, normalize iff peak>1)
                             ↓
                       Async Disk Write
 ```
@@ -81,8 +81,8 @@ OnLoopbackData()                    OnMicData()
 
 ### Adding New Settings
 1. Add property to `AppSettings.cs`
-2. Bind in `MainWindow.xaml` (UI)
-3. Load/save in `LoadSettingsToUi()` / `SaveSettings()`
+2. Bind in `MainWindow.xaml` or `SettingsWindow.xaml` (UI)
+3. Load in `LoadSettingsToUi()` / `LoadFromSettings()`; persist with `_settings.Save()`
 4. Handle legacy migration if needed
 
 ### Changing Audio Pipeline
@@ -92,8 +92,8 @@ OnLoopbackData()                    OnMicData()
 4. Check session logs for diagnostics
 
 ### Adding UI Features
-1. Edit `MainWindow.xaml` (layout)
-2. Add event handlers in `MainWindow.cs`
+1. Edit `MainWindow.xaml` or `SettingsWindow.xaml` (layout)
+2. Add event handlers in the matching `.xaml.cs`
 3. Update settings model if needed
 4. Test on Windows (WPF-specific)
 
@@ -113,14 +113,14 @@ Performance Optimization
 - `_monitoring = true, _recording = true` → Recording (meters+file I/O)
 
 ### Buffer Allocation
-- Ring buffer: ~384 KB (4 sec @ 48kHz stereo)
-- Temporary float buffers: ~64 KB each
+- Mic/loop FIFOs: 192k floats each (≈ 2 s stereo @ 48 kHz)
+- Temporary float buffers: `BlockFrames`×8 floats (≈ 32 KB) each
 - Disk write buffers: Pooled per block
 
 ### Callback Frequency
 - Audio callbacks: ~100-150 Hz
-- UI meter timer: 100 ms (10 Hz)
-- Diagnistic logging: Every 50 loopback blocks
+- UI meter timer: 100 ms (10 Hz `DispatcherTimer`)
+- Diagnostic logging: 1 Hz wall-clock `lagTime` line in the session log
 
 ---
 
@@ -142,10 +142,10 @@ Performance Optimization
 - Sample rates match? (mic resampled to loopback)
 
 ### Sync Issues
-- Check session log `Mic ring backlog: X s`
-- ~0.1s = healthy
-- ~0.0s = underruns
-- >0.2s = overruns
+- Check the session log `lagTime=` line
+- `lagWatch=ok` = healthy
+- `under`/`silenced` climbing = underruns (mic too slow)
+- `over` climbing or `lagWatch=LAG` = overruns / backlog over 80 ms
 
 ---
 
@@ -185,7 +185,7 @@ Performance Optimization
 ## 🎓 Learning Path for LLMs
 
 1. **First:** Read `docs/ARCHITECTURE.md` - understand overall design
-2. **Second:** Read `HLM_QUICK_REFERENCE.md` - get the code structure
+2. **Second:** Read `docs/LLM_QUICK_REFERENCE.md` - get the code structure
 3. **Third:** Skim `RecorderEngine.cs` - see actual implementation
 4. **Fourth:** Deep dive `docs/WORKING_WITH_AUDIO.md` - audio theory
 5. **Fifth:** Reference `docs/CONTRIBUTING.md` - coding conventions

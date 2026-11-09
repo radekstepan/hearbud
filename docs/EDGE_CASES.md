@@ -107,9 +107,10 @@ Related: `docs/WORKING_WITH_AUDIO.md` (DSP/clock background),
 - **Test:** `RecorderEngineMuteTests.EmitFixedMix_MicMuted_EqualsLoopOnly`,
   `EmitFixedMix_SystemMuted_EqualsMicOnly`, `EmitFixedMix_BothMuted_IsSilence`,
   `EmitMicOnlyFixed_MicMuted_IsSilence`.
-- **Try:** While recording, toggle mic mute and drag gains; the meters and
-  the resulting WAVs must follow within a frame, and unmuting must not burst
-  or gap.
+- **Try:** While recording, drag the gains; the meters and the resulting
+  WAVs must follow within a frame. (The include checkboxes only mute while
+  idle — toggles are skipped once recording starts, since sources are fixed
+  for the running file.) Unmuting while idle must not burst or gap.
 
 ## 8. Acoustic echo (speakers feeding the mic)
 
@@ -159,5 +160,8 @@ Related: `docs/WORKING_WITH_AUDIO.md` (DSP/clock background),
   `WriterFailureTests.Manifest_Begin_Unclosed_ScanFinds_MarkClosed_ScanClears`,
   `Manifest_CorruptJson_Ignored_BestEffort`, plus the
   `WriterHealth.IsDiskFull` / high-water suite for the disk-full stop path.
-- **Try:** Kill the app mid-record, restart, and confirm the startup scan
-  flags the WAVs, repair restores playability, and the manifest records it.
+- **Try:** Kill the app mid-record, then confirm `WavRepair.TryRepair`
+  restores playability and `SessionManifest.ScanUnclosed` still flags the
+  session until `MarkClosed`. (There is currently no automatic startup
+  scan in the UI — recovery is covered by the tests above, not by a
+  restart flow.)

@@ -20,15 +20,23 @@ This document provides a condensed overview of the Hearbud codebase, optimized f
 
 ```
 Hearbud/
-├── App.xaml                # App entry point (global exception handlers)
-├── AppSettings.cs          # Settings persistence (~/.hearbud_config.json)
-├── Dbfs.cs                # Audio level (dBFS) calculations
-├── MainWindow.xaml         # Main UI
-├── MainWindow.cs           # UI logic, event handlers
-└── RecorderEngine.cs       # CORE: Audio capture, mixing, async I/O
+├── App.xaml / .xaml.cs      # App entry point, crash dialog + debugger sink
+├── AppSettings.cs           # Settings persistence (~/.hearbud_config.json)
+├── Dbfs.cs                  # Audio level (dBFS) calculations
+├── MainWindow.xaml          # Main UI (devices, audio, footer transport)
+├── MainWindow.xaml.cs       # UI logic, event handlers
+├── SettingsWindow.xaml      # Settings dialog (format/limits/countdown/hotkeys)
+├── SettingsWindow.xaml.cs
+├── UsbTopology.cs           # Mic+mouse shared-USB-hub probe
+├── UiDiagnostics.cs         # Env report, input ring, lag tracker
+├── HistoryStore.cs          # Session history JSON (currently unwired from UI)
+├── SessionManifest.cs       # Crash bookkeeping (Begin/MarkClosed)
+├── WavRepair.cs             # WAV header fix + unclosed-session recovery
+├── WriterHealth.cs          # Disk-full / high-water tracking
+└── RecorderEngine.cs        # CORE: Audio capture, mixing, async I/O
 ```
 
-**Most Important File:** `RecorderEngine.cs` ~1065 lines - all audio pipeline logic
+**Most Important File:** `RecorderEngine.cs` ~2600 lines - all audio pipeline logic
 
 ---
 
@@ -36,11 +44,12 @@ Hearbud/
 
 | Class | Lines | Purpose | Important Members |
 |-------|-------|---------|------------------|
-| `RecorderEngine` | ~1065 | Core audio engine | `Monitor()`, `Start()`, `StopAsync()`, `OnLoopbackData()`, `OnMicData()` |
-| `MainWindow` | ~521 | UI, events, controls | `OnStart()`, `OnStop()`, `UpdateMeters()`, device selection |
-| `AppSettings` | ~90 | Settings persistence | `Load()`, `Save()`, properties: `MicGain`, `LoopGain`, `Mp3BitrateKbps` |
-| `Dbfs` | ~15 | Conversions | `FormatGain()`, `ToDbfs()` |
-| `App` (xaml.cs) | ~30 | Global crash handling | `CrashLog.LogAndShow()` |
+| `RecorderEngine` | ~2600 | Core audio engine | `MonitorAsync()`, `MonitorSourcesAsync()`, `StartAsync()`, `StopAsync()`, `OnLoopbackData()`, `OnMicData()` |
+| `MainWindow` | ~1550 | UI, events, controls | `OnStart()`, `OnStop()`, `UpdateMeters()`, device selection |
+| `SettingsWindow` | ~265 | Settings dialog | `OnOk()`, `OnCancel()`, hotkey capture |
+| `AppSettings` | ~160 | Settings persistence | `Load()`, `Save()`, gains, includes, limits, hotkeys |
+| `Dbfs` | ~26 | Conversions | `FormatGain()`, `ToDbfs()` |
+| `App` (xaml.cs) | ~71 | Global crash handling | `CrashLog.LogAndShow()` |
 
 ---
 
@@ -70,14 +79,14 @@ WASAPI Loopback → OnLoopbackData() → ReadExactSamples() → Convert to float
                           ↓
                EnqueueWrite() → _writeQueue (bg thread writes WAV)
 
-WASAPI Mic       → OnMicData() → ReadExactSamples() → ConvertToTarget()
-                                              ↓ (resample/remix if needed)
-                                      _micRing[] (ring buffer)
+WASAPI Mic       → OnMicData() → ReadExactSamples() → ConvertToTargetChunked()
+                                              ↓ (windowed-sinc resample/remix)
+                                      _micRing[] (FIFO, dual-FIFO with loop)
                                               ↓
-                                      Mixed by OnLoopbackData
+                                      Fixed 480-frame quanta mixed on loop ticks
 ```
 
-**Synchronization:** Loopback (system) is clock source. Mik pulled from ring buffer to match loopback chunks.
+**Synchronization:** Loopback (system) is clock source. Mic pulled from FIFO to match loopback chunks.
 
 ---
 
@@ -110,9 +119,10 @@ foreach (var job in _writeQueue.GetConsumingEnumerable()) {
 float systemSample = loopBufF[i] * LoopGain;
 float micSample = micBufF[i] * MicGain;
 
-// Mix formula (preserve headroom)
-float mix = (systemSample + micSample) * 0.5;
-float mixClipped = SoftClipIfNeeded(mix);  // tanh + clamp
+// Mix formula: straight sum, normalize only on overs (bit-transparent otherwise)
+float mix = systemSample + micSample;
+mix *= ComputeMixScale(blockPeak);      // 1/peak if peak > 1, else 1
+float mixClipped = SoftClipIfNeeded(mix);  // tanh only above ±1, then clamp
 ```
 
 ### 4. Dispose Idempotence Pattern
@@ -156,15 +166,15 @@ public void Dispose() {
 ### Pre-allocated Buffers (instance fields)
 | Buffer | Type | Size | Purpose |
 |--------|------|------|---------|
-| `_micRing` | `float[]` | 4 sec @ 48kHz × 2ch ≈ 384 KB | Mic sync ring |
-| `_loopBufF` | `float[]` | 8 × 1024 frames × 2ch ≈ 64 KB | Loopback temp |
+| `_micRing` | `float[]` | 192k floats ≈ 2 s stereo @ 48 kHz | Mic sync FIFO |
+| `_loopRing` | `float[]` | Same as above | Loopback FIFO (dual-FIFO) |
+| `_loopBufF` | `float[]` | `BlockFrames`×8 floats ≈ 32 KB | Loopback temp |
 | `_micConvBuf` | `float[]` | Same as above | Mic converted |
 | `_tmpMicBlock` | `float[]` | Same | Pulled from ring |
-| `_mixBufF` | `float[]` | Same | Mixed output |
-| `_pcm16Sys` | `byte[]` | 2× above | System WAV bytes |
-| `_pcm16Mix` | `byte[]` | 2× above | Mix WAV bytes |
-| `_pcm32Mix` | `byte[]` | 4× above | 32-bit mix bytes |
-| `_resampleScratch` | `float[]` | Same | Reusable for resampling |
+| `_mixBufF` | `float[]` | Same | Mixed output (480-frame quanta) |
+| `_pcm16Sys` / `_pcm16Mic` / `_pcm16Mix` | `byte[]` | `BlockFrames`×8×2 ≈ 16 KB each | 16-bit WAV bytes |
+| `_pcm32Mix` | `byte[]` | Sized per block | 32-bit mix bytes |
+| `_resampleScratch` | `float[]` | `BlockFrames`×8 floats | Reusable for resampling |
 
 **Resizing:** `EnsureCapacity()` resizes to next power-of-2, but rarely needed if initial sizes sufficient.
 
@@ -191,31 +201,37 @@ public void Dispose() {
 | `SpeakerName` | string | "" | Last selected speaker |
 | `OutputDir` | string | `~/Music/Recordings` | Save location |
 | `Mp3BitrateKbps` | int | 192 | 0 = Original (WAV only) |
-| `MicGain` | double | 1.0 | Linear multiplier (0.0–3.0) |
-| `LoopGain` | double | 1.0 | Linear multiplier (0.0–3.0) |
-| `IncludeMic` | bool | true | Include mic in recording |
+| `MicGain` | double | 1.0 | Linear multiplier (slider 0.0–3.0) |
+| `LoopGain` | double | 1.0 | Linear multiplier (slider 0.0–3.0) |
+| `IncludeMic` / `IncludeSystem` | bool | true | Include source (idle soft-mute; excluded from record set) |
+| `WriteStems` | bool | true | false = mix only |
+| `AutoStopMinutes` / `AutoStopSizeMb` | double | 0 | 0 = off |
+| `SplitInsteadOfStop` | bool | false | Split into `(N)` file instead of stopping |
+| `CountdownSeconds` | int | 0 | 0/3/5/10, pre-start delay |
+| `Start/Pause/StopHotkey` | string | Ctrl+R/P/S | Remappable, converter-validated |
 
 ---
 
 ## Logging & Diagnostics
 
-### Crash Log
-- **Location:** `%LocalAppData%\Hearbud\logs.txt`
+### Crash Diagnostics
+- **No log file:** `CrashLog.LogAndShow(where, ex)` shows the exception in the
+  crash dialog and writes the same text to the debugger only.
 - **Captures:** Unhandled exceptions (AppDomain, Dispatcher, TaskScheduler)
-- **Written by:** `CrashLog.LogAndShow(where, ex)`
 
 ### Session Log
 - **Location:** `*.txt` next to output files (e.g., `rec-20250623_143022.txt`)
-- **Per-Session:** Created in `Start()`, closed in `StopAsync()`
+- **Per-Session:** Created in `StartAsync()`, closed in `StopAsync()`
 - **Events:** Start/stop, device info, per-block diagnostics
 
-**Key Diagnostics:**
+**Key Diagnostics (1 Hz `lagTime` line):**
 ```text
-[...] INFO OnLoopbackData: Mic ring backlog: 0.0523 s (max 0.1500 s)
+[...] INFO Info: lagTime=0.052s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.120s masterFrames=… resyncs=0 trim=… lagWatch=ok
 ```
-- `backlog ≈ 0.1s` → Healthy sync
-- `backlog ≈ 0.0s` → Underruns (mic too slow)
-- `backlog ≈ 0.4s` → Overruns (mic too fast)
+- `lagTime` small + `lagWatch=ok` → Healthy sync
+- `under`/`silenced` climbing → Underruns (mic too slow)
+- `over` climbing → Overruns (mic too fast)
+- `lagWatch=LAG` → Backlog over 80 ms (drift/resync territory, see `resyncs=`)
 
 ---
 
@@ -255,12 +271,8 @@ public void Dispose() {
 
 ## Key Algorithms (Reference)
 
-### Linear Resampling
-```csharp
-int srcIndex = (int)(dstFrame * (srcRate / dstRate));
-float frac = (dstFrame * (srcRate / dstRate)) - srcIndex;
-interpolated = src[srcIndex] * (1 - frac) + src[srcIndex + 1] * frac;
-```
+### Windowed-Sinc Resampling (`ConvertToTargetChunked`)
+Mic → target rate via a 12-tap polyphase windowed-sinc kernel (`SincPolyphase` table) with fractional phase carried across callbacks in `ResamplerState`, so chunk boundaries never click. Cumulative length stays within ±1 frame/s. (The old linear-interpolation resampler is gone.)
 
 ### RMS Calculation
 ```csharp
@@ -307,15 +319,16 @@ _micCount -= read;
 
 | State | Meaning | Entry | Exit |
 |-------|---------|-------|------|
-| `_monitoring = false, _recording = false` | Idle (stopped) | ctor/Dispose/StopMonitor | Monitor() |
-| `_monitoring = true, _recording = false` | Monitoring (meters active) | Monitor() | StopMonitor() / Start() |
-| `_monitoring = true, _recording = true` | Recording (meters + file I/O) | Start() | StopAsync() |
+| `_monitoring = false, _recording = false` | Idle (stopped) | ctor/Dispose/StopMonitor | MonitorAsync() |
+| `_monitoring = true, _recording = false` | Monitoring (meters active) | MonitorAsync() | StopMonitor() / StartAsync() |
+| `_monitoring = true, _recording = true` | Recording (meters + file I/O) | StartAsync() | StopAsync() |
 
 **Transitions:**
 - `Idle → Monitor`: Open devices, subscribe callbacks
 - `Monitor → Recording`: Open WAVs, init queue, reset counters
 - `Recording → Monitor`: StopAsync complete, keep monitoring (unless full stop)
 - *any* → `Idle`: StopMonitor, close devices
+- Include toggles while idle go through `MonitorSourcesAsync()` (soft-mute, no teardown)
 
 ---
 
@@ -347,7 +360,10 @@ _micCount -= read;
 | Shortcut | Action |
 |----------|--------|
 | Ctrl+R | Start recording |
+| Ctrl+P | Pause / resume |
 | Ctrl+S | Stop recording |
+
+(Defaults; remappable in the Settings dialog.)
 
 ---
 
@@ -355,17 +371,18 @@ _micCount -= read;
 
 When modifying specific functionality, look here:
 
-| Task | File | Line Range (approx) | Key Methods |
-|------|------|---------------------|-------------|
-| Change mixing formula | RecorderEngine.cs | ~700-720 | `OnLoopbackData` mix loop |
-| Add metering metrics | RecorderEngine.cs | ~560-620 | Metering accumulators in callbacks |
-| Modify gain application | RecorderEngine.cs | ~580, 660 | Multipliers in metering and mix |
-| Change dither algorithm | RecorderEngine.cs | ~870-890 | `FloatToPcm16()` |
-| Adjust resampling | RecorderEngine.cs | ~830-860 | `ConvertToTarget()` |
-| Add diagnostic logging | RecorderEngine.cs | ~970-990 | `Info()`, `Warn()`, `Error()` |
-| Change UI layout | MainWindow.xaml | Entire file | XAML markup |
-| Add UI events | MainWindow.xsl.cs | ~200-450 | Event handlers |
-| Persist new setting | AppSettings.cs | Property + Load/Save | Add property, handle migration |
+| Task | File | Key Methods |
+|------|------|-------------|
+| Change mixing formula | RecorderEngine.cs | `EmitFixedMix()` / `EmitMicOnlyFixed()`, `ComputeMixScale()` |
+| Add metering metrics | RecorderEngine.cs | Metering accumulators in `OnLoopbackData()` / `OnMicData()` |
+| Modify gain application | RecorderEngine.cs | `MicGain` / `LoopGain` multipliers in metering and mix |
+| Change dither algorithm | RecorderEngine.cs | `FloatToPcm16()` |
+| Adjust resampling | RecorderEngine.cs | `ConvertToTargetChunked()`, `SincPolyphase` |
+| Add diagnostic logging | RecorderEngine.cs | `Info()`, `Warn()`, `Error()` |
+| Change main UI layout | MainWindow.xaml | XAML markup |
+| Change settings UI | SettingsWindow.xaml | XAML markup |
+| Add UI events | MainWindow.xaml.cs | `OnStart()`, `OnStop()`, … event handlers |
+| Persist new setting | AppSettings.cs | Property + `Load()`/`Save()`, handle migration |
 
 ---
 
@@ -373,10 +390,10 @@ When modifying specific functionality, look here:
 
 **Core Pillars:**
 1. Non-blocking audio callbacks (use async I/O, pooling)
-2. Loopback as clock source (mic via ring buffer)
-3. Three parallel WAV outputs (system, mic, mix)
-4. Throttled UI updates (100ms timer)
-5. Comprehensive logging (crash + session)
+2. Loopback as clock source (mic via FIFO, fixed 480-frame quanta)
+3. Parallel WAV outputs (mix always, stems optional)
+4. Throttled UI updates (100ms `DispatcherTimer`, engine level events at 50ms)
+5. Session logging (`*.txt`); crashes go to dialog + debugger only (no log file)
 
 **What to Watch:**
 - Audio callback execution time (keep <1 ms)

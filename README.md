@@ -10,7 +10,7 @@ Record your PC’s **system audio (WASAPI loopback)** and your **microphone** at
   - Writes three parallel WAVs during capture:
     - `*-system.wav` (raw system/loopback)
     - `*-mic.wav` (raw microphone, auto-converted to match loopback format)
-    - `*-mix.wav` (system + mic averaged mix, headroom preserved)
+    - `*-mix.wav` (system + mic sum, normalized only on overs so in-range audio stays bit-transparent)
   - After stop, the mix is encoded to `*.mp3`.
 
 - **Quality-focused pipeline**
@@ -24,14 +24,14 @@ Record your PC’s **system audio (WASAPI loopback)** and your **microphone** at
   - When loopback resumes, stale mic backlog is **dropped**, so you don’t hear old mic over new system.
 
 - **Live meters & gains**
-  - Smooth, throttled (~20 Hz) UI level updates with **RMS + Peak** and clip flashes.
+  - Smooth, throttled (10 Hz) UI level updates with **RMS + Peak** and clip flashes.
   - Independent **Mic** and **System** gains affect both meters and mix balance.
 
 - **Ergonomics**
-  - **MP3 bitrate selector** in the Output Settings (96–320 kbps).
+  - **Settings dialog** for output format + **MP3 bitrate** (96–320 kbps), stems, auto-stop limits, countdown, and remappable hotkeys.
   - Non-clobbering filenames (`foo (1).wav`, `foo (2).mp3`, etc.).
-  - Session log (`*.txt`) written next to outputs; per-block diagnostics include ring underruns and effective mic backlog (latency) snapshots.
-  - **Ctrl+R** to start, **Ctrl+S** to stop.
+  - Session log (`*.txt`) written next to outputs; per-second diagnostics include FIFO under/overruns and mic backlog (latency) snapshots.
+  - **Ctrl+R** to start, **Ctrl+P** to pause/resume, **Ctrl+S** to stop.
 
 ---
 

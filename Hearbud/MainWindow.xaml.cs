@@ -11,8 +11,8 @@ using System.Reflection;
 using System.Threading;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
-using System.Windows.Controls; // ComboBoxItem
 using System.Windows.Threading;
 
 using WpfMessageBox = System.Windows.MessageBox;
@@ -24,7 +24,14 @@ namespace Hearbud
     public partial class MainWindow : Window, IMMNotificationClient, IDisposable
     {
     private readonly RecorderEngine _engine = new();
-    private readonly System.Timers.Timer _uiTimer = new(100);
+    // UI meter pump: DispatcherTimer (UI thread, coalesced) instead of
+    // System.Timers.Timer + blocking Dispatcher.Invoke, which queued up
+    // behind slow device-enum/audio-start and starved input (checkbox/
+    // dropdown lag immediately on launch).
+    private readonly DispatcherTimer _uiTimer = new() { Interval = TimeSpan.FromMilliseconds(100) };
+    private System.Windows.Media.Brush? _clipBrush;
+    private System.Windows.Media.Brush? _disabledBrush;
+    private int _lastEncodePercent = -1;
     private TaskbarIcon? _trayIcon;
     private MMDeviceEnumerator? _notifEnumerator;
 
@@ -41,15 +48,11 @@ namespace Hearbud
     private bool _autoActionRunning;
     private bool _suppressStopUi;
 
-    // GAP-09 #4: pre-record countdown + mini-bar + tray states.
+    // GAP-09 #4: pre-record countdown + tray states.
     private CancellationTokenSource? _countdownCts;
-    private MiniBar? _miniBar;
     private System.Windows.Controls.MenuItem? _trayPauseItem;
     private System.Windows.Controls.MenuItem? _trayStopItem;
     private string? _lastAutoReason;
-
-    // GAP-09 #8: session history (JSON beside config) + startup repair scan.
-    private HistoryStore _history = new();
 
     private AppSettings _settings = AppSettings.Load();
         private readonly Dictionary<string, MMDevice> _micDict = new();
@@ -71,10 +74,22 @@ namespace Hearbud
     private int _diagLastMouseDown;
     private int _diagLastMouseUp;
 
+    // Non-client/close diagnostics: the title-bar X is a Win32 message, not a
+    // WPF mouse event, so the input ring above cannot see it. These log the
+    // real click -> WM_CLOSE -> OnClosing timeline. Frame counters prove
+    // whether the WPF render thread is presenting while the UI thread ticks.
+    private long _ctorTick;
+    private HwndSource? _hwndSource;
+    private long _frameCount;
+    private long _firstFrameTick;
+    private long _lastFrameTick;
+    private long _maxFrameGapTicks;
+
         public MainWindow()
         {
             try
             {
+                _ctorTick = Stopwatch.GetTimestamp();
                 InitializeComponent();
 
                 // GAP-09 #6: remappable in-app hotkeys (window-focused scope only;
@@ -92,7 +107,6 @@ namespace Hearbud
                 {
                     SafeRefreshDevices();
                     LoadSettingsToUi();
-                    CrashLog.SetLogDirectory(OutputFolderText.Text);
 
                     // default base name
                     var defBase = $"rec-{DateTime.Now:yyyyMMdd_HHmmss}";
@@ -102,6 +116,11 @@ namespace Hearbud
                     _uiReady = true;
                     UpdateGainLabels();
 
+                    // Resolve meter brushes once (UpdateMeters runs at 10 Hz;
+                    // per-tick FindResource walks the tree and adds jank).
+                    try { _clipBrush = (System.Windows.Media.Brush)FindResource("ClipBrush"); } catch { }
+                    try { _disabledBrush = (System.Windows.Media.Brush)FindResource("ControlDisabled"); } catch { }
+
                     // Display version
                     var version = Assembly.GetExecutingAssembly().GetName().Version;
                     if (version != null)
@@ -109,13 +128,12 @@ namespace Hearbud
                         VersionText.Text = $"v{version.Major}.{version.Minor}.{version.Build}";
                     }
 
-                    // Auto-start live monitoring so meters show immediately
-                    TryStartAutoMonitor();
-
-                    // GAP-09 #8: session history list + startup repair scan
-                    // for unfinalized WAVs (crash/abort leftovers).
-                    RefreshHistoryList();
-                    RunStartupRepairScan();
+                    // Auto-start live monitoring so meters show immediately,
+                    // but only after the first frame: WASAPI init on the UI
+                    // thread before the window is presented could delay the
+                    // first paint on slow USB audio drivers.
+                    Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle,
+                        new Action(() => TryStartAutoMonitor()));
 
                     // Register for Windows audio device notifications (plug/unplug).
                     // Must be done after the window handle exists (i.e. inside Loaded).
@@ -126,18 +144,46 @@ namespace Hearbud
                     try { CrashLog.LogOnly("UiDiagnostics.Env", UiDiagnostics.BuildEnvReport(this)); } catch { }
                     _diagLastTick = Stopwatch.GetTimestamp();
                     try { _diagTimer?.Start(); } catch { }
+
+                    // USB layout check (best-effort, off the UI thread): a mic
+                    // and pointing device behind one hub can drop mouse input
+                    // entirely before Windows delivers it, which looks exactly
+                    // like a frozen app. Never block startup.
+                    CheckUsbLayout();
+
+                    // A window launched by a script/agent can open behind the
+                    // foreground window; the first title-bar clicks then never
+                    // reach it. Make the launched window active explicitly.
+                    try { Activate(); } catch { }
                 };
 
                 _engine.LevelChanged += OnEngineLevelChanged;
                 _engine.Status += OnEngineStatus;
                 _engine.EncodingProgress += OnEngineEncodingProgress;
 
-                _uiTimer.Elapsed += (_, __) => Dispatcher.Invoke(UpdateMeters);
+                _uiTimer.Tick += (_, __) => UpdateMeters();
                 _uiTimer.Start();
 
                 _limitTimer.Tick += OnLimitTimerTick;
 
                 SetupUiDiagnostics();
+
+                // Render-thread probe: ContentRendered proves the first frame
+                // reached the screen; Rendering counts presented frames. A GUI
+                // that looks frozen while the UI thread timer still ticks shows
+                // up here as frames=0 or a large maxGap.
+                ContentRendered += (_, __) =>
+                {
+                    try
+                    {
+                        CrashLog.LogOnly("UiRender",
+                            $"t={DateTime.Now:HH:mm:ss.fff} ContentRendered after {Ms(_ctorTick)}ms " +
+                            $"size={ActualWidth:F0}x{ActualHeight:F0} left={Left:F0} top={Top:F0} " +
+                            $"state={WindowState} active={IsActive} tid={Environment.CurrentManagedThreadId}");
+                    }
+                    catch { /* best-effort */ }
+                };
+                try { CompositionTarget.Rendering += OnCompositionFrame; } catch { }
             }
             catch (Exception ex)
             {
@@ -148,16 +194,144 @@ namespace Hearbud
 
         private void OnToggleTheme(object sender, RoutedEventArgs e) { /* hidden; no-op */ }
 
+        /// <summary>
+        /// Runs the USB topology probe off the UI thread for the selected mic.
+        /// A mic and pointing device behind one hub can drop mouse input before
+        /// Windows delivers it, which looks exactly like the app freezing; the
+        /// inline banner makes the risk visible, and the probe never blocks.
+        /// Called at startup and from Refresh Devices (so rewiring can be
+        /// re-checked without restarting).
+        /// </summary>
+        private void CheckUsbLayout()
+        {
+            try
+            {
+                try { UsbWarningBanner.Visibility = Visibility.Collapsed; } catch { }
+                if (MicCombo.SelectedItem is not string micName ||
+                    !_micDict.TryGetValue(micName, out MMDevice? micDevice))
+                    return;
+
+                string micId = micDevice.DeviceID;
+                string micLabel = micDevice.FriendlyName ?? micName;
+                _ = Task.Run(() =>
+                {
+                    string? found = UsbTopologyProbe.Check(micId, micLabel);
+                    if (found == null)
+                    {
+                        CrashLog.LogOnly("UiDiagnostics.Usb",
+                            "OK: selected mic and pointing devices do not share a non-root USB hub.");
+                        return;
+                    }
+                    string warning = found;
+                    CrashLog.LogOnly("UiDiagnostics.Usb", warning);
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            UsbWarningText.Text = warning;
+                            UsbWarningBanner.Visibility = Visibility.Visible;
+                            MicCombo.ToolTip = warning;
+                            ShowTrayBalloon("Hearbud: USB layout warning", warning);
+                        }
+                        catch { /* best-effort */ }
+                    }));
+                });
+            }
+            catch { /* diagnostics must never affect startup */ }
+        }
+
         private void OnRefreshDevices(object sender, RoutedEventArgs e)
         {
             SafeRefreshDevices();
             TryStartAutoMonitor(); // keep meters alive after device changes
+            CheckUsbLayout();      // re-check after the user rewires USB
+        }
+
+        /// <summary>
+        /// Include toggles sit next to the device names. Unchecking mutes that
+        /// source in software: its combo is disabled synchronously so the
+        /// click paints instantly, then a pool thread (never the UI thread)
+        /// applies the mute via <see cref="RecorderEngine.MonitorSourcesAsync"/>,
+        /// which never stops or restarts a running capture (the device is only
+        /// opened when a wanted side is missing). Skipped while recording
+        /// (sources are fixed for the running file). Every step is timestamped
+        /// to the debugger ("AudioRestart") so a laggy click can be traced.
+        /// </summary>
+        private readonly object _restartLock = new();
+        private Task _restartChain = Task.CompletedTask;
+
+        private void OnIncludeSourceChanged(object sender, RoutedEventArgs e)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+            try
+            {
+                // Checked/Unchecked can fire during InitializeComponent before
+                // every x:Name field is connected; a null here used to throw.
+                if (IncludeMicCheck == null || RecordSysCheck == null ||
+                    MicCombo == null || SpeakerCombo == null) return;
+                bool wantMic = IncludeMicCheck.IsChecked ?? true;
+                bool wantSys = RecordSysCheck.IsChecked ?? true;
+                MicCombo.IsEnabled = wantMic;
+                SpeakerCombo.IsEnabled = wantSys;
+                CrashLog.LogOnly("AudioRestart",
+                    $"t={DateTime.Now:HH:mm:ss.fff} click mic={wantMic} sys={wantSys} uiReady={_uiReady} recording={_engine.IsRecording} tid={Environment.CurrentManagedThreadId}");
+                if (!_uiReady || _engine.IsRecording) return;
+
+                var micName = MicCombo.SelectedItem as string;
+                var spkName = SpeakerCombo.SelectedItem as string;
+                if (wantMic && (micName == null || !_micDict.ContainsKey(micName)))
+                {
+                    CrashLog.LogOnly("AudioRestart", $"t={DateTime.Now:HH:mm:ss.fff} no mic selected, restart skipped");
+                    return;
+                }
+                if (wantSys && (spkName == null || !_spkDict.ContainsKey(spkName)))
+                {
+                    CrashLog.LogOnly("AudioRestart", $"t={DateTime.Now:HH:mm:ss.fff} no output selected, restart skipped");
+                    return;
+                }
+                var opts = new RecorderStartOptions
+                {
+                    LoopbackDeviceId = wantSys ? _spkDict[spkName!].DeviceID : null,
+                    MicDeviceId = wantMic ? _micDict[micName!].DeviceID : null,
+                };
+                lock (_restartLock)
+                {
+                    _restartChain = _restartChain.ContinueWith(async _ =>
+                    {
+                        long s0 = Stopwatch.GetTimestamp();
+                        try
+                        {
+                            await _engine.MonitorSourcesAsync(opts).ConfigureAwait(false);
+                            CrashLog.LogOnly("AudioRestart",
+                                $"t={DateTime.Now:HH:mm:ss.fff} toggle done +{(Stopwatch.GetTimestamp() - s0) * 1000.0 / Stopwatch.Frequency:F0}ms (pool thread, UI never blocked)");
+                        }
+                        catch (Exception ex)
+                        {
+                            CrashLog.LogOnly("AudioRestart",
+                                $"t={DateTime.Now:HH:mm:ss.fff} toggle FAILED after {(Stopwatch.GetTimestamp() - s0) * 1000.0 / Stopwatch.Frequency:F0}ms: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    }, TaskScheduler.Default).Unwrap();
+                }
+                CrashLog.LogOnly("AudioRestart",
+                    $"t={DateTime.Now:HH:mm:ss.fff} click handler returned in {(Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency:F1}ms (UI thread free)");
+            }
+            catch (Exception ex)
+            {
+                CrashLog.LogOnly("AudioRestart",
+                    $"t={DateTime.Now:HH:mm:ss.fff} click handler EXCEPTION: {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
         private void SafeRefreshDevices()
         {
             try
             {
+                // Dispose prior COM devices before dropping them (leaked
+                // MMDevice RCWs accumulated handles on every refresh/notify).
+                foreach (var d in _micDict.Values)
+                    try { d.Dispose(); } catch { }
+                foreach (var d in _spkDict.Values)
+                    try { d.Dispose(); } catch { }
                 _micDict.Clear(); _spkDict.Clear();
 
                 using var enumerator = new MMDeviceEnumerator();
@@ -207,6 +381,9 @@ namespace Hearbud
 
         private async void TryStartAutoMonitor()
         {
+            long t0 = Stopwatch.GetTimestamp();
+            CrashLog.LogOnly("AudioEngine",
+                $"t={DateTime.Now:HH:mm:ss.fff} TryStartAutoMonitor entry tid={Environment.CurrentManagedThreadId}");
             await ExecuteWithDeviceRetryAsync(async () =>
             {
                 var micName = MicCombo.SelectedItem as string;
@@ -226,6 +403,8 @@ namespace Hearbud
                     MicDeviceId = wantMic && micName != null ? _micDict[micName].DeviceID : null
                 });
                 StatusText.Text = "Monitoring...";
+                CrashLog.LogOnly("AudioEngine",
+                    $"t={DateTime.Now:HH:mm:ss.fff} TryStartAutoMonitor done +{(Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency:F0}ms");
             });
         }
 
@@ -268,7 +447,6 @@ namespace Hearbud
                 if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
                 {
                     OutputFolderText.Text = dlg.SelectedPath;
-                    CrashLog.SetLogDirectory(OutputFolderText.Text);
                 }
             }
             catch (Exception ex)
@@ -378,7 +556,6 @@ namespace Hearbud
                     OutputFolderText.Text = def;
                     outDir = def;
                 }
-                CrashLog.SetLogDirectory(outDir);
 
                 var baseName = SanitizeFilename(BaseNameText.Text);
                 if (string.IsNullOrWhiteSpace(baseName))
@@ -465,13 +642,13 @@ namespace Hearbud
 
                 await _engine.StartAsync(BuildStartOptions(outDir, baseName));
 
-                // GAP-09: arm optional time/size limits (0 = off; unparsable = off).
+                // GAP-09: arm optional time/size limits from Settings (0 = off).
                 _splitOutDir = outDir;
                 _splitBaseName = baseName;
                 _splitIndex = 1;
-                _limitMinutes = ParseNonNegativeMinutes(LimitMinutesText.Text);
-                _limitSizeBytes = ParseNonNegativeSizeBytes(LimitSizeMbText.Text);
-                _splitMode = SplitInsteadOfStopCheck.IsChecked ?? false;
+                _limitMinutes = _settings.AutoStopMinutes;
+                _limitSizeBytes = (long)Math.Min(_settings.AutoStopSizeMb * 1024 * 1024, (double)long.MaxValue);
+                _splitMode = _settings.SplitInsteadOfStop;
                 _autoActionRunning = false;
                 _suppressStopUi = false;
                 _limitTimer.Start();
@@ -482,7 +659,6 @@ namespace Hearbud
                 StopBtn.IsEnabled  = true;
                 StatusText.Text = "Recording...";
                 _lastAutoReason = null;
-                ShowMiniBar();
                 UpdateTrayTooltip();
             }
             catch (Exception ex)
@@ -504,22 +680,8 @@ namespace Hearbud
                 MicDeviceId = wantMic && micName != null ? _micDict[micName].DeviceID : null,
                 Mp3BitrateKbps = GetSelectedBitrateKbps(),
                 IncludeMic = wantMic,
-                WriteStems = WriteStemsCheck.IsChecked ?? true
+                WriteStems = _settings.WriteStems
             };
-        }
-
-        private static double ParseNonNegativeMinutes(string? text)
-        {
-            if (double.TryParse(text, out var v) && !double.IsNaN(v) && v > 0)
-                return Math.Min(v, 24 * 60);
-            return 0;
-        }
-
-        private static long ParseNonNegativeSizeBytes(string? text)
-        {
-            if (double.TryParse(text, out var v) && !double.IsNaN(v) && v > 0)
-                return (long)Math.Min(v * 1024 * 1024, (double)long.MaxValue);
-            return 0;
         }
 
         /// <summary>
@@ -624,19 +786,13 @@ namespace Hearbud
         }
 
         /// <summary>
-        /// GAP-09 #4: reads the Output Settings countdown ComboBox. Only the
-        /// listed values (0/3/5/10) are valid; anything else means off.
+        /// GAP-09 #4: pre-record countdown from Settings. Only the listed
+        /// values (0/3/5/10) are valid; anything else means off.
         /// </summary>
         private int GetCountdownSeconds()
         {
-            try
-            {
-                string? tag = (CountdownCombo.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string
-                    ?? CountdownCombo.SelectedValue as string;
-                if (int.TryParse(tag, out var v) && v is 0 or 3 or 5 or 10) return v;
-            }
-            catch { /* best-effort: off */ }
-            return 0;
+            int v = _settings.CountdownSeconds;
+            return v is 0 or 3 or 5 or 10 ? v : 0;
         }
 
         /// <summary>GAP-09 #4: aborts a running start countdown (button next to StatusText).</summary>
@@ -644,33 +800,6 @@ namespace Hearbud
         {
             try { _countdownCts?.Cancel(); }
             catch { /* best-effort */ }
-        }
-
-        /// <summary>
-        /// GAP-09 #4: shows the mini-bar (created on demand, owned by main so
-        /// it closes with it). Its buttons delegate to OnPauseResume / OnStop.
-        /// </summary>
-        private void ShowMiniBar()
-        {
-            try
-            {
-                if (_miniBar == null)
-                {
-                    _miniBar = new MiniBar(
-                        () => _engine.RecordElapsed,
-                        () => (_micPeak, _sysPeak, _engine.IsPaused && _engine.IsRecording),
-                        () => OnPauseResume(null, null),
-                        () => OnStop(null, null));
-                    _miniBar.Owner = this;
-                    _miniBar.Closed += (_, __) => _miniBar = null;
-                }
-                _miniBar.Show();
-                _miniBar.Activate();
-            }
-            catch (Exception ex)
-            {
-                CrashLog.LogAndShow("ShowMiniBar", ex);
-            }
         }
 
         private void OnPauseResume(object? sender, RoutedEventArgs? e)
@@ -720,147 +849,6 @@ namespace Hearbud
             LoopGainLabel.Text = Dbfs.FormatGain(LoopGain.Value);
         }
 
-        // GAP-09 #3: sound-test slice. No engine change, nothing persisted.
-        private bool _micTestRunning;
-        private bool _sysTestRunning;
-
-        /// <summary>
-        /// Mic self-test: ensures the live monitor is running (same path as the
-        /// auto-monitor on startup) and samples the existing MicBar/MicDb peak
-        /// for 3 s. Reports the peak dBFS; the engine is left untouched.
-        /// </summary>
-        private async void OnTestMic(object sender, RoutedEventArgs e)
-        {
-            if (_micTestRunning) return;
-            try
-            {
-                if (!(IncludeMicCheck.IsChecked ?? true))
-                {
-                    WpfMessageBox.Show("Tick \"Include microphone\" so the monitor opens the mic.",
-                        "Test Mic", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
-                }
-                if (MicCombo.SelectedItem as string == null)
-                {
-                    WpfMessageBox.Show("Select a microphone first.",
-                        "Test Mic", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
-                }
-                _micTestRunning = true;
-                TestMicBtn.IsEnabled = false;
-                TryStartAutoMonitor(); // no-op when already monitoring/recording
-                await Task.Delay(400);
-                StatusText.Text = "Mic test: speak for 3 s…";
-                float peak = 0f;
-                var until = DateTime.UtcNow.AddSeconds(3);
-                while (DateTime.UtcNow < until)
-                {
-                    if (_micPeak > peak) peak = _micPeak;
-                    await Task.Delay(50);
-                }
-                double db = Dbfs.ToDbfs(peak);
-                StatusText.Text = $"Mic test peak: {db:0.0} dBFS";
-                WpfMessageBox.Show($"Mic test peak: {db:0.0} dBFS ({peak * 100.0:0}%).\n\nWatch the live Mic meter while speaking; raise Mic Gain if too quiet, lower it on CLIP.",
-                    "Test Mic", MessageBoxButton.OK, MessageBoxImage.Information);
-            }
-            catch (Exception ex)
-            {
-                CrashLog.LogAndShow("OnTestMic", ex);
-            }
-            finally
-            {
-                _micTestRunning = false;
-                TestMicBtn.IsEnabled = true;
-            }
-        }
-
-        /// <summary>
-        /// System self-test: synthesizes a 1 kHz / 1 s sine (with 10 ms edge
-        /// fades) to a temp WAV and plays it through the selected Speaker
-        /// device via CSCore WasapiOut. No assets shipped, no engine change.
-        /// </summary>
-        private async void OnTestSys(object sender, RoutedEventArgs e)
-        {
-            if (_sysTestRunning) return;
-            try
-            {
-                var spkName = SpeakerCombo.SelectedItem as string;
-                if (string.IsNullOrEmpty(spkName) || !_spkDict.TryGetValue(spkName, out var device) || device == null)
-                {
-                    WpfMessageBox.Show("Select an output device to capture first.",
-                        "Test System", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
-                }
-                _sysTestRunning = true;
-                TestSysBtn.IsEnabled = false;
-                StatusText.Text = "Playing test tone (1 kHz, 1 s)…";
-                string tmp = Path.Combine(Path.GetTempPath(), "hearbud-test-tone.wav");
-                WriteTestToneWav(tmp, freqHz: 1000.0, seconds: 1.0);
-                try
-                {
-                    // Kept on the UI thread (async waits only): the MMDevice RCW
-                    // comes from the UI-thread enumerator, so don't hop threads.
-                    using var reader = new CSCore.Codecs.WAV.WaveFileReader(tmp);
-                    using var wasapi = new CSCore.SoundOut.WasapiOut() { Device = device };
-                    wasapi.Initialize(reader);
-                    wasapi.Play();
-                    var deadline = DateTime.UtcNow.AddSeconds(6);
-                    while (wasapi.PlaybackState == CSCore.SoundOut.PlaybackState.Playing
-                           && DateTime.UtcNow < deadline)
-                        await Task.Delay(50);
-                    try { wasapi.Stop(); } catch { }
-                    StatusText.Text = "Test tone played (1 kHz, 1 s).";
-                }
-                finally
-                {
-                    try { File.Delete(tmp); } catch { }
-                }
-            }
-            catch (Exception ex)
-            {
-                CrashLog.LogAndShow("OnTestSys", ex);
-                StatusText.Text = "Test tone failed (see log).";
-            }
-            finally
-            {
-                _sysTestRunning = false;
-                TestSysBtn.IsEnabled = true;
-            }
-        }
-
-        /// <summary>Writes a 16-bit stereo PCM WAV sine with short edge fades (click-free).</summary>
-        private static void WriteTestToneWav(string path, double freqHz, double seconds, int sampleRate = 44100, short channels = 2)
-        {
-            int frames = Math.Max(1, (int)(sampleRate * seconds));
-            const short bits = 16;
-            int blockAlign = channels * bits / 8;
-            int dataBytes = frames * blockAlign;
-            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-            using var w = new BinaryWriter(fs);
-            w.Write(System.Text.Encoding.ASCII.GetBytes("RIFF"));
-            w.Write(36 + dataBytes);
-            w.Write(System.Text.Encoding.ASCII.GetBytes("WAVE"));
-            w.Write(System.Text.Encoding.ASCII.GetBytes("fmt "));
-            w.Write(16);
-            w.Write((short)1); // PCM
-            w.Write(channels);
-            w.Write(sampleRate);
-            w.Write(sampleRate * blockAlign);
-            w.Write((short)blockAlign);
-            w.Write(bits);
-            w.Write(System.Text.Encoding.ASCII.GetBytes("data"));
-            w.Write(dataBytes);
-            const double amp = 0.5; // -6 dBFS: clearly audible, headroom before clip
-            int fadeFrames = Math.Max(1, (int)(sampleRate * 0.01));
-            for (int n = 0; n < frames; n++)
-            {
-                double env = Math.Min(1.0, Math.Min(n, frames - 1 - n) / (double)fadeFrames);
-                double s = amp * env * Math.Sin(2.0 * Math.PI * freqHz * n / sampleRate);
-                short v = (short)Math.Clamp((int)Math.Round(s * short.MaxValue), short.MinValue, short.MaxValue);
-                for (int c = 0; c < channels; c++) w.Write(v);
-            }
-        }
-
         private volatile float _micPeak;
         private volatile float _sysPeak;
         private DateTime _micClipUntil = DateTime.MinValue;
@@ -880,25 +868,81 @@ namespace Hearbud
 
         private void UpdateMeters()
         {
-            var mp = Math.Clamp(_micPeak, 0f, 1f);
-            var sp = Math.Clamp(_sysPeak, 0f, 1f);
+            try
+            {
+                var mp = Math.Clamp(_micPeak, 0f, 1f);
+                var sp = Math.Clamp(_sysPeak, 0f, 1f);
 
-            MicBar.Value = Math.Round(mp * 100, 1);
-            SysBar.Value = Math.Round(sp * 100, 1);
+                MicBar.Value = Math.Round(mp * 100, 1);
+                SysBar.Value = Math.Round(sp * 100, 1);
 
-            MicDb.Text = $"{Dbfs.ToDbfs(mp),6:0.0} dBFS";
-            SysDb.Text = $"{Dbfs.ToDbfs(sp),6:0.0} dBFS";
+                MicDb.Text = $"{Dbfs.ToDbfs(mp),6:0.0} dBFS";
+                SysDb.Text = $"{Dbfs.ToDbfs(sp),6:0.0} dBFS";
 
-            MicClip.Foreground = DateTime.Now < _micClipUntil ? (System.Windows.Media.Brush)FindResource("ClipBrush") : (System.Windows.Media.Brush)FindResource("ControlDisabled");
-            SysClip.Foreground = DateTime.Now < _sysClipUntil ? (System.Windows.Media.Brush)FindResource("ClipBrush") : (System.Windows.Media.Brush)FindResource("ControlDisabled");
+                UpdateRecordingElapsed();
+                UpdateTransportState();
+
+                var clip = _clipBrush ?? (System.Windows.Media.Brush)FindResource("ClipBrush");
+                var off = _disabledBrush ?? (System.Windows.Media.Brush)FindResource("ControlDisabled");
+                MicClip.Foreground = DateTime.Now < _micClipUntil ? clip : off;
+                SysClip.Foreground = DateTime.Now < _sysClipUntil ? clip : off;
+            }
+            catch { /* best-effort: meters must never break input */ }
+        }
+
+        /// <summary>
+        /// Replaces the separate mini-bar: elapsed recording time stays in the
+        /// main footer, next to the status text, and disappears when idle.
+        /// </summary>
+        private void UpdateRecordingElapsed()
+        {
+            if (!_engine.IsRecording)
+            {
+                if (ElapsedText.Visibility != Visibility.Collapsed)
+                    ElapsedText.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            var elapsed = _engine.RecordElapsed;
+            ElapsedText.Text = elapsed.TotalHours >= 1
+                ? elapsed.ToString(@"h\:mm\:ss", CultureInfo.InvariantCulture)
+                : elapsed.ToString(@"mm\:ss", CultureInfo.InvariantCulture);
+            if (ElapsedText.Visibility != Visibility.Visible)
+                ElapsedText.Visibility = Visibility.Visible;
+        }
+
+        /// <summary>
+        /// Pause/Stop are no-ops unless a file is actively recording and no
+        /// auto stop/split owns the state transition; keep them disabled then.
+        /// Runs from the 100 ms UI tick so engine-side stops (auto-stop, errors,
+        /// encoding) disable the buttons even when no click initiated them.
+        /// </summary>
+        private void UpdateTransportState()
+        {
+            bool canControl = _engine.IsRecording && !_autoActionRunning;
+            if (PauseBtn.IsEnabled != canControl) PauseBtn.IsEnabled = canControl;
+            if (StopBtn.IsEnabled != canControl) StopBtn.IsEnabled = canControl;
+            if (_trayPauseItem != null && _trayPauseItem.IsEnabled != canControl)
+                _trayPauseItem.IsEnabled = canControl;
+            if (_trayStopItem != null && _trayStopItem.IsEnabled != canControl)
+                _trayStopItem.IsEnabled = canControl;
         }
 
         private void OnEngineEncodingProgress(object? sender, int percent)
         {
-            Dispatcher.Invoke(() =>
+            // Encode loop fires per 64KB chunk; coalesce to one UI update per
+            // percent point via async BeginInvoke so the UI never blocks the
+            // encoder and the queue never floods (was sync Invoke per chunk).
+            if (percent == _lastEncodePercent) return;
+            _lastEncodePercent = percent;
+            Dispatcher.BeginInvoke(() =>
             {
-                EncodingProgressBar.Value = percent;
-                EncodingProgressText.Text = $"{percent}%";
+                try
+                {
+                    EncodingProgressBar.Value = percent;
+                    EncodingProgressText.Text = $"{percent}%";
+                }
+                catch { }
             });
         }
 
@@ -910,6 +954,7 @@ namespace Hearbud
 
                 if (e.Kind == EngineStatusKind.Encoding)
                 {
+                    _lastEncodePercent = 0;
                     EncodingProgressBar.Visibility = Visibility.Visible;
                     EncodingProgressText.Visibility = Visibility.Visible;
                     EncodingProgressBar.Value = 0;
@@ -921,17 +966,9 @@ namespace Hearbud
                     EncodingProgressBar.Visibility = Visibility.Collapsed;
                     EncodingProgressText.Visibility = Visibility.Collapsed;
 
-                    // GAP-09 #8: every finished file is history — including
-                    // auto-split parts (the suppress flag only skips the
-                    // saved-dialog, folder open, and auto-monitor below).
-                    RecordHistoryEntry(e);
-
                     // GAP-09 auto-split handoff: the next StartAsync rearms UI;
                     // skip the saved-dialog, folder open, and auto-monitor here.
                     if (_suppressStopUi) return;
-
-                    // GAP-09 #4: mini-bar only lives while recording.
-                    try { _miniBar?.Hide(); } catch { }
 
                     if (_lastAutoReason != null)
                     {
@@ -976,185 +1013,6 @@ namespace Hearbud
                         MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             });
-        }
-
-        // ==========================================
-        // GAP-09 #8: HISTORY + REPAIR SCAN + PREVIEW
-        // Preview is OS-default only (Process.Start in the default player);
-        // no embedded MediaElement — a full player is out of scope (§12).
-        // ==========================================
-
-        /// <summary>
-        /// Appends the finished session to the JSON history (best-effort).
-        /// Runs for every Stopped event, including suppressed auto-split parts.
-        /// </summary>
-        private void RecordHistoryEntry(EngineStatusEventArgs e)
-        {
-            try
-            {
-                string mix = e.OutputPathMix ?? "";
-                if (string.IsNullOrWhiteSpace(mix)) return;
-                string baseName = Path.GetFileNameWithoutExtension(mix);
-                if (baseName.EndsWith("-mix", StringComparison.OrdinalIgnoreCase))
-                    baseName = baseName[..^4];
-                _history.Add(new HistoryEntry
-                {
-                    Timestamp = DateTime.Now,
-                    BaseName = baseName,
-                    MixPath = mix,
-                    Mp3Path = e.OutputPathMp3 ?? "",
-                    SystemPath = e.OutputPathSystem ?? "",
-                    MicPath = e.OutputPathMic ?? "",
-                    DurationSeconds = _engine.LastRecordElapsed.TotalSeconds,
-                    SizeBytes = _engine.TotalMixBytesWritten,
-                });
-                RefreshHistoryList();
-            }
-            catch { /* best-effort */ }
-        }
-
-        private void RefreshHistoryList()
-        {
-            try
-            {
-                HistoryList.ItemsSource = null;
-                HistoryList.ItemsSource = _history.Entries;
-            }
-            catch { /* best-effort */ }
-        }
-
-        private HistoryEntry? SelectedHistoryEntry() => HistoryList.SelectedItem as HistoryEntry;
-
-        private static string? FirstExistingFile(params string?[] paths)
-        {
-            foreach (var p in paths)
-            {
-                try { if (!string.IsNullOrWhiteSpace(p) && File.Exists(p)) return p; }
-                catch { /* best-effort */ }
-            }
-            return null;
-        }
-
-        private void OnHistoryDoubleClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
-            => RevealSelectedHistoryEntry();
-
-        private void OnHistoryOpen(object sender, RoutedEventArgs e)
-            => RevealSelectedHistoryEntry();
-
-        /// <summary>Reveals the selected session file in Explorer (selects it); falls back to the folder.</summary>
-        private void RevealSelectedHistoryEntry()
-        {
-            try
-            {
-                var entry = SelectedHistoryEntry();
-                if (entry == null) { StatusText.Text = "Select a history entry first."; return; }
-                string? target = FirstExistingFile(entry.MixPath, entry.Mp3Path, entry.SystemPath, entry.MicPath);
-                if (target != null)
-                {
-                    Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{target}\"") { UseShellExecute = true });
-                    return;
-                }
-                string? dir = null;
-                try
-                {
-                    string? d = Path.GetDirectoryName(entry.MixPath);
-                    if (!string.IsNullOrWhiteSpace(d) && Directory.Exists(d)) dir = d;
-                    else if (Directory.Exists(OutputFolderText.Text)) dir = OutputFolderText.Text;
-                }
-                catch { /* best-effort */ }
-                if (dir != null)
-                    Process.Start(new ProcessStartInfo() { FileName = dir, UseShellExecute = true, Verb = "open" });
-                else
-                    StatusText.Text = "Session files no longer exist.";
-            }
-            catch (Exception ex) { CrashLog.LogAndShow("HistoryReveal", ex); }
-        }
-
-        /// <summary>
-        /// Minimal preview: opens the session (MP3 preferred, else mix WAV) in the
-        /// OS-default player. No embedded MediaElement by design (§12).
-        /// </summary>
-        private void OnHistoryPlay(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var entry = SelectedHistoryEntry();
-                if (entry == null) { StatusText.Text = "Select a history entry to play."; return; }
-                string? target = FirstExistingFile(entry.Mp3Path, entry.MixPath);
-                if (target == null)
-                {
-                    WpfMessageBox.Show("Session file no longer exists on disk.",
-                        "Play", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
-                }
-                Process.Start(new ProcessStartInfo() { FileName = target, UseShellExecute = true });
-            }
-            catch (Exception ex) { CrashLog.LogAndShow("HistoryPlay", ex); }
-        }
-
-        private void OnHistoryDelete(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                var entry = SelectedHistoryEntry();
-                if (entry == null) { StatusText.Text = "Select a history entry to delete."; return; }
-                var answer = WpfMessageBox.Show(
-                    $"Delete session files for \"{entry.BaseName}\"?\nThis removes the mix, MP3 and stems from disk.",
-                    "Delete session",
-                    MessageBoxButton.YesNo, MessageBoxImage.Warning);
-                if (answer != MessageBoxResult.Yes) return;
-                foreach (var f in new[] { entry.MixPath, entry.Mp3Path, entry.SystemPath, entry.MicPath })
-                {
-                    try { if (!string.IsNullOrWhiteSpace(f) && File.Exists(f)) File.Delete(f); }
-                    catch { /* best-effort */ }
-                }
-                _history.Remove(entry);
-                RefreshHistoryList();
-            }
-            catch (Exception ex) { CrashLog.LogAndShow("HistoryDelete", ex); }
-        }
-
-        /// <summary>
-        /// Startup scan of the output folder for unfinalized WAVs (crash/abort
-        /// leftovers). Fixable headers are repaired in place; the rest are
-        /// listed with a delete offer. Best-effort.
-        /// </summary>
-        private void RunStartupRepairScan()
-        {
-            try
-            {
-                var suspects = WavRepair.ScanDirectory(OutputFolderText.Text);
-                if (suspects.Count == 0) return;
-                int repaired = 0;
-                var unrepairable = new List<string>();
-                foreach (var f in suspects)
-                {
-                    try
-                    {
-                        if (WavRepair.TryRepair(f)) repaired++;
-                        else unrepairable.Add(f);
-                    }
-                    catch { unrepairable.Add(f); }
-                }
-                if (unrepairable.Count > 0)
-                {
-                    int show = Math.Min(10, unrepairable.Count);
-                    string list = string.Join("\n", unrepairable.Take(show).Select(Path.GetFileName));
-                    if (unrepairable.Count > show) list += $"\n… and {unrepairable.Count - show} more.";
-                    var answer = WpfMessageBox.Show(
-                        $"{repaired} file(s) repaired.\n\n{unrepairable.Count} unrepairable file(s) (empty or corrupt header):\n{list}\n\nDelete them?",
-                        "Unfinished recordings found",
-                        MessageBoxButton.YesNo, MessageBoxImage.Warning);
-                    if (answer == MessageBoxResult.Yes)
-                        foreach (var f in unrepairable)
-                            try { if (File.Exists(f)) File.Delete(f); } catch { }
-                }
-                else if (repaired > 0)
-                {
-                    StatusText.Text = $"Repaired {repaired} unfinalized recording(s).";
-                }
-            }
-            catch { /* best-effort */ }
         }
 
         private void SetupTrayIcon()
@@ -1230,12 +1088,13 @@ namespace Hearbud
         /// </summary>
         protected override async void OnClosing(CancelEventArgs e)
         {
+            long t0 = Stopwatch.GetTimestamp();
+            CrashLog.LogOnly("UiInput",
+                $"t={DateTime.Now:HH:mm:ss.fff} OnClosing entry recording={_engine.IsRecording} active={IsActive}");
             base.OnClosing(e);
 
-            // GAP-09 #4: abort any pending start countdown; the mini-bar is
-            // Owner-bound so it closes with main, but close explicitly too.
+            // GAP-09 #4: abort any pending start countdown.
             try { _countdownCts?.Cancel(); } catch { }
-            try { _miniBar?.Close(); } catch { }
 
             if (_engine.IsRecording)
             {
@@ -1248,12 +1107,20 @@ namespace Hearbud
                 if (result == MessageBoxResult.No)
                 {
                     e.Cancel = true;
+                    CrashLog.LogOnly("UiInput",
+                        $"t={DateTime.Now:HH:mm:ss.fff} OnClosing cancelled +{Ms(t0):F0}ms");
                     return;
                 }
 
                 // Ensure the engine stops and flushes before the window fully closes
                 await _engine.StopAsync();
+                CrashLog.LogOnly("UiInput",
+                    $"t={DateTime.Now:HH:mm:ss.fff} OnClosing StopAsync done +{Ms(t0):F0}ms");
+                return;
             }
+
+            CrashLog.LogOnly("UiInput",
+                $"t={DateTime.Now:HH:mm:ss.fff} OnClosing done (idle) +{Ms(t0):F1}ms");
         }
 
         protected override void OnClosed(EventArgs e)
@@ -1263,20 +1130,15 @@ namespace Hearbud
 
             try
             {
-                // Persist current UI selections
+                // Persist current UI selections (_settings already holds the
+                // Settings-dialog values: bitrate, stems, limits, countdown).
                 _settings.MicName = MicCombo.SelectedItem as string ?? _settings.MicName;
                 _settings.SpeakerName = SpeakerCombo.SelectedItem as string ?? _settings.SpeakerName;
                 _settings.OutputDir = OutputFolderText.Text;
                 _settings.MicGain = MicGain.Value;
                 _settings.LoopGain = LoopGain.Value;
-                _settings.Mp3BitrateKbps = GetSelectedBitrateKbps();
-                _settings.WriteStems = WriteStemsCheck.IsChecked ?? true;
                 _settings.IncludeMic = IncludeMicCheck.IsChecked ?? true;
                 _settings.IncludeSystem = RecordSysCheck.IsChecked ?? true;
-                _settings.AutoStopMinutes = ParseNonNegativeMinutes(LimitMinutesText.Text);
-                _settings.AutoStopSizeMb = ParseNonNegativeSizeBytes(LimitSizeMbText.Text) / (1024.0 * 1024.0);
-                _settings.SplitInsteadOfStop = SplitInsteadOfStopCheck.IsChecked ?? false;
-                _settings.CountdownSeconds = GetCountdownSeconds();
                 _settings.Save();
             }
             catch { /* best-effort */ }
@@ -1292,6 +1154,7 @@ namespace Hearbud
             if (_disposed) return;
             _disposed = true;
             try { _uiTimer.Stop(); } catch { }
+            try { CompositionTarget.Rendering -= OnCompositionFrame; } catch { }
             try
             {
                 // Click-glitch diagnostics: close summary with tail-capped input ring.
@@ -1300,6 +1163,13 @@ namespace Hearbud
                 CrashLog.LogOnly("UiDiagnostics.Close",
                     $"ticks={_diagTickCount} maxLag={_diagLag.MaxLagMs:F0}ms spikes={_diagLag.SpikeCount} " +
                     $"mouseDown={_diagMouseDown} mouseUp={_diagMouseUp} stylus={_diagStylusDown} tail=[{tail}]");
+                double firstFrameMs = _frameCount > 0 && _firstFrameTick != 0
+                    ? (_firstFrameTick - _ctorTick) * 1000.0 / Stopwatch.Frequency
+                    : -1;
+                CrashLog.LogOnly("UiRender",
+                    $"frames={_frameCount} firstFrameAfter={firstFrameMs:F0}ms " +
+                    $"maxGap={(double)_maxFrameGapTicks * 1000.0 / Stopwatch.Frequency:F0}ms " +
+                    $"size={ActualWidth:F0}x{ActualHeight:F0} state={WindowState} active={IsActive}");
             }
             catch { /* best-effort */ }
             try { _trayIcon?.Dispose(); } catch { }
@@ -1337,7 +1207,7 @@ namespace Hearbud
                     _diagStylusDown++;
                     _diagInput.Record($"StylusDown src={UiDiagnostics.SourceName(e.OriginalSource)} tid={Environment.CurrentManagedThreadId}");
                 };
-                foreach (var cb in new System.Windows.Controls.ComboBox[] { MicCombo, SpeakerCombo, OutputFormatCombo, OutputQualityCombo, CountdownCombo })
+                foreach (var cb in new System.Windows.Controls.ComboBox[] { MicCombo, SpeakerCombo })
                 {
                     try
                     {
@@ -1381,6 +1251,81 @@ namespace Hearbud
             catch { /* best-effort */ }
         }
 
+        /// <summary>Milliseconds elapsed since a <see cref="Stopwatch"/> tick.</summary>
+        private static double Ms(long sinceTick)
+            => (Stopwatch.GetTimestamp() - sinceTick) * 1000.0 / Stopwatch.Frequency;
+
+        private void OnCompositionFrame(object? sender, EventArgs e)
+        {
+            long now = Stopwatch.GetTimestamp();
+            if (_frameCount == 0)
+            {
+                _firstFrameTick = now;
+            }
+            else
+            {
+                long gap = now - _lastFrameTick;
+                if (gap > _maxFrameGapTicks) _maxFrameGapTicks = gap;
+            }
+            _lastFrameTick = now;
+            _frameCount++;
+        }
+
+        /// <summary>
+        /// Win32 hook for the layers the WPF input ring cannot see: the
+        /// non-client title bar (where the close button lives), activation,
+        /// and WM_CLOSE itself. Transitions only, one line each.
+        /// </summary>
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            try
+            {
+                _hwndSource = (HwndSource?)PresentationSource.FromVisual(this);
+                _hwndSource?.AddHook(WndProcHook);
+                CrashLog.LogOnly("UiInput",
+                    $"t={DateTime.Now:HH:mm:ss.fff} SourceInitialized hwnd=0x{(_hwndSource?.Handle.ToInt64() ?? 0):X} after {Ms(_ctorTick):F0}ms tid={Environment.CurrentManagedThreadId}");
+            }
+            catch { /* best-effort */ }
+        }
+
+        private IntPtr WndProcHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            try
+            {
+                switch (msg)
+                {
+                    case 0x00A1: // WM_NCLBUTTONDOWN
+                        CrashLog.LogOnly("UiInput",
+                            $"t={DateTime.Now:HH:mm:ss.fff} WM_NCLBUTTONDOWN hit=0x{wParam.ToInt64():X} active={IsActive} state={WindowState}");
+                        break;
+                    case 0x00A2: // WM_NCLBUTTONUP
+                        CrashLog.LogOnly("UiInput",
+                            $"t={DateTime.Now:HH:mm:ss.fff} WM_NCLBUTTONUP hit=0x{wParam.ToInt64():X} active={IsActive}");
+                        break;
+                    case 0x0010: // WM_CLOSE
+                        CrashLog.LogOnly("UiInput",
+                            $"t={DateTime.Now:HH:mm:ss.fff} WM_CLOSE active={IsActive} recording={_engine.IsRecording}");
+                        break;
+                    case 0x0112: // WM_SYSCOMMAND
+                        if ((wParam.ToInt64() & 0xFFF0) == 0xF060) // SC_CLOSE
+                            CrashLog.LogOnly("UiInput",
+                                $"t={DateTime.Now:HH:mm:ss.fff} WM_SYSCOMMAND SC_CLOSE active={IsActive}");
+                        break;
+                    case 0x0006: // WM_ACTIVATE
+                        CrashLog.LogOnly("UiInput",
+                            $"t={DateTime.Now:HH:mm:ss.fff} WM_ACTIVATE state=0x{wParam.ToInt64() & 0xFFFF:X}");
+                        break;
+                    case 0x0021: // WM_MOUSEACTIVATE
+                        CrashLog.LogOnly("UiInput",
+                            $"t={DateTime.Now:HH:mm:ss.fff} WM_MOUSEACTIVATE active={IsActive}");
+                        break;
+                }
+            }
+            catch { /* best-effort: diagnostics must never break input */ }
+            return IntPtr.Zero;
+        }
+
         private void LoadSettingsToUi()
         {
             try
@@ -1402,32 +1347,14 @@ namespace Hearbud
                 MicGain.Value  = _settings.MicGain;
                 LoopGain.Value = _settings.LoopGain;
 
-                // GAP-09 #9 mapping slice: single persisted value
-                // (AppSettings.Mp3BitrateKbps) drives two controls.
-                // 0 -> WAV master (bitrate box disabled, parked at 192);
-                // >0 -> WAV + MP3 @ that bitrate (unknown values fall back to 192).
-                var persisted = _settings.Mp3BitrateKbps < 0 ? 192 : _settings.Mp3BitrateKbps;
-                bool wavOnly = persisted == 0;
-                OutputFormatCombo.SelectedValue = wavOnly ? "wav" : "mp3";
-                if (OutputFormatCombo.SelectedItem as ComboBoxItem == null)
-                    OutputFormatCombo.SelectedValue = "mp3";
-                OutputQualityCombo.SelectedValue = wavOnly ? "192" : persisted.ToString(CultureInfo.InvariantCulture);
-                if (OutputQualityCombo.SelectedItem as ComboBoxItem == null)
-                    OutputQualityCombo.SelectedValue = "192";
-                UpdateBitrateEnabled();
-
-                WriteStemsCheck.IsChecked = _settings.WriteStems;
                 IncludeMicCheck.IsChecked = _settings.IncludeMic;
                 RecordSysCheck.IsChecked = _settings.IncludeSystem;
-                LimitMinutesText.Text = _settings.AutoStopMinutes > 0 ? _settings.AutoStopMinutes.ToString(CultureInfo.InvariantCulture) : "";
-                LimitSizeMbText.Text = _settings.AutoStopSizeMb > 0 ? _settings.AutoStopSizeMb.ToString(CultureInfo.InvariantCulture) : "";
-                SplitInsteadOfStopCheck.IsChecked = _settings.SplitInsteadOfStop;
-                CountdownCombo.SelectedValue = _settings.CountdownSeconds switch { 3 => "3", 5 => "5", 10 => "10", _ => "0" };
+                MicCombo.IsEnabled = _settings.IncludeMic;
+                SpeakerCombo.IsEnabled = _settings.IncludeSystem;
 
-                // GAP-09 #6: show persisted hotkeys, then rebuild gestures.
-                if (StartHotkeyBox != null) StartHotkeyBox.Text = _settings.StartHotkey;
-                if (PauseHotkeyBox != null) PauseHotkeyBox.Text = _settings.PauseHotkey;
-                if (StopHotkeyBox != null) StopHotkeyBox.Text = _settings.StopHotkey;
+                // Output format, stems, limits, countdown and hotkeys now live
+                // in the Settings dialog and are already in _settings; just
+                // rebuild the transport gestures from the persisted hotkeys.
                 RebuildInputBindings();
             }
             catch (Exception ex)
@@ -1437,67 +1364,30 @@ namespace Hearbud
         }
 
         /// <summary>
-        /// GAP-09 #9 mapping slice (UI-only): two controls, one persisted value.
-        /// Format "wav" (WAV master) forces 0 regardless of the bitrate box;
-        /// format "mp3" (WAV + MP3) uses the bitrate box, clamped to 64..320.
-        /// Unknown/unset format defaults to MP3-included to preserve the
-        /// historical default (WAV + MP3 @ 192).
+        /// GAP-09 #9 mapping (Settings-dialog owned): the single persisted
+        /// value drives the engine. 0 = WAV master, otherwise WAV + MP3 at
+        /// that bitrate (clamped to 64..320 for legacy configs).
         /// </summary>
-        private bool IsMp3Included()
-        {
-            try
-            {
-                string? tag = (OutputFormatCombo.SelectedItem as System.Windows.Controls.ComboBoxItem)?.Tag as string
-                    ?? OutputFormatCombo.SelectedValue as string;
-                if (string.Equals(tag, "wav", StringComparison.OrdinalIgnoreCase)) return false;
-                if (string.Equals(tag, "mp3", StringComparison.OrdinalIgnoreCase)) return true;
-            }
-            catch { /* best-effort: default below */ }
-            return true;
-        }
-
-        private void UpdateBitrateEnabled()
-        {
-            try
-            {
-                if (OutputQualityCombo != null)
-                    OutputQualityCombo.IsEnabled = IsMp3Included();
-            }
-            catch { /* best-effort */ }
-        }
-
-        private void OnOutputFormatChanged(object sender, SelectionChangedEventArgs e)
-        {
-            UpdateBitrateEnabled();
-        }
-
         private int GetSelectedBitrateKbps()
         {
+            int kb = _settings.Mp3BitrateKbps;
+            if (kb == 0) return 0;
+            return Math.Clamp(kb, 64, 320);
+        }
+
+        /// <summary>Opens the Settings dialog; rebuilds hotkey gestures on OK.</summary>
+        private void OnOpenSettings(object sender, RoutedEventArgs e)
+        {
             try
             {
-                // WAV master ignores the bitrate box entirely.
-                if (!IsMp3Included()) return 0;
-                int kb = 192; // default
-                if (OutputQualityCombo.SelectedItem is ComboBoxItem item &&
-                    item.Tag is string s &&
-                    int.TryParse(s, out var parsedKb))
-                {
-                    kb = parsedKb;
-                }
-                else if (OutputQualityCombo.SelectedValue is int kbpsInt)
-                {
-                    kb = kbpsInt;
-                }
-                else if (OutputQualityCombo.SelectedValue is string kbpsStr && int.TryParse(kbpsStr, out var kbpsParsed))
-                {
-                    kb = kbpsParsed;
-                }
-
-                if (kb == 0) return 0; // Original (WAV)
-                return Math.Clamp(kb, 64, 320);
+                var dlg = new SettingsWindow(_settings) { Owner = this };
+                if (dlg.ShowDialog() == true)
+                    RebuildInputBindings();
             }
-            catch { }
-            return 192;
+            catch (Exception ex)
+            {
+                CrashLog.LogAndShow("OnOpenSettings", ex);
+            }
         }
 
         // ==========================================
@@ -1568,148 +1458,8 @@ namespace Hearbud
             catch { /* best-effort */ }
         }
 
-        private void OnHotkeyBoxGotFocus(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                if (sender is System.Windows.Controls.TextBox tb)
-                {
-                    tb.SelectAll();
-                    StatusText.Text = "Press the new shortcut (Esc cancels)…";
-                }
-            }
-            catch { /* best-effort */ }
-        }
-
-        private void OnHotkeyBoxLostFocus(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                // Restore canonical text in case focus left mid-capture.
-                if (sender is System.Windows.Controls.TextBox tb && tb.Tag is string tag)
-                    tb.Text = HotkeyFor(tag);
-            }
-            catch { /* best-effort */ }
-        }
-
-        private string HotkeyFor(string tag) => tag switch
-        {
-            "Start" => _settings.StartHotkey,
-            "Pause" => _settings.PauseHotkey,
-            "Stop" => _settings.StopHotkey,
-            _ => "",
-        };
-
-        /// <summary>
-        /// Click-to-capture: converts the pressed key + current modifiers into a
-        /// canonical gesture string. Bare-modifier presses are ignored; a
-        /// modifier-less key or Escape cancels. Duplicates across the three
-        /// actions warn and keep the old value; otherwise the new gesture is
-        /// persisted and bindings are rebuilt.
-        /// </summary>
-        private void OnHotkeyCapturePreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-        {
-            if (sender is not System.Windows.Controls.TextBox tb || tb.Tag is not string tag)
-                return;
-            try
-            {
-                e.Handled = true;
-
-                // Resolve the real key first: with Alt held, e.Key is
-                // Key.System and the physical key is in e.SystemKey.
-                Key key = e.Key == Key.System ? e.SystemKey : e.Key;
-                if (key == Key.ImeProcessed)
-                    key = e.ImeProcessedKey;
-
-                // Ignore bare modifier presses (user is still chording).
-                if (key is Key.LeftCtrl or Key.RightCtrl or Key.LeftAlt or Key.RightAlt
-                    or Key.LeftShift or Key.RightShift or Key.LWin or Key.RWin)
-                    return;
-
-                // Escape with no modifiers cancels the capture.
-                if (key == Key.Escape && Keyboard.Modifiers == ModifierKeys.None)
-                {
-                    tb.Text = HotkeyFor(tag);
-                    StatusText.Text = "Shortcut capture cancelled.";
-                    MoveFocus(new TraversalRequest(FocusNavigationDirection.Next));
-                    return;
-                }
-
-                var mods = Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Shift | ModifierKeys.Windows);
-                if (mods == ModifierKeys.None)
-                {
-                    StatusText.Text = "Shortcut needs a modifier (Ctrl/Alt/Shift) — keeping old.";
-                    return;
-                }
-
-                string? gestureText;
-                try
-                {
-                    gestureText = new KeyGestureConverter().ConvertToString(new KeyGesture(key, mods));
-                }
-                catch
-                {
-                    StatusText.Text = "That key can't be used as a shortcut — keeping old.";
-                    return;
-                }
-                if (string.IsNullOrWhiteSpace(gestureText) ||
-                    !AppSettings.TryNormalizeHotkey(gestureText, out var normalized))
-                {
-                    StatusText.Text = "That key can't be used as a shortcut — keeping old.";
-                    return;
-                }
-
-                // Conflict check: duplicate gesture → warning, keep old.
-                string other1, other2;
-                if (tag == "Start") { other1 = _settings.PauseHotkey; other2 = _settings.StopHotkey; }
-                else if (tag == "Pause") { other1 = _settings.StartHotkey; other2 = _settings.StopHotkey; }
-                else if (tag == "Stop") { other1 = _settings.StartHotkey; other2 = _settings.PauseHotkey; }
-                else return;
-                if (string.Equals(normalized, other1, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(normalized, other2, StringComparison.OrdinalIgnoreCase))
-                {
-                    WpfMessageBox.Show(
-                        $"\"{normalized}\" is already assigned to another action.\nKeeping the old shortcut.",
-                        "Shortcut already in use",
-                        MessageBoxButton.OK, MessageBoxImage.Warning);
-                    tb.Text = HotkeyFor(tag);
-                    return;
-                }
-
-                if (tag == "Start") _settings.StartHotkey = normalized;
-                else if (tag == "Pause") _settings.PauseHotkey = normalized;
-                else _settings.StopHotkey = normalized;
-                _settings.Save();
-                tb.Text = normalized;
-                RebuildInputBindings();
-                StatusText.Text = $"Shortcut set: {tag} = {normalized}";
-                MoveFocus(new TraversalRequest(FocusNavigationDirection.Next));
-            }
-            catch (Exception ex)
-            {
-                CrashLog.LogAndShow("OnHotkeyCapture", ex);
-            }
-        }
-
-        private void OnResetHotkeys(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                _settings.StartHotkey = AppSettings.DefaultStartHotkey;
-                _settings.PauseHotkey = AppSettings.DefaultPauseHotkey;
-                _settings.StopHotkey = AppSettings.DefaultStopHotkey;
-                _settings.Save();
-                if (StartHotkeyBox != null) StartHotkeyBox.Text = _settings.StartHotkey;
-                if (PauseHotkeyBox != null) PauseHotkeyBox.Text = _settings.PauseHotkey;
-                if (StopHotkeyBox != null) StopHotkeyBox.Text = _settings.StopHotkey;
-                RebuildInputBindings();
-                StatusText.Text = "Shortcuts reset to Ctrl+R / Ctrl+P / Ctrl+S.";
-            }
-            catch (Exception ex)
-            {
-                CrashLog.LogAndShow("OnResetHotkeys", ex);
-            }
-        }
+        // Hotkey capture UI now lives in SettingsWindow; this window only
+        // rebuilds the window-focused gestures from _settings.
 
         // ==========================================
         // DEVICE NOTIFICATION (IMMNotificationClient)
@@ -1787,10 +1537,10 @@ namespace Hearbud
             if (_trayPauseItem != null)
             {
                 _trayPauseItem.Header = _engine.IsPaused ? "Resume" : "Pause";
-                _trayPauseItem.IsEnabled = _engine.IsRecording;
+                _trayPauseItem.IsEnabled = _engine.IsRecording && !_autoActionRunning;
             }
             if (_trayStopItem != null)
-                _trayStopItem.IsEnabled = _engine.IsRecording;
+                _trayStopItem.IsEnabled = _engine.IsRecording && !_autoActionRunning;
         }
 
         /// <summary>GAP-09 #4: tray balloon tip (auto-stop / auto-split). Best-effort.</summary>
