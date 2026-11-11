@@ -113,6 +113,85 @@ public class RecorderEngineDspTests
         Assert.Equal(0.5f, scale(2f), precision: 6);
     }
 
+    private static float[] ConstFrames(int n, float v)
+    {
+        var f = new float[n];
+        for (int i = 0; i < n; i++) f[i] = v;
+        return f;
+    }
+
+    private static float[] EmitMix(object engine, float loopVal, float micVal, int n)
+    {
+        var loop = ConstFrames(n, loopVal);
+        var mic = ConstFrames(n, micVal);
+        GetInstance("EmitFixedMix").Invoke(engine, new object[] { loop, mic, n });
+        var buf = Field<float[]>(engine, "_mixBufF");
+        var out_ = new float[n];
+        Array.Copy(buf, out_, n);
+        return out_;
+    }
+
+    [Fact]
+    public void MixCap_HotFrame_CapsAtCeiling_NoStickyDuck()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        engine.MicGain = 1.0; engine.LoopGain = 1.0;
+
+        // Sum peaks at 3.6, headroom halves to 1.8: the overs frame caps at 1.
+        var mix = EmitMix(engine, 1.8f, 1.8f, 960);
+        for (int i = 0; i < mix.Length; i++)
+            Assert.Equal(1f, MathF.Abs(mix[i]), precision: 6);
+
+        // The next quiet frame is transparent immediately: a memoryless cap
+        // has no release envelope, so overs never duck following audio.
+        var clean = EmitMix(engine, 0.1f, 0.1f, 960);
+        for (int i = 0; i < clean.Length; i++)
+            Assert.Equal(0.1f, clean[i], precision: 5);
+    }
+
+    [Fact]
+    public void MixCap_SustainedOvers_StayAtCeiling_QuietRecoversInstantly()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        engine.MicGain = 1.0; engine.LoopGain = 1.0;
+
+        for (int k = 0; k < 10; k++)
+        {
+            var hot = EmitMix(engine, 1.8f, 1.8f, 960);
+            for (int i = 0; i < hot.Length; i++)
+                Assert.Equal(1f, MathF.Abs(hot[i]), precision: 6);
+        }
+        var clean = EmitMix(engine, 0.1f, 0.1f, 960);
+        for (int i = 0; i < clean.Length; i++)
+            Assert.Equal(0.1f, clean[i], precision: 5);
+    }
+
+    [Fact]
+    public void MixMeter_ReportsPostGainPeak_AndClipsOnOvers()
+    {
+        using var engine = new RecorderEngine();
+        SetField(engine, "_outChannels", 2);
+        SetField(engine, "_outRate", 48000);
+        engine.MicGain = 1.0; engine.LoopGain = 1.0;
+
+        var seen = new System.Collections.Generic.List<LevelChangedEventArgs>();
+        engine.LevelChanged += (_, e) => { if (e.Source == LevelSource.Mix) seen.Add(e); };
+
+        // Post-gain/post-headroom peak is 1.8: the meter must report the
+        // capped bus (peak <= 1) with Clipped set, so the UI mix CLIP light
+        // fires exactly when the cap engages.
+        EmitMix(engine, 1.8f, 1.8f, 960);
+        Assert.NotEmpty(seen);
+        var last = seen[^1];
+        Assert.True(last.Clipped);
+        Assert.True(last.Peak <= 1f);
+        Assert.True(last.Rms <= 1f);
+    }
+
     [Fact]
     public void SoftClip_LargePositive_ClampsNearOne()
     {
@@ -586,15 +665,28 @@ public class RecorderEngineDspTests
         var ring = (float[])ringField.GetValue(engine)!;
         int initialLen = ring.Length;
 
-        // Request far more room than the bounded cap allows: must not grow unbounded,
-        // must count an overrun instead.
+        // Request far more room than the bounded cap allows: must not grow unbounded.
+        // With an empty ring nothing is evicted, so nothing is counted; with a
+        // near-full ring exactly the overflow is evicted and counted.
         method.Invoke(engine, new object[] { initialLen * 10 });
 
         var newRing = (float[])ringField.GetValue(engine)!;
         Assert.True(newRing.Length <= initialLen * 2,
             $"Bounded FIFO must not grow 10x; got {newRing.Length} from {initialLen}");
-        Assert.True((long)overField.GetValue(engine)! > 0,
-            "Overrun counter must increment when demand exceeds cap");
+        Assert.Equal(0L, (long)overField.GetValue(engine)!);
+
+        var countField = EngineType.GetField("_micCount",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var rField = EngineType.GetField("_micR",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var wField = EngineType.GetField("_micW",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        int fill = initialLen - 100;
+        rField.SetValue(engine, 0);
+        wField.SetValue(engine, fill % initialLen);
+        countField.SetValue(engine, fill);
+        Assert.Equal(100L, (long)method.Invoke(engine, new object[] { 200 })!);
+        Assert.Equal(100L, (long)overField.GetValue(engine)!);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -856,7 +948,7 @@ public class RecorderEngineDspTests
         int n = (int)GetInstance("FixedFrameFloats").Invoke(engine, null)!;
         var src = new float[n];
         for (int i = 0; i < n; i++) src[i] = i * 0.001f;
-        GetInstance("PushLoopRing").Invoke(engine, new object[] { src, n });
+        GetInstance("PushLoopRing").Invoke(engine, new object[] { src, n, 0.0 });
         // Feed mic ring directly via EnsureRingCapacity + field write.
         var micRing = Field<float[]>(engine, "_micRing");
         Assert.True(micRing.Length >= n);
@@ -884,7 +976,7 @@ public class RecorderEngineDspTests
         int n = (int)GetInstance("FixedFrameFloats").Invoke(engine, null)!;
         var src = new float[n];
         for (int i = 0; i < n; i++) src[i] = 0.25f;
-        GetInstance("PushLoopRing").Invoke(engine, new object[] { src, n });
+        GetInstance("PushLoopRing").Invoke(engine, new object[] { src, n, 0.0 });
         var loopDst = new float[n];
         var micDst = new float[n];
         for (int i = 0; i < n; i++) micDst[i] = 99f;
@@ -1035,91 +1127,10 @@ public class RecorderEngineDspTests
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // TASK-3 continuous drift trim (TryGentleTrim)
+    // Drift trim deleted: TryGentleTrim/FindZeroCrossDrop are gone (they
+    // chopped healthy audio chasing a constant delivery offset). Pair by
+    // count absorbs the offset; only CheckLagResync bounds true runaway.
     // ─────────────────────────────────────────────────────────────────────────
-
-    private static double InvokeTrim(object engine, double backlogSec)
-        => (double)GetInstance("TryGentleTrim").Invoke(engine, new object[] { backlogSec })!;
-
-    [Fact]
-    public void Trim_Deadband_NoOp()
-    {
-        using var engine = new RecorderEngine();
-        SetField(engine, "_outChannels", 2);
-        SetField(engine, "_outRate", 48000);
-        // Target with zero resampler delay = 1 frame = 960 floats = 0.01 s.
-        SetField(engine, "_micCount", 960);
-        long before = engine.TrimDropped + engine.TrimInserted;
-        double outBacklog = InvokeTrim(engine, 0.01);
-        Assert.Equal(0.01, outBacklog, precision: 9);
-        Assert.Equal(before, engine.TrimDropped + engine.TrimInserted);
-    }
-
-    [Fact]
-    public void Trim_SmallPositive_DropsBounded_AndCounts()
-    {
-        using var engine = new RecorderEngine();
-        SetField(engine, "_outChannels", 2);
-        SetField(engine, "_outRate", 48000);
-        var ring = Field<float[]>(engine, "_micRing");
-        Assert.True(ring.Length >= 1920);
-        SetField(engine, "_micR", 0);
-        SetField(engine, "_micW", 1920 % ring.Length);
-        SetField(engine, "_micCount", 1920); // backlog 0.02 s, 10 ms over target
-        double outBacklog = InvokeTrim(engine, 0.02);
-        // Must trim 8..96 floats (frame-aligned), never burst-drop to one frame.
-        long dropped = engine.TrimDropped;
-        Assert.InRange(dropped, 8, 96);
-        Assert.Equal(1920 - (int)dropped, Field<int>(engine, "_micCount"));
-        Assert.True(outBacklog < 0.02 && outBacklog >= 0.018);
-        Assert.Equal(0L, Field<long>(engine, "_resyncCount"));
-    }
-
-    [Fact]
-    public void Trim_LargeBacklog_Passthrough_ToResync()
-    {
-        using var engine = new RecorderEngine();
-        SetField(engine, "_outChannels", 2);
-        SetField(engine, "_outRate", 48000);
-        var ring = Field<float[]>(engine, "_micRing");
-        int fill = Math.Min(ring.Length - 1, 48000);
-        SetField(engine, "_micR", 0);
-        SetField(engine, "_micW", fill % ring.Length);
-        SetField(engine, "_micCount", fill);
-        double outBacklog = InvokeTrim(engine, 0.5);
-        Assert.Equal(0.5, outBacklog, precision: 9); // >=80 ms: leave to CheckLagResync
-        Assert.Equal(0L, engine.TrimDropped);
-        Assert.Equal(fill, Field<int>(engine, "_micCount"));
-    }
-
-    [Fact]
-    public void Trim_Negative_InsertsFade_AndCounts()
-    {
-        using var engine = new RecorderEngine();
-        SetField(engine, "_outChannels", 2);
-        SetField(engine, "_outRate", 48000);
-        SetField(engine, "_micR", 0);
-        SetField(engine, "_micW", 0);
-        SetField(engine, "_micCount", 0); // backlog 0, 10 ms under target
-        double outBacklog = InvokeTrim(engine, 0.0);
-        long inserted = engine.TrimInserted;
-        Assert.InRange(inserted, 8, 96);
-        Assert.Equal((int)inserted, Field<int>(engine, "_micCount"));
-        Assert.True(outBacklog > 0.0 && outBacklog <= 0.002);
-    }
-
-    [Fact]
-    public void Trim_ZeroCrossDrop_IsFrameAligned_WithinWindow()
-    {
-        using var engine = new RecorderEngine();
-        var m = GetStatic("FindZeroCrossDrop");
-        var ring = new float[4096];
-        for (int i = 0; i < ring.Length; i++)
-            ring[i] = (float)Math.Sin(2 * Math.PI * 440 * i / 48000);
-        int got = (int)m.Invoke(null, new object[] { ring, 100, 2000, 90, 2 })!;
-        Assert.Equal(0, got % 2); // frame-aligned for stereo
-        Assert.InRange(got, 90 - 16, 90 + 16);
-    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // TASK-2 capture scheduling (RecordCallbackTiming / MMCSS helpers)

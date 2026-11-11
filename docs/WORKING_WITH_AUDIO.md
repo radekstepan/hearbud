@@ -158,7 +158,7 @@ ConvertToTargetChunked (windowed-sinc resample/remix to common format)
     ↓
 Gain Application (multiply by MicGain or LoopGain)
     ↓
-Mixing: s + m, normalize only on overs (bit-transparent otherwise)
+Mixing: (s + m) * 0.5 headroom, limit only on overs (transparent otherwise)
     ↓
 Soft Clipping (tanh, only above ±1)
     ↓
@@ -189,24 +189,34 @@ gain_multiplier = 10^(dB / 20)
 
 ### Mixing Algorithm
 
-Hearbud uses a straight sum with conditional normalization (`ComputeMixScale`):
+Hearbud sums with fixed -6 dB headroom, then caps memorylessly on overs
+(`ApplyMixLimit` over `ComputeMixScale`: 1/peak per frame, no release
+envelope, so overs never duck following frames):
 
 ```
-mixed_sample = system_sample * LoopGain + mic_sample * MicGain
-if block_peak > 1.0: mixed_sample /= block_peak   // normalize only on overs
+mixed_sample = (system_sample * LoopGain + mic_sample * MicGain) * 0.5
+if block_peak > 1.0: mixed_sample *= 1/block_peak  // memoryless, per frame
 ```
 
-**Why normalize instead of averaging?**
-- A fixed `* 0.5` average would attenuate everything by -6 dB even when the sum never clips
-- Normalizing only on overs keeps the mix bit-transparent at/below full scale, then `tanh` soft-clips any residual overs
+**Why headroom instead of pure normalize?**
+- Two hot sources routinely sum past 1.0, so a normalize-only bus rides
+  the gain audibly (ducking/pumping that reads as clipping on the mic
+  whenever system audio plays). Running the bus 6 dB low keeps typical
+  mixes bit-transparent; the cap engages only on true overs.
+- The cap is memoryless by design (no ~150 ms release): a hot frame never
+  attenuates the next one. Persistent overs mean the gains are too hot —
+  the mix-bus meter (`LevelSource.Mix`, post-gain/post-headroom) drives a
+  third CLIP light so the user sees it and turns the gains down.
+- Below the ceiling the bus gain sits at exactly 1, then `tanh`
+  soft-clips any residual overs (plus a ±1 clamp against float rounding).
 
 **Alternative Mix Formulas (not used):**
 ```
 // Equal power mix (more perceived volume gain)
 mixed_sample = (s + m) * 0.707  // 0.707 ≈ sqrt(0.5)
 
-// Fixed average (constant -6 dB penalty, even when nothing clips)
-mixed_sample = (s + m) * 0.5
+// No headroom (normalize rides constantly on hot two-source mixes)
+mixed_sample = s + m
 
 // Weighted mix
 mixed_sample = s * 0.7 + m * 0.3  // System louder than mic
@@ -395,6 +405,7 @@ if (abs > 1.0) clipped = true;
 
 Hearbud tracks clipping **per interval** (reset after each level event, ~50 ms):
 - The engine flags `Clipped` if any sample exceeded ±1.0 in the interval; the UI lights the red CLIP indicator for 1.5 s per flag
+- Per-source meters are post-gain but pre-sum; the mix-bus meter (`LevelSource.Mix`) is post-gain/post-headroom/post-cap, so its CLIP light fires exactly when the mix cap engages
 - Helps user identify gain issues
 
 ---
@@ -568,7 +579,7 @@ When loopback **resumes**:
 | Linear to dB (amplitude) | `dB = 20 * log10(amplitude)` | Voltage/amplitude, not power |
 | dB to Linear (amplitude) | `amp = 10^(dB / 20)` | |
 | Power to dB | `dB = 10 * log10(power)` | Power, not voltage |
-| Two-source sum + normalize | `out = (s1 + s2) * (peak>1 ? 1/peak : 1)` | Bit-transparent unless overs |
+| Two-source sum + headroom + limit | `out = (s1 + s2) * 0.5`, limiter only on overs | Transparent unless overs |
 | RMS calculation | `sqrt(sum(x^2) / N)` | N samples in interval |
 | Soft clip (tanh) | `tanh(x)` or `x / sqrt(1 + x^2)` | Many approximations exist |
 | Resampling ratio | `src_rate / dst_rate` | Multiplier for index calculations |

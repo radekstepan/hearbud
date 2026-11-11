@@ -28,12 +28,15 @@
 // - LOG LIMITING: The log file is now capped at 10MB to prevent unbounded growth during long sessions.
 //
 // DESIGN INTENT
-// - Loopback (system) is the "clock source": whenever loopback provides a chunk, we pull a same-sized
-//   chunk from a microphone ring buffer and mix them. This preserves relative timing and prevents
-//   'line up at start' errors. If mic is late, we zero-fill the gap (so silence is kept).
+// - Loopback (system) is the "clock source": both sources land in bounded FIFOs stamped
+//   on the shared QPC clock; a dedicated mixer thread (10 ms tick) pops fixed 480-frame
+//   quanta from the loop window and pulls the overlapping mic window. This preserves
+//   relative timing and prevents 'line up at start' errors. If mic is late, we zero-fill
+//   the gap (so silence is kept); stale mic is dropped capped, never re-emitted.
 // - If loopback is silent (e.g., user is speaking but no system audio), we still want files produced.
-//   We track time since last loopback block and, if it exceeds a threshold, we *drive* the output using
-//   the mic stream alone (system gets zeros, mix = scaled mic). This ensures mic-only sessions still work.
+//   We track time since last loopback block and, if it exceeds a threshold, the mixer *drives*
+//   the output using the mic stream alone (system gets zeros, mix = scaled mic).
+//   This ensures mic-only sessions still work; a stalled device cannot block the mix.
 //
 // ----------------------------------------------------------------------------------------------------
 
@@ -56,7 +59,7 @@ using CSCore.Streams;
 namespace Hearbud
 {
     // Identifies which source a level meter event refers to.
-    public enum LevelSource { Mic, System }
+    public enum LevelSource { Mic, System, Mix }
 
     // Event payload for real-time level updates to the UI.
     public sealed class LevelChangedEventArgs : EventArgs
@@ -282,6 +285,29 @@ namespace Hearbud
         private float[] _micConvBuf   = new float[BlockFrames * 8];
         private float[] _tmpMicBlock  = new float[BlockFrames * 8];
         private float[] _mixBufF      = new float[BlockFrames * 8];
+
+        // Mix-bus cap: memoryless per-frame normalize (never exceeds 0 dBFS,
+        // never ducks following frames — there is no release envelope).
+        // Persistent overs mean the gains are too hot; the mix CLIP light
+        // (LevelSource.Mix, post-gain/post-headroom) tells the user to turn
+        // them down. Below the ceiling the gain sits at exactly 1.
+
+        // Fixed mix-bus headroom (-6 dB): two sources near full scale sum
+        // past 0 dBFS, so the bus runs 6 dB low and the limiter above stays
+        // a rare safety net instead of a constantly-riding attenuator (which
+        // reads as clipping/ducking on the mic whenever system audio plays).
+        private const float MixHeadroom = 0.5f;
+
+        // Join-tick mask: 5 ms linear fade-in on the first loop-driven mix
+        // frames after silence -> signal (and at record start). The unpause
+        // tick is a real device gap + stale buffer + limiter attack landing
+        // in ~20 ms; the fade makes it inaudible instead of a buzz/click.
+        // Mixer-thread state only (armed in DoMixerTick, consumed in
+        // EmitFixedMix), so no cross-thread sync needed.
+        private const double ResumeFadeMs = 5.0;
+        private int _resumeFadeLeft;
+        private int _resumeFadeTotal;
+        private bool _prevLoopSilent;
         
         // Reusable scratch buffer for the resampler (Performance Fix)
         private float[] _resampleScratch = new float[BlockFrames * 8];
@@ -390,26 +416,51 @@ namespace Hearbud
         internal const double ResyncThresholdSec = 0.08;
         internal const int ResyncStreakNeeded = 3;
 
-        // TASK-3 continuous drift trim (PI corrector, RecExperts-style 1-2 ms).
-        internal const double TrimDeadbandSec = 0.002;
-        internal const double TrimTargetFrames = 1.0;
-        internal const int TrimMinSamples = 8;
-        internal const int TrimMaxSamples = 96;
-        internal const int TrimZeroCrossWindow = 32;
-        private const double TrimGainP = 0.25;
-        private const double TrimGainI = 0.02;
-        private double _driftIntegral;
-        private const double DriftIntegralMax = 0.005;
-        private long _trimTotalDropped;
-        private long _trimTotalInserted;
-        private long _trimTickDropped;
-        private long _trimTickInserted;
-        public long TrimDropped => Interlocked.Read(ref _trimTotalDropped);
-        public long TrimInserted => Interlocked.Read(ref _trimTotalInserted);
+        // Sync policy: pair by count, absorb, never cut or pad. A steady
+        // delivery offset between devices rides as latency; only sustained
+        // backlog past ResyncThresholdSec goes to CheckLagResync.
+        // Windowed pull, drift trim, and their telemetry are deleted.
 
         private static readonly double _tickMs = 1000.0 / Stopwatch.Frequency;
         private long _lastLoopTick;
         private long _lastMicTick;
+        // OBS_LESSONS 3.1: packet-start ticks on the one Stopwatch/QPC clock
+        // (same family as os_gettime_ns; avoids the ts*100 QPF==10MHz trap).
+        // Diagnostics only: feeds the 1 Hz clkErr log, never drives the mix.
+        private long _lastLoopPacketTick;
+        private long _lastMicPacketTick;
+        private double _lastClockErrorSec;
+        private double _clockErrorMaxSec;
+        // OBS_LESSONS 3.2: consecutive silent loopback blocks (|x| < 1e-7).
+        // Tracked for the silentLoop log column only.
+        private int _silentLoopBlocks;
+        private bool _loopWasSilent;
+        internal const float SilentEpsilon = 1e-7f;
+        internal const int SilentLoopBlocksNeeded = 3;
+        internal double LastClockErrorSec => Volatile.Read(ref _lastClockErrorSec);
+        internal double ClockErrorMaxSec => Volatile.Read(ref _clockErrorMaxSec);
+        internal bool LoopWasSilent => Volatile.Read(ref _loopWasSilent);
+        // OBS_LESSONS 3.4: windowed pull. Loop-ring head tick (QPC ticks)
+        // advances with every pop/drop and re-anchors whenever the ring
+        // refills from empty. Mic packets carry (startTick, frames) stamps;
+        // the mixer consumes only the overlap with the loop window and
+        // zero-fills just the uncovered tail.
+        private double _loopHeadTick;
+        private bool _loopHeadValid;
+        private struct MicPacketStamp { public double StartTick; public int Frames; }
+        private readonly Queue<MicPacketStamp> _micPackets = new();
+        private int _micPacketsFrontUsed;
+        private double _micTailTick;
+        private bool _micTicksValid;
+        private int _micTrackedCount;
+        // OBS_LESSONS 3.3: decoupled mixer. Callbacks only buffer;
+        // this thread owns every EmitFixedMix/EmitMicOnlyFixed call, so one
+        // device stalling cannot block the other, and the two former emit
+        // call sites collapse into one. Runs while _monitoring, ticks 10ms.
+        private Thread? _mixerThread;
+        private readonly AutoResetEvent _mixerWake = new(false);
+        private volatile bool _mixerStop;
+        private byte[] _pcm16SysZero = new byte[BlockFrames * 8 * 2];
         private long _captureGlitchBlocks;
         private const double CaptureStarvationMs = 50.0;
         internal const double CaptureWatchdogStarveMs = 2000.0;
@@ -434,6 +485,152 @@ namespace Hearbud
             long b = lastTick != 0 ? lastTick : baselineTick;
             if (b == 0) return false;
             return (nowTick - b) * _tickMs >= thresholdMs;
+        }
+
+        /// <summary>
+        /// OBS_LESSONS 3.1: packet-start tick on the shared Stopwatch/QPC clock.
+        /// nowTick minus the packet duration, so loopback and mic arrivals are
+        /// comparable without native device timestamps (and without the
+        /// QPF==10MHz assumption behind OBS's ts*100).
+        /// </summary>
+        internal static long PacketStartTick(long nowTick, int frames, int rate)
+        {
+            if (frames <= 0 || rate <= 0) return nowTick;
+            long delta = (long)(frames * (double)Stopwatch.Frequency / rate);
+            return nowTick - delta;
+        }
+
+        /// <summary>
+        /// OBS_LESSONS 3.2: explicit silent-block detector (CSCore hides the
+        /// AUDCLNT_BUFFERFLAGS_SILENT flag behind FillWithZeros, so test the
+        /// floats directly: all |x| below 1e-7 counts as silence).
+        /// </summary>
+        internal static bool IsSilentBlock(float[] buf, int count)
+        {
+            if (buf == null || count <= 0) return true;
+            for (int i = 0; i < count; i++)
+            {
+                float v = buf[i];
+                if (v >= SilentEpsilon || v <= -SilentEpsilon) return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// OBS_LESSONS 3.1: record one packet-start tick and refresh the
+        /// loop-minus-mic offset (seconds). Diagnostics only; never trims.
+        /// </summary>
+        private void RecordPacketClock(bool isLoop, long packetTick)
+        {
+            if (isLoop) Interlocked.Exchange(ref _lastLoopPacketTick, packetTick);
+            else Interlocked.Exchange(ref _lastMicPacketTick, packetTick);
+            long loop = Volatile.Read(ref _lastLoopPacketTick);
+            long mic = Volatile.Read(ref _lastMicPacketTick);
+            if (loop == 0 || mic == 0) return;
+            double err = (loop - mic) * _tickMs / 1000.0;
+            Volatile.Write(ref _lastClockErrorSec, err);
+            double mag = err < 0 ? -err : err;
+            double cur = Volatile.Read(ref _clockErrorMaxSec);
+            double curMag = cur < 0 ? -cur : cur;
+            if (mag > curMag) Volatile.Write(ref _clockErrorMaxSec, err);
+        }
+
+        /// <summary>
+        /// OBS_LESSONS 3.4: QPC ticks per output sample (both rings run at
+        /// _outRate). Zero when the rate is unknown — tick state is then
+        /// invalid and sync falls back to the depth heuristic.
+        /// </summary>
+        private double TicksPerSample()
+        {
+            int rate = _outRate;
+            return rate > 0 ? (double)Stopwatch.Frequency / rate : 0.0;
+        }
+
+        /// <summary>
+        /// OBS_LESSONS 3.4: resampler group-delay shift (dst frames to QPC
+        /// ticks) so mic stamps line up with loop stamps. Zero when the mic
+        /// passes through unconverted (no FIR delay then) or state unknown.
+        /// </summary>
+        private double MicOutputDelayTicks(int srcRate)
+        {
+            if (srcRate <= 0 || srcRate == _outRate || _outRate <= 0) return 0.0;
+            int d = MicResamplerDelayDstFrames;
+            return d > 0 ? d * (double)Stopwatch.Frequency / _outRate : 0.0;
+        }
+
+        // All MicTicks* helpers take _micRingLock themselves (Monitor is
+        // re-entrant, so call sites that already hold it are safe).
+
+        private void MicTicksPush(double startTick, int frames)
+        {
+            if (frames <= 0) return;
+            double tps = TicksPerSample();
+            if (tps <= 0) return;
+            lock (_micRingLock)
+            {
+                if (_micTailTick != 0 && startTick < _micTailTick) startTick = _micTailTick;
+                if (!_micTicksValid || _micPackets.Count == 0)
+                {
+                    _micPackets.Clear();
+                    _micPacketsFrontUsed = 0;
+                    _micTicksValid = true;
+                    _micTrackedCount = 0;
+                }
+                _micPackets.Enqueue(new MicPacketStamp { StartTick = startTick, Frames = frames });
+                _micTailTick = startTick + frames * tps;
+                _micTrackedCount += frames;
+            }
+        }
+
+        private void MicTicksConsume(int n)
+        {
+            if (n <= 0) return;
+            lock (_micRingLock)
+            {
+                int left = n;
+                while (left > 0 && _micPackets.Count > 0)
+                {
+                    var f = _micPackets.Peek();
+                    int avail = f.Frames - _micPacketsFrontUsed;
+                    if (avail <= 0) { _micPackets.Dequeue(); _micPacketsFrontUsed = 0; continue; }
+                    int take = Math.Min(left, avail);
+                    _micPacketsFrontUsed += take;
+                    left -= take;
+                    _micTrackedCount -= take;
+                    if (_micPacketsFrontUsed >= f.Frames) { _micPackets.Dequeue(); _micPacketsFrontUsed = 0; }
+                }
+                if (_micTrackedCount < 0) _micTrackedCount = 0;
+                if (_micPackets.Count == 0) { _micPacketsFrontUsed = 0; _micTicksValid = false; }
+            }
+        }
+
+        private void MicTicksClear()
+        {
+            lock (_micRingLock)
+            {
+                _micPackets.Clear();
+                _micPacketsFrontUsed = 0;
+                _micTailTick = 0;
+                _micTicksValid = false;
+                _micTrackedCount = 0;
+            }
+        }
+
+        /// <summary>
+        /// OBS_LESSONS 3.4: true when tick bookkeeping covers the whole mic
+        /// ring. Any disagreement (e.g. reflection-driven tests hand-setting
+        /// _micCount) degrades to the legacy depth path for that tick.
+        /// </summary>
+        private bool MicTicksCoverRing_NeedsLock()
+        {
+            return _micTicksValid && _micPackets.Count > 0 && _micTrackedCount == _micCount;
+        }
+
+        private double MicHeadTick_NeedsLock()
+        {
+            double tps = TicksPerSample();
+            var f = _micPackets.Peek();
+            return f.StartTick + _micPacketsFrontUsed * tps;
         }
 
         /// <summary>
@@ -679,6 +876,11 @@ namespace Hearbud
         private long _rmsCountSinceLastSys;
         private bool _clippedSinceLastMic;
         private bool _clippedSinceLastSys;
+        private long _lastLevelTickMix;
+        private float _peakSinceLastMix;
+        private double _rmsSumSinceLastMix;
+        private long _rmsCountSinceLastMix;
+        private bool _clippedSinceLastMix;
 
         private volatile bool _disposed;
 
@@ -705,11 +907,16 @@ namespace Hearbud
 
                 _monitoring = true;
                 _lastLoopTick = Stopwatch.GetTimestamp();
-                _lastLevelTickMic = _lastLevelTickSys = _lastLoopTick; 
+                _lastLevelTickMic = _lastLevelTickSys = _lastLoopTick;
+                _lastLevelTickMix = _lastLoopTick;
                 _peakSinceLastMic = _peakSinceLastSys = 0f;
+                _peakSinceLastMix = 0f;
                 _rmsSumSinceLastMic = _rmsSumSinceLastSys = 0.0;
+                _rmsSumSinceLastMix = 0.0;
                 _rmsCountSinceLastMic = _rmsCountSinceLastSys = 0;
+                _rmsCountSinceLastMix = 0;
                 _clippedSinceLastMic = _clippedSinceLastSys = false;
+                _clippedSinceLastMix = false;
 
                 Volatile.Write(ref _restartLogged, 0);
                 Volatile.Write(ref _restartTick, Stopwatch.GetTimestamp());
@@ -717,6 +924,7 @@ namespace Hearbud
                     $"t={DateTime.Now:HH:mm:ss.fff} MonitorAsync caps started, total +{(Stopwatch.GetTimestamp() - t0) * _tickMs:F0}ms");
 
                 RaiseStatus(EngineStatusKind.Info, "Monitoring…");
+                EnsureMixerRunning();
                 Info("Monitoring started");
             }
         }
@@ -764,6 +972,7 @@ namespace Hearbud
                     TryDispose(ref _loopIn);
                     TryDispose(ref _loopSrc);
                     lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; }
+                    _loopHeadValid = false;
                     log($"loop side torn down +{(Stopwatch.GetTimestamp() - s0) * _tickMs:F0}ms");
                     MMDevice loopDev;
                     using (var mmde = new MMDeviceEnumerator()) loopDev = mmde.GetDevice(opts.LoopbackDeviceId!);
@@ -793,6 +1002,7 @@ namespace Hearbud
                     TryDispose(ref _micIn);
                     TryDispose(ref _micSrc);
                     lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                    MicTicksClear();
                     try { Array.Clear(_resampleScratch, 0, _resampleScratch.Length); } catch { }
                     log($"mic side torn down +{(Stopwatch.GetTimestamp() - s0) * _tickMs:F0}ms");
                     MMDevice micDev;
@@ -805,6 +1015,7 @@ namespace Hearbud
                     _micIn = new SoundInSource(_micCap) { FillWithZeros = true };
                     _micSrc = _micIn.ToSampleSource();
                     lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                    MicTicksClear();
                     _micResamp.Reset(_micSrc.WaveFormat.Channels, _micSrc.WaveFormat.SampleRate, _outRate);
                     _micIn.DataAvailable += OnMicData;
                     _micCap.Start();
@@ -818,6 +1029,7 @@ namespace Hearbud
                 {
                     Volatile.Write(ref _restartLogged, 0);
                     Volatile.Write(ref _restartTick, Stopwatch.GetTimestamp());
+                    EnsureMixerRunning();
                 }
                 log($"done monitoring={_monitoring}");
                 return Task.CompletedTask;
@@ -884,7 +1096,9 @@ namespace Hearbud
             _writeTask = Task.Factory.StartNew(DiskWriteLoop, TaskCreationOptions.LongRunning);
 
             lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+            MicTicksClear();
             lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; }
+            _loopHeadValid = false;
             _micResamp.Reset(-1, 0, 0);
             _micUnderrunBlocks = 0;
             _micOverrunBlocks = 0;
@@ -893,6 +1107,15 @@ namespace Hearbud
             Interlocked.Exchange(ref _captureGlitchBlocks, 0);
             Interlocked.Exchange(ref _lastWatchdogTriggerTick, 0);
             Interlocked.Exchange(ref _watchdogRestarts, 0);
+            Interlocked.Exchange(ref _lastLoopPacketTick, 0);
+            Interlocked.Exchange(ref _lastMicPacketTick, 0);
+            Volatile.Write(ref _lastClockErrorSec, 0.0);
+            Volatile.Write(ref _clockErrorMaxSec, 0.0);
+            _silentLoopBlocks = 0;
+            Volatile.Write(ref _loopWasSilent, false);
+            _resumeFadeLeft = 0;
+            _resumeFadeTotal = 0;
+            _prevLoopSilent = true; // first active tick fades in, kills start click
             _silencedSamples = 0;
             _loopBlockCounter = 0;
             _masterFramesEmitted = 0;
@@ -1142,6 +1365,7 @@ namespace Hearbud
             StopInternal(fullStop: true);
             CloseDumpStreams();
             TryDispose(ref _log);
+            try { _mixerWake.Dispose(); } catch { }
         }
 
         private void OpenDumpStreams(string dumpDir, string outDir, string baseName)
@@ -1396,6 +1620,7 @@ namespace Hearbud
                         _micSrc = _micIn.ToSampleSource();
 
                         lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                        MicTicksClear();
                         _micResamp.Reset(_micSrc.WaveFormat.Channels, _micSrc.WaveFormat.SampleRate, _outRate);
 
                         if (!wantLoop)
@@ -1445,6 +1670,7 @@ namespace Hearbud
         {
             long t0 = Stopwatch.GetTimestamp();
             bool wasMonitoring = _monitoring;
+            StopMixer();
             if (_monitoring)
             {
                 try { if (_loopIn != null) _loopIn.DataAvailable -= OnLoopbackData; } catch { }
@@ -1532,8 +1758,8 @@ namespace Hearbud
             try { if (!isLoop && _micIn != null) _micIn.DataAvailable -= OnMicData; } catch { }
             if (isLoop) { TryStopDispose(ref _loopCap); TryDispose(ref _loopIn); TryDispose(ref _loopSrc); }
             else { TryStopDispose(ref _micCap); TryDispose(ref _micIn); TryDispose(ref _micSrc); }
-            if (isLoop) lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; }
-            if (!isLoop) lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+            if (isLoop) { lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; } _loopHeadValid = false; }
+            if (!isLoop) { lock (_micRingLock) { _micR = _micW = _micCount = 0; } MicTicksClear(); }
             _micResamp.Reset(-1, 0, 0);
             try { Array.Clear(_resampleScratch, 0, _resampleScratch.Length); } catch { }
         }
@@ -1567,6 +1793,7 @@ namespace Hearbud
                         _loopCap.Start();
                         _lastLoopTick = Stopwatch.GetTimestamp();
                         lock (_loopRingLock) { _loopR = _loopW = _loopCount = 0; }
+                        _loopHeadValid = false;
                     }
                     else
                     {
@@ -1576,6 +1803,7 @@ namespace Hearbud
                         _micIn = new SoundInSource(_micCap) { FillWithZeros = true };
                         _micSrc = _micIn.ToSampleSource();
                         lock (_micRingLock) { _micR = _micW = _micCount = 0; }
+                        MicTicksClear();
                         try { Array.Clear(_resampleScratch, 0, _resampleScratch.Length); } catch { }
                         _micIn.DataAvailable += OnMicData;
                         _micCap.Start();
@@ -1615,6 +1843,19 @@ namespace Hearbud
 
                 int framesAvail = e.ByteCount / blockAlignBytes;
                 if (framesAvail <= 0) return;
+                // OBS_LESSONS 3.1: stamp packet start on the shared QPC clock
+                // (diagnostics only; the FIFO depth heuristic still drives sync).
+                double micPacketTick = 0;
+                bool haveMicTick = false;
+                try
+                {
+                    int srcRate = _micSrc.WaveFormat.SampleRate;
+                    long micStart = PacketStartTick(Stopwatch.GetTimestamp(), framesAvail, srcRate);
+                    micPacketTick = micStart + MicOutputDelayTicks(srcRate);
+                    RecordPacketClock(isLoop: false, packetTick: micStart);
+                    haveMicTick = micPacketTick != 0;
+                }
+                catch { }
 
                 int floatSamplesToRead = framesAvail * _micSrc.WaveFormat.Channels;
                 EnsureCapacity(ref _micInBuf, floatSamplesToRead);
@@ -1627,9 +1868,6 @@ namespace Hearbud
                 WriteDump(_dumpMic, _micConvBuf, conv);
 
                 long nowTicksA = Stopwatch.GetTimestamp();
-                double msSinceLoop = (nowTicksA - _lastLoopTick) * _tickMs;
-                // GAP-09: no loopback device → mic permanently drives the mix.
-                bool loopSilent = _loopCap == null || msSinceLoop > LoopSilentMsThreshold;
 
                 // --- Metering (post-mute: muted channel reads live 0) ---
                 float blockPeak = 0f;
@@ -1679,6 +1917,7 @@ namespace Hearbud
                     long capDropped;
                     lock (_micRingLock)
                     {
+                        int before = _micCount;
                         capDropped = EnsureRingCapacity(conv);
                         for (int i = 0; i < conv; i++)
                         {
@@ -1687,6 +1926,13 @@ namespace Hearbud
                             if (_micCount < _micRing.Length) _micCount++;
                             else { _micR = (_micR + 1) % _micRing.Length; overruns++; }
                         }
+                        if (haveMicTick)
+                        {
+                            int headDropped = overruns + (capDropped > 0 ? (int)Math.Min(capDropped, Math.Max(0, before)) : 0);
+                            if (headDropped > 0) MicTicksConsume(headDropped);
+                            MicTicksPush(micPacketTick, conv);
+                        }
+                        else MicTicksClear();
                     }
                     long totalCap = capDropped;
                     if (capDropped > 0)
@@ -1713,25 +1959,9 @@ namespace Hearbud
                     EnqueueWrite(AudioFileTarget.Mic, _pcm16Mic, conv * 2);
                 }
 
-                // --- Mic-Only Drive (if loopback silent): fixed-frame emit ---
-                if (_recording && _wavMix != null && loopSilent)
-                {
-                    int n = FixedFrameFloats();
-                    EnsureCapacity(ref _frameMic, n);
-                    while (true)
-                    {
-                        lock (_micRingLock)
-                        {
-                            if (_micCount < n) break;
-                            for (int i = 0; i < n; i++) { _frameMic[i] = _micRing[_micR]; _micR = (_micR + 1) % _micRing.Length; }
-                            _micCount -= n;
-                        }
-                        if (_preRollRemaining > 0) { _preRollRemaining--; Array.Clear(_frameMic, 0, n); }
-                        if (_paused) Array.Clear(_frameMic, 0, n);
-                        Interlocked.Add(ref _masterFramesEmitted, FixedFramesPerChannel);
-                        EmitMicOnlyFixed(_frameMic, n);
-                    }
-                }
+                // OBS_LESSONS 3.3: no direct emit here. The mixer thread owns
+                // all emits (loop-driven and mic-only); just wake it.
+                try { _mixerWake.Set(); } catch { }
             }
             catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
             {
@@ -1759,12 +1989,33 @@ namespace Hearbud
 
                 int frames = e.ByteCount / bytesPerFrame;
                 if (frames <= 0) return;
+                // OBS_LESSONS 3.1: stamp packet start on the shared QPC clock
+                // (diagnostics only; the FIFO depth heuristic still drives sync).
+                double loopPacketTick = 0;
+                try { loopPacketTick = PacketStartTick(Stopwatch.GetTimestamp(), frames, Math.Max(1, _outRate)); RecordPacketClock(isLoop: true, packetTick: (long)loopPacketTick); }
+                catch { }
 
                 int wantFloats = frames * _outChannels;
                 EnsureCapacity(ref _loopBufF, wantFloats);
 
                 int gotLoop = ReadExactSamples(_loopSrc, _loopBufF, wantFloats);
                 if (gotLoop <= 0) return;
+
+                // OBS_LESSONS 3.2: explicit silent-loopback detector. CSCore
+                // hides AUDCLNT_BUFFERFLAGS_SILENT behind FillWithZeros, so a
+                // quiet desktop looks like valid zeros. Tracked for the log
+                // line only (silentLoop); transitions only.
+                bool silentBlock = IsSilentBlock(_loopBufF, gotLoop);
+                if (silentBlock) _silentLoopBlocks++;
+                else _silentLoopBlocks = 0;
+                bool silentNow = _silentLoopBlocks >= SilentLoopBlocksNeeded;
+                bool wasSilent = Volatile.Read(ref _loopWasSilent);
+                if (silentNow != wasSilent)
+                {
+                    Volatile.Write(ref _loopWasSilent, silentNow);
+                    if (silentNow) Info($"Loopback silent: {SilentLoopBlocksNeeded}+ consecutive quiet blocks.");
+                    else Info("Loopback signal resumed.");
+                }
 
                 // --- Metering (post-mute: muted channel reads live 0) ---
                 float blockPeak = 0f;
@@ -1819,8 +2070,8 @@ namespace Hearbud
                 }
                 WriteDump(_dumpSys, _loopBufF, gotLoop);
 
-                // --- Dual-FIFO tick: buffer loopback, emit fixed frames. ---
-                long loopDropped = PushLoopRing(_loopBufF, gotLoop);
+                // --- Dual-FIFO tick: buffer loopback; the mixer drains. ---
+                long loopDropped = PushLoopRing(_loopBufF, gotLoop, loopPacketTick);
                 if (loopDropped > 0)
                 {
                     long totalLoop = Interlocked.Read(ref _loopOverrunBlocks);
@@ -1828,47 +2079,16 @@ namespace Hearbud
                         Warn($"Loop ring overrun: dropped {loopDropped} samples (total {totalLoop})");
                 }
 
-                // --- Diagnostics + continuous drift trim + master-clock resync ---
-                double backlogSec = MicBacklogSec();
-                if (!_paused) backlogSec = TryGentleTrim(backlogSec);
-                int snapshotMicCount;
-                lock (_micRingLock) snapshotMicCount = _micCount;
-                _lastMicBacklogSec = backlogSec;
-                if (backlogSec > _micBacklogSecMax) _micBacklogSecMax = backlogSec;
-                if (!_paused) CheckLagResync(backlogSec);
-
-                // --- Fixed-frame emit (480 frames = 960 floats stereo) ---
-                int fixedN = FixedFrameFloats();
-                EnsureCapacity(ref _frameLoop, fixedN);
-                EnsureCapacity(ref _frameMic, fixedN);
-                while (TryPopFixedFrame(_frameLoop, _frameMic))
-                {
-                    if (_paused) { Array.Clear(_frameLoop, 0, fixedN); Array.Clear(_frameMic, 0, fixedN); }
-                    EmitFixedMix(_frameLoop, _frameMic, fixedN);
-                }
-
+                // OBS_LESSONS 3.3: this callback only buffers + trims. Emits
+                // run on the mixer thread (DoMixerTick), which a stalled
+                // device cannot block. Wake it; it drains what is available.
                 _loopBlockCounter++;
-                // lagTime-equivalent: wall-clock 1 Hz line (RecExperts style), not callback-count anchored.
-                // Includes FIFO depth, over/under counters, backlog max + master clock + resync count.
-                long nowLagTick = Stopwatch.GetTimestamp();
-                if (_lastLagLogTick == 0) _lastLagLogTick = nowLagTick;
-                double secSinceLag = (nowLagTick - _lastLagLogTick) * _tickMs / 1000.0;
-                if (secSinceLag >= 1.0)
+                if (_loopBlockCounter % BacklogLogEveryNBlocks == 0)
                 {
-                    _lastLagLogTick = nowLagTick;
-                    long over = Interlocked.Read(ref _micOverrunBlocks);
-                    long under = Interlocked.Read(ref _micUnderrunBlocks);
-                    long loopOver = Interlocked.Read(ref _loopOverrunBlocks);
-                    long trimD = Interlocked.Exchange(ref _trimTickDropped, 0);
-                    long trimI = Interlocked.Exchange(ref _trimTickInserted, 0);
-                    long trimDTot = Interlocked.Read(ref _trimTotalDropped);
-                    long trimITot = Interlocked.Read(ref _trimTotalInserted);
-                    Info($"lagTime={backlogSec:F3}s micDepth={snapshotMicCount} over={over} loopOver={loopOver} under={under} silenced={_silencedSamples} backlogMax={_micBacklogSecMax:F3}s masterFrames={_masterFramesEmitted} resyncs={_resyncCount} trim={trimD}/{trimI}/s trimTot={trimDTot}/{trimITot} lagWatch={(backlogSec > 0.08 ? "LAG" : "ok")}");
+                    double liveBacklog = MicBacklogSec();
+                    Info($"Mic ring backlog: {liveBacklog:F4} s (max {_micBacklogSecMax:F4} s)");
                 }
-                else if (_loopBlockCounter % BacklogLogEveryNBlocks == 0)
-                {
-                    Info($"Mic ring backlog: {backlogSec:F4} s (max {_micBacklogSecMax:F4} s)");
-                }
+                try { _mixerWake.Set(); } catch { }
             }
             catch (CSCore.CoreAudioAPI.CoreAudioAPIException ex) when (ex.HResult == unchecked((int)0x88890004))
             {
@@ -2080,6 +2300,64 @@ namespace Hearbud
             return peak > 1f ? 1f / peak : 1f;
         }
 
+        /// <summary>
+        /// Mix-bus cap: applies the overs target from
+        /// <see cref="ComputeMixScale"/> memorylessly, per frame. The bus
+        /// never exceeds 0 dBFS and never ducks following frames — there is
+        /// no release envelope. Below the ceiling the gain stays exactly 1
+        /// (transparent); only overs engage it.
+        /// </summary>
+        private static void ApplyMixLimit(float[] buf, int n, float peak)
+        {
+            float g = ComputeMixScale(peak);
+            if (g == 1f) return;
+            for (int i = 0; i < n; i++)
+            {
+                float v = buf[i] * g;
+                // Clamp the product: peak*(1/peak) can round 1 ulp over 1,
+                // which must not trip the tanh discontinuity in SoftClip.
+                buf[i] = v > 1f ? 1f : (v < -1f ? -1f : v);
+            }
+        }
+
+        /// <summary>
+        /// Mix-bus meter: post-gain, post-headroom, post-cap. Reports the
+        /// peak/RMS the file actually gets, throttled to
+        /// <see cref="LevelThrottleMs"/> like the per-source meters, so the
+        /// UI mix CLIP light fires exactly when the cap engages.
+        /// </summary>
+        private void ReportMixMeter(float prePeak, double sumSq, int n)
+        {
+            if (n <= 0) return;
+            float scale = ComputeMixScale(prePeak);
+            float peak = prePeak * scale;
+            if (peak > _peakSinceLastMix) _peakSinceLastMix = peak;
+            _rmsSumSinceLastMix += sumSq * scale * scale;
+            _rmsCountSinceLastMix += n;
+            if (prePeak > 1f) _clippedSinceLastMix = true;
+            long now = Stopwatch.GetTimestamp();
+            if ((now - _lastLevelTickMix) * _tickMs >= LevelThrottleMs && _rmsCountSinceLastMix > 0)
+            {
+                if (_paused)
+                {
+                    _peakSinceLastMix = 0f;
+                    _rmsSumSinceLastMix = 0.0;
+                    _rmsCountSinceLastMix = 0;
+                    _clippedSinceLastMix = false;
+                }
+                else
+                {
+                    float rms = (float)Math.Sqrt(_rmsSumSinceLastMix / _rmsCountSinceLastMix);
+                    LevelChanged?.Invoke(this, new LevelChangedEventArgs(LevelSource.Mix, rms, _peakSinceLastMix, _clippedSinceLastMix));
+                    _peakSinceLastMix = 0f;
+                    _rmsSumSinceLastMix = 0.0;
+                    _rmsCountSinceLastMix = 0;
+                    _clippedSinceLastMix = false;
+                }
+                _lastLevelTickMix = now;
+            }
+        }
+
         private static float SoftClipIfNeeded(float x)
         {
             // Conditional limiter: passthrough inside [-1,1] so quiet passages
@@ -2179,47 +2457,72 @@ namespace Hearbud
             }
             int drop = Math.Min(want - cap, _loopCount);
             if (drop > 0) { _loopR = (_loopR + drop) % _loopRing.Length; _loopCount -= drop; }
-            long dropped = want - cap;
+            long dropped = drop;
             Interlocked.Add(ref _loopOverrunBlocks, dropped);
             return dropped;
         }
 
-        private long PushLoopRing(float[] src, int count)
+        private long PushLoopRing(float[] src, int count, double packetStartTick)
         {
             long dropped;
             lock (_loopRingLock)
             {
+                double tps = TicksPerSample();
+                // OBS_LESSONS 3.4: anchor the loop window when the ring
+                // refills from empty; head drops below advance the head tick
+                // (anchor accounts for drops when one push overflows).
+                bool anchored = packetStartTick != 0 && (!_loopHeadValid || _loopCount == 0);
+                if (anchored)
+                {
+                    _loopHeadTick = packetStartTick;
+                    _loopHeadValid = true;
+                }
+                int before = _loopCount;
                 dropped = EnsureLoopRingCapacity(count);
+                long headDropped = dropped > 0 ? Math.Min(dropped, (long)Math.Max(0, before)) : 0;
+                int overwritten = 0;
                 for (int i = 0; i < count; i++)
                 {
                     _loopRing[_loopW] = src[i];
                     _loopW = (_loopW + 1) % _loopRing.Length;
                     if (_loopCount < _loopRing.Length) _loopCount++;
-                    else { _loopR = (_loopR + 1) % _loopRing.Length; Interlocked.Increment(ref _loopOverrunBlocks); }
+                    else { _loopR = (_loopR + 1) % _loopRing.Length; overwritten++; Interlocked.Increment(ref _loopOverrunBlocks); }
                 }
+                headDropped += overwritten;
+                if (_loopHeadValid && tps > 0 && headDropped > 0)
+                    _loopHeadTick = anchored ? packetStartTick + headDropped * tps : _loopHeadTick + headDropped * tps;
             }
             return dropped;
         }
 
-        // Pops one fixed frame: full loop quantum + best-effort mic (zero-fill).
+        // Pops one fixed frame: full loop quantum + mic paired by count.
+        // No windowed pull, no stale-drop, no trim: a steady delivery offset
+        // is absorbed as latency, never cut or padded. Sustained backlog
+        // past ResyncThresholdSec still goes to CheckLagResync.
         // Advances the master clock. Returns false when loop FIFO is short.
         private bool TryPopFixedFrame(float[] loopDst, float[] micDst)
         {
             int n = FixedFrameFloats();
             if (loopDst == null || micDst == null || loopDst.Length < n || micDst.Length < n) return false;
             Debug.Assert(loopDst.Length >= n && micDst.Length >= n, "TryPopFixedFrame dst buffers must hold one fixed frame (n floats)");
+            double tps = TicksPerSample();
             lock (_loopRingLock)
             {
                 if (_loopCount < n) return false;
                 for (int i = 0; i < n; i++) { loopDst[i] = _loopRing[_loopR]; _loopR = (_loopR + 1) % _loopRing.Length; }
                 _loopCount -= n;
+                if (_loopHeadValid && tps > 0) _loopHeadTick += n * tps;
             }
-            int micRead;
+            int micRead = 0;
             lock (_micRingLock)
             {
                 micRead = Math.Min(n, _micCount);
                 for (int i = 0; i < micRead; i++) { micDst[i] = _micRing[_micR]; _micR = (_micR + 1) % _micRing.Length; }
                 _micCount -= micRead;
+                // Stay in sync when covered (stale-overflow fallback);
+                // a foreign hand on _micCount (tests) resets tracking.
+                if (MicTicksCoverRing_NeedsLock() || _micPackets.Count == 0) MicTicksConsume(micRead);
+                else MicTicksClear();
             }
             if (micRead < n)
             {
@@ -2233,7 +2536,10 @@ namespace Hearbud
         }
 
         // Master-clock resync: sustained backlog >80 ms drops mic excess back to
-        // one fixed frame. Returns true on the tick that resyncs.
+        // one fixed frame. Depth (sample counts) is the only trigger. This is
+        // now the single bounded-loss path: windowed pull and drift trim are
+        // deleted, so nothing else drops or pads mic audio.
+        // Returns true on the tick that resyncs.
         private bool CheckLagResync(double backlogSec)
         {
             Debug.Assert(ResyncThresholdSec == 0.08, "ResyncThresholdSec 80ms contract with watchdog tests");
@@ -2245,7 +2551,7 @@ namespace Hearbud
             int dropped = 0;
             lock (_micRingLock)
             {
-                if (_micCount > keep) { dropped = _micCount - keep; _micR = (_micR + dropped) % _micRing.Length; _micCount = keep; }
+                if (_micCount > keep) { dropped = _micCount - keep; _micR = (_micR + dropped) % _micRing.Length; _micCount = keep; MicTicksConsume(dropped); }
             }
             if (dropped > 0)
             {
@@ -2254,98 +2560,6 @@ namespace Hearbud
                 return true;
             }
             return false;
-        }
-
-        private double TryGentleTrim(double backlogSec)
-        {
-            int ch = Math.Max(1, _outChannels);
-            int rate = Math.Max(1, _outRate);
-            double targetSec = TrimTargetFrames * FixedFramesPerChannel / (double)rate + MicResamplerDelaySec;
-            double errorSec = backlogSec - targetSec;
-            double aerr = errorSec < 0 ? -errorSec : errorSec;
-            if (aerr < TrimDeadbandSec) return backlogSec;
-            if (aerr >= ResyncThresholdSec) return backlogSec;
-            _driftIntegral = _driftIntegral * 0.999 + errorSec;
-            if (_driftIntegral > DriftIntegralMax) _driftIntegral = DriftIntegralMax;
-            else if (_driftIntegral < -DriftIntegralMax) _driftIntegral = -DriftIntegralMax;
-            double corrFloats = errorSec * rate * ch * TrimGainP
-                             + _driftIntegral * rate * ch * TrimGainI;
-            int want = (int)(corrFloats < 0 ? corrFloats - 0.5 : corrFloats + 0.5);
-            int mag = want < 0 ? -want : want;
-            if (mag < TrimMinSamples) want = want < 0 ? -TrimMinSamples : TrimMinSamples;
-            else if (mag > TrimMaxSamples) want = want < 0 ? -TrimMaxSamples : TrimMaxSamples;
-            want -= want % ch;
-            if (want == 0) want = errorSec > 0 ? ch : -ch;
-            mag = want < 0 ? -want : want;
-            if (mag > TrimMaxSamples) want = want < 0 ? -(TrimMaxSamples / ch * ch) : (TrimMaxSamples / ch * ch);
-            int dropped = 0, inserted = 0;
-            lock (_micRingLock)
-            {
-                if (want > 0)
-                {
-                    int drop = want;
-                    if (drop > _micCount) drop = (_micCount / ch) * ch;
-                    if (drop > 0)
-                    {
-                        drop = FindZeroCrossDrop(_micRing, _micR, _micCount, drop, ch);
-                        if (drop > TrimMaxSamples) drop = (TrimMaxSamples / ch) * ch;
-                        _micR = (_micR + drop) % _micRing.Length;
-                        _micCount -= drop;
-                        dropped = drop;
-                    }
-                }
-                else
-                {
-                    int ins = -want;
-                    EnsureRingCapacity_NoLog_NeedsLock(ins);
-                    if (ins > _micRing.Length - _micCount) ins = ((_micRing.Length - _micCount) / ch) * ch;
-                    if (ins > 0)
-                    {
-                        float last = _micCount > 0
-                            ? _micRing[(_micW - 1 + _micRing.Length) % _micRing.Length]
-                            : 0f;
-                        for (int i = 0; i < ins; i++)
-                        {
-                            float t = (float)(i + 1) / ins;
-                            _micRing[_micW] = last * (1f - t);
-                            _micW = (_micW + 1) % _micRing.Length;
-                            _micCount++;
-                        }
-                        inserted = ins;
-                    }
-                }
-                backlogSec = (double)_micCount / (ch * rate) + MicResamplerDelaySec;
-            }
-            if (dropped > 0) { Interlocked.Add(ref _trimTotalDropped, dropped); Interlocked.Add(ref _trimTickDropped, dropped); }
-            if (inserted > 0) { Interlocked.Add(ref _trimTotalInserted, inserted); Interlocked.Add(ref _trimTickInserted, inserted); }
-            return backlogSec;
-        }
-
-        private static int FindZeroCrossDrop(float[] ring, int r, int count, int nominal, int ch)
-        {
-            int half = TrimZeroCrossWindow / 2;
-            int lo = ((nominal - half) / ch) * ch;
-            int hi = ((nominal + half) / ch) * ch;
-            if (lo < ch) lo = ch;
-            if (hi > count) hi = (count / ch) * ch;
-            if (hi <= lo) return (nominal / ch) * ch;
-            int best = (nominal / ch) * ch;
-            int bestQ = int.MaxValue;
-            for (int cand = lo; cand <= hi; cand += ch)
-            {
-                int idx = (r + cand) % ring.Length;
-                float a = ring[idx] < 0 ? -ring[idx] : ring[idx];
-                float m = a;
-                if (ch > 1)
-                {
-                    float s = ring[(idx + 1) % ring.Length];
-                    float b = s < 0 ? -s : s;
-                    if (b > m) m = b;
-                }
-                int q = (int)(m * 32768f);
-                if (q < bestQ) { bestQ = q; best = cand; if (q == 0) break; }
-            }
-            return best;
         }
 
         private long EnsureRingCapacity_NoLog_NeedsLock(int roomNeeded)
@@ -2370,10 +2584,155 @@ namespace Hearbud
             int drop = want - cap;
             drop = Math.Min(drop, _micCount);
             if (drop > 0) { _micR = (_micR + drop) % _micRing.Length; _micCount -= drop; }
-            long dropped = want - cap;
+            long dropped = drop;
             Interlocked.Add(ref _micOverrunBlocks, dropped);
             Debug.Assert(_micCount <= _micRing.Length, "micCount must not exceed ring length");
             return dropped;
+        }
+
+        /// <summary>
+        /// OBS_LESSONS 3.3: idempotent mixer start. Safe from any thread;
+        /// a live mixer is just woken.
+        /// </summary>
+        private void EnsureMixerRunning()
+        {
+            var t = _mixerThread;
+            if (t != null && t.IsAlive) { try { _mixerWake.Set(); } catch { } return; }
+            _mixerStop = false;
+            t = new Thread(MixerLoop) { IsBackground = true, Name = "Hearbud mixer" };
+            _mixerThread = t;
+            t.Start();
+        }
+
+        private void StopMixer()
+        {
+            _mixerStop = true;
+            try { _mixerWake.Set(); } catch { }
+            var t = _mixerThread;
+            _mixerThread = null;
+            try
+            {
+                if (t != null && t.IsAlive && !t.Join(TimeSpan.FromSeconds(2)))
+                    Warn("Mixer thread did not stop within 2s.");
+            }
+            catch { }
+        }
+
+        private void MixerLoop()
+        {
+            int mmcss = NativeTiming.BoostCurrentThread();
+            try
+            {
+                while (!_mixerStop)
+                {
+                    try
+                    {
+                        if (_monitoring && !_disposed) DoMixerTick();
+                    }
+                    catch (Exception ex) { try { Error("MixerLoop", ex); } catch { } }
+                    try { _mixerWake.WaitOne(10); }
+                    catch { break; }
+                }
+            }
+            finally { NativeTiming.Unboost(mmcss); }
+        }
+
+        /// <summary>
+        /// OBS_LESSONS 3.3: one emit path. Drains every complete loop quantum
+        /// (bursts must not add latency), resyncs only on sustained backlog,
+        /// drives mic-only on loop stall, and owns the 1 Hz lag line so it
+        /// survives a stalled loopback device.
+        /// </summary>
+        private void DoMixerTick()
+        {
+            int n = FixedFrameFloats();
+            EnsureCapacity(ref _frameLoop, n);
+            EnsureCapacity(ref _frameMic, n);
+
+            // Master-clock resync only (drift trim deleted): measure depth,
+            // track the peak, and let CheckLagResync bound true runaway.
+            bool haveQuantum;
+            lock (_loopRingLock) haveQuantum = _loopCount >= n;
+            if (haveQuantum && !_paused)
+            {
+                double backlogSec = MicBacklogSec();
+                _lastMicBacklogSec = backlogSec;
+                if (backlogSec > _micBacklogSecMax) _micBacklogSecMax = backlogSec;
+                CheckLagResync(backlogSec);
+            }
+
+            // Join-tick mask: silence -> signal arms a 5 ms fade consumed in
+            // EmitFixedMix. Mixer-thread state only.
+            bool silentNow = Volatile.Read(ref _loopWasSilent);
+            if (_prevLoopSilent && !silentNow)
+            {
+                int total = Math.Max(1, (int)(_outRate * ResumeFadeMs / 1000.0));
+                _resumeFadeTotal = total;
+                _resumeFadeLeft = total;
+            }
+            _prevLoopSilent = silentNow;
+
+            while (TryPopFixedFrame(_frameLoop, _frameMic))
+            {
+                if (_paused) { Array.Clear(_frameLoop, 0, n); Array.Clear(_frameMic, 0, n); }
+                EmitFixedMix(_frameLoop, _frameMic, n);
+            }
+
+            // Mic-only drive (same 200 ms rule + no-loopback config as before).
+            long now = Stopwatch.GetTimestamp();
+            long loopTick = Interlocked.Read(ref _lastLoopTick);
+            bool loopSilent = _loopCap == null || (now - loopTick) * _tickMs > LoopSilentMsThreshold;
+            if (_recording && _wavMix != null && loopSilent)
+            {
+                while (true)
+                {
+                    lock (_micRingLock)
+                    {
+                        if (_micCount < n) break;
+                        for (int i = 0; i < n; i++) { _frameMic[i] = _micRing[_micR]; _micR = (_micR + 1) % _micRing.Length; }
+                        _micCount -= n;
+                        MicTicksConsume(n);
+                    }
+                    if (_preRollRemaining > 0) { _preRollRemaining--; Array.Clear(_frameMic, 0, n); }
+                    if (_paused) Array.Clear(_frameMic, 0, n);
+                    Interlocked.Add(ref _masterFramesEmitted, FixedFramesPerChannel);
+                    EmitMicOnlyFixed(_frameMic, n);
+                }
+            }
+
+            long nowLagTick = Stopwatch.GetTimestamp();
+            if (_lastLagLogTick == 0) _lastLagLogTick = nowLagTick;
+            double secSinceLag = (nowLagTick - _lastLagLogTick) * _tickMs / 1000.0;
+            if (secSinceLag >= 1.0)
+            {
+                _lastLagLogTick = nowLagTick;
+                long over = Interlocked.Read(ref _micOverrunBlocks);
+                long under = Interlocked.Read(ref _micUnderrunBlocks);
+                long loopOver = Interlocked.Read(ref _loopOverrunBlocks);
+                int depth;
+                lock (_micRingLock) depth = _micCount;
+                double lag = MicBacklogSec();
+                Info($"lagTime={lag:F3}s micDepth={depth} over={over} loopOver={loopOver} under={under} silenced={_silencedSamples} backlogMax={_micBacklogSecMax:F3}s masterFrames={_masterFramesEmitted} resyncs={_resyncCount} clkErr={Volatile.Read(ref _lastClockErrorSec):F3}s clkMax={Volatile.Read(ref _clockErrorMaxSec):F3}s silentLoop={Volatile.Read(ref _loopWasSilent)} lagWatch={(lag > 0.08 ? "LAG" : "ok")}");
+            }
+        }
+
+        /// <summary>
+        /// Join-tick mask: linear 0..1 ramp over the armed fade frames,
+        /// per audio frame (all channels share one gain). Consumes the armed
+        /// fade across emits; no-op when none armed.
+        /// </summary>
+        private void ApplyResumeFade(float[] buf, int n)
+        {
+            if (_resumeFadeLeft <= 0 || _resumeFadeTotal <= 0) return;
+            int ch = Math.Max(1, _outChannels);
+            int frames = n / ch;
+            for (int f = 0; f < frames && _resumeFadeLeft > 0; f++)
+            {
+                float g = 1f - (float)_resumeFadeLeft / (float)_resumeFadeTotal;
+                for (int c = 0; c < ch; c++) buf[f * ch + c] *= g;
+                _resumeFadeLeft--;
+            }
+            if (_resumeFadeLeft <= 0) _resumeFadeTotal = 0;
         }
 
         private void EmitFixedMix(float[] loopFrame, float[] micFrame, int n)
@@ -2383,18 +2742,24 @@ namespace Hearbud
             double micGain = MicGain;
             bool sysM = SystemMuted;
             bool micM = MicMuted;
-            float peak = 0f;
             for (int i = 0; i < n; i++)
             {
                 float s = sysM ? 0f : (float)(loopFrame[i] * loopGain);
                 float m = micM ? 0f : (float)(micFrame[i] * micGain);
-                float a = s + m;
-                _mixBufF[i] = a;
+                _mixBufF[i] = (s + m) * MixHeadroom;
+            }
+            ApplyResumeFade(_mixBufF, n);
+            float peak = 0f;
+            double sumSq = 0.0;
+            for (int i = 0; i < n; i++)
+            {
+                float a = _mixBufF[i];
                 float abs = MathF.Abs(a);
                 if (abs > peak) peak = abs;
+                sumSq += (double)a * a;
             }
-            float scale = ComputeMixScale(peak);
-            if (scale != 1f) for (int i = 0; i < n; i++) _mixBufF[i] *= scale;
+            ApplyMixLimit(_mixBufF, n, peak);
+            ReportMixMeter(peak, sumSq, n);
             for (int i = 0; i < n; i++) _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i]);
             WriteDump(_dumpMix, _mixBufF, n);
             if (_recording && _wavMix != null)
@@ -2410,15 +2775,19 @@ namespace Hearbud
             double micGain = MicGain;
             bool micM = MicMuted;
             float micPeak = 0f;
-            for (int i = 0; i < n; i++) { float m = micM ? 0f : (float)(micFrame[i] * micGain); _mixBufF[i] = m; float abs = MathF.Abs(m); if (abs > micPeak) micPeak = abs; }
-            float micScale = ComputeMixScale(micPeak);
-            for (int i = 0; i < n; i++) _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i] * micScale);
+            double micSumSq = 0.0;
+            for (int i = 0; i < n; i++) { float m = micM ? 0f : (float)(micFrame[i] * micGain) * MixHeadroom; _mixBufF[i] = m; float abs = MathF.Abs(m); if (abs > micPeak) micPeak = abs; micSumSq += (double)m * m; }
+            ApplyMixLimit(_mixBufF, n, micPeak);
+            ReportMixMeter(micPeak, micSumSq, n);
+            for (int i = 0; i < n; i++) _mixBufF[i] = SoftClipIfNeeded(_mixBufF[i]);
             WriteDump(_dumpMix, _mixBufF, n);
             if (_writeStems && _wavSys != null)
             {
-                EnsureCapacity(ref _pcm16Sys, n * 2);
-                Array.Clear(_pcm16Sys, 0, n * 2);
-                EnqueueWrite(AudioFileTarget.System, _pcm16Sys, n * 2);
+                // Dedicated buffer: the mixer thread owns emits while the
+                // loopback callback owns _pcm16Sys stem writes.
+                EnsureCapacity(ref _pcm16SysZero, n * 2);
+                Array.Clear(_pcm16SysZero, 0, n * 2);
+                EnqueueWrite(AudioFileTarget.System, _pcm16SysZero, n * 2);
             }
             if (_recording && _wavMix != null)
             {
@@ -2475,7 +2844,7 @@ namespace Hearbud
                 _micR = (_micR + drop) % _micRing.Length;
                 _micCount -= drop;
             }
-            long dropped = want - cap;
+            long dropped = drop;
             Interlocked.Add(ref _micOverrunBlocks, dropped);
             Debug.Assert(_micCount <= _micRing.Length, "micCount must not exceed ring length");
             return dropped;

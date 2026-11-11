@@ -7,6 +7,14 @@ namespace Hearbud
     {
         protected override void OnStartup(System.Windows.StartupEventArgs e)
         {
+            // Offline CLI verb: scan a take for splices without touching audio
+            // devices or opening the UI. Runs before any window is created.
+            if (e.Args.Length > 0 && string.Equals(e.Args[0], "verify-take", StringComparison.OrdinalIgnoreCase))
+            {
+                Shutdown(RunVerifyTake(e.Args));
+                return;
+            }
+
             // Global crash handlers
             AppDomain.CurrentDomain.UnhandledException += (_, args) =>
                 CrashLog.LogAndShow("AppDomain.CurrentDomain.UnhandledException", args.ExceptionObject as Exception);
@@ -36,6 +44,25 @@ namespace Hearbud
 
             base.OnStartup(e);
         }
+
+        private static int RunVerifyTake(string[] args)
+        {
+            try { AttachConsole(-1); } catch { /* headless: exit code only */ }
+            try
+            {
+                var rest = new string[Math.Max(0, args.Length - 1)];
+                Array.Copy(args, 1, rest, 0, rest.Length);
+                return TakeVerifier.VerifyTake(rest, Console.Out);
+            }
+            catch (Exception ex)
+            {
+                try { Console.Error.WriteLine("verify-take: " + ex.Message); } catch { }
+                return 2;
+            }
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern bool AttachConsole(int dwProcessId);
     }
 
     internal static class CrashLog

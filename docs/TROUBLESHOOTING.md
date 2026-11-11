@@ -302,19 +302,19 @@ Get-Service -Name "AudioSrv"
 
 **Cause:** Clock drift between microphone ADC and system DAC
 
-**Normal Behavior:** Small drift (≤50 ms) is expected and absorbed by the trim loop and FIFOs.
+**Normal Behavior:** Small drift (≤50 ms) is expected and rides as latency in the FIFOs (pair-by-count sync absorbs steady offsets; only sustained backlog past 80 ms resyncs).
 
 **If large delay (>100 ms):**
 
 #### Check Session Log
 
 ```text
-[...] INFO Info: lagTime=0.152s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.200s masterFrames=… resyncs=2 trim=… lagWatch=LAG
+[...] INFO Info: lagTime=0.152s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.200s masterFrames=… resyncs=2 lagWatch=LAG
 ```
 
 - `lagWatch=ok` with small `lagTime`: normal sync
 - `under`/`silenced` climbing: Mic is too slow (underruns)
-- `over` climbing or backlogs past 80 ms (`LAG`, `resyncs` counting): Mic is too fast or drift too large for trim
+- `over` climbing or backlogs past 80 ms (`LAG`, `resyncs` counting): Mic is too fast or drift too large — the single bounded-loss path is the resync
 
 **Workarounds:**
 - Record silence-only first to see drift direction
@@ -619,7 +619,7 @@ Session log (`*.txt` in output folder) is invaluable for diagnosing:
 #### Mic Sync Issues
 
 ```text
-[...] INFO Info: lagTime=0.152s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.200s masterFrames=… resyncs=2 trim=… lagWatch=LAG
+[...] INFO Info: lagTime=0.152s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.200s masterFrames=… resyncs=2 lagWatch=LAG
 [...] WARN Warn: Master-clock resync: dropped 4800 mic samples (backlog 0.100s > 0.08s, resync #1)
 ```
 

@@ -156,10 +156,11 @@ public class ModelTests
     // ── LevelSource enum ─────────────────────────────────────────────────────
 
     [Fact]
-    public void LevelSource_HasTwoMembers()
+    public void LevelSource_HasThreeMembers_IncludingMixBus()
     {
         var values = Enum.GetValues<LevelSource>();
-        Assert.Equal(2, values.Length);
+        Assert.Equal(3, values.Length);
+        Assert.Contains(LevelSource.Mix, values);
     }
 
     // ── EngineStatusKind enum ─────────────────────────────────────────────────

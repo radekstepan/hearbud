@@ -41,7 +41,7 @@ public class RecorderEngineMuteTests
         var (loop, mic) = Frames();
         InvokeEmit(e, "EmitFixedMix", loop, mic, loop.Length);
         var mix = MixBuf(e);
-        for (int i = 0; i < loop.Length; i++) Assert.Equal(loop[i], mix[i]);
+        for (int i = 0; i < loop.Length; i++) Assert.Equal(loop[i] * 0.5f, mix[i]);
     }
 
     [Fact]
@@ -52,7 +52,7 @@ public class RecorderEngineMuteTests
         var (loop, mic) = Frames();
         InvokeEmit(e, "EmitFixedMix", loop, mic, loop.Length);
         var mix = MixBuf(e);
-        for (int i = 0; i < mic.Length; i++) Assert.Equal(mic[i], mix[i]);
+        for (int i = 0; i < mic.Length; i++) Assert.Equal(mic[i] * 0.5f, mix[i]);
     }
 
     [Fact]
@@ -86,16 +86,16 @@ public class RecorderEngineMuteTests
         var (loop, mic) = Frames();
         InvokeEmit(e, "EmitFixedMix", loop, mic, loop.Length);
         var first = (float[])MixBuf(e).Clone();
-        for (int i = 0; i < loop.Length; i++) Assert.Equal(loop[i] + mic[i], first[i]);
+        for (int i = 0; i < loop.Length; i++) Assert.Equal((loop[i] + mic[i]) * 0.5f, first[i]);
 
         e.MicMuted = true;
         InvokeEmit(e, "EmitFixedMix", loop, mic, loop.Length);
         var second = (float[])MixBuf(e).Clone();
-        for (int i = 0; i < loop.Length; i++) Assert.Equal(loop[i], second[i]);
+        for (int i = 0; i < loop.Length; i++) Assert.Equal(loop[i] * 0.5f, second[i]);
 
         e.MicMuted = false;
         InvokeEmit(e, "EmitFixedMix", loop, mic, loop.Length);
         var third = (float[])MixBuf(e).Clone();
-        for (int i = 0; i < loop.Length; i++) Assert.Equal(loop[i] + mic[i], third[i]);
+        for (int i = 0; i < loop.Length; i++) Assert.Equal((loop[i] + mic[i]) * 0.5f, third[i]);
     }
 }
