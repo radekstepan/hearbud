@@ -51,51 +51,10 @@ public class RecorderEngineChaosTests : IDisposable
         => EngineType.GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(o, v);
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 1. Drift absorption: mic 0.5% fast, trim must hold the backlog bounded
-    //    without ever reaching the 80 ms resync threshold.
+    // 1. Drift: no trim exists anymore. A steady offset rides as latency;
+    //    only CheckLagResync bounds true runaway (sustained >80 ms).
+    //    (The old trim-absorption test was deleted with TryGentleTrim.)
     // ─────────────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void DriftAbsorption_HalfPercentFast_BacklogStaysBounded()
-    {
-        using var engine = new RecorderEngine();
-        SetField(engine, "_outChannels", 2);
-        SetField(engine, "_outRate", 48000);
-        var trim = GetInstance("TryGentleTrim");
-
-        const int ch = 2;
-        const int rate = 48000;
-        const int frameFloats = 480 * 2; // FixedFramesPerChannel * ch
-        var ring = Field<float[]>(engine, "_micRing");
-
-        // Start at the trim target: exactly one fixed frame buffered.
-        SetField(engine, "_micR", 0);
-        SetField(engine, "_micW", frameFloats % ring.Length);
-        SetField(engine, "_micCount", frameFloats);
-
-        double maxBacklog = 0;
-        // 600 ticks x 10 ms. Loopback (master clock) consumes one fixed frame
-        // per tick; the mic delivers 0.5% extra: +4.8 floats/tick on average.
-        int[] surplus = { 5, 5, 5, 5, 4 };
-        for (int tick = 0; tick < 600; tick++)
-        {
-            int count = Field<int>(engine, "_micCount");
-            count -= Math.Min(frameFloats, count); // master-clock consumption
-            count += frameFloats + surplus[tick % surplus.Length]; // mic-fast inflow
-            SetField(engine, "_micCount", count);
-            SetField(engine, "_micR", 0);
-            SetField(engine, "_micW", count % ring.Length);
-
-            double backlog = (double)count / (ch * rate);
-            double outBacklog = (double)trim.Invoke(engine, new object[] { backlog })!;
-            maxBacklog = Math.Max(maxBacklog, outBacklog);
-        }
-
-        // 30 ms of accumulated drift absorbed; resync (80 ms) never approached.
-        Assert.True(maxBacklog < 0.08, $"drift escaped trim: max backlog {maxBacklog:F4}s");
-        Assert.True(engine.TrimDropped > 0, "trim never fired over 600 drifted ticks");
-        Assert.Equal(0L, Field<long>(engine, "_resyncCount"));
-    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 2. Jitter burst: variable-size mic packets in one tick must still emit
@@ -114,7 +73,7 @@ public class RecorderEngineChaosTests : IDisposable
         // Loopback side: one complete fixed frame.
         var loopSrc = new float[n];
         for (int i = 0; i < n; i++) loopSrc[i] = 0.1f + i * 0.0001f;
-        GetInstance("PushLoopRing").Invoke(engine, new object[] { loopSrc, n });
+        GetInstance("PushLoopRing").Invoke(engine, new object[] { loopSrc, n, 0.0 });
 
         // Mic side: jittered bursts arriving in one tick, 640 of 960 floats.
         int[] bursts = { 137, 311, 89, 103 };

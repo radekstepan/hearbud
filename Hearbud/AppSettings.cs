@@ -110,7 +110,7 @@ namespace Hearbud
         /// </summary>
         private void Validate()
         {
-            MicGain = Math.Clamp(MicGain, 0.0, 10.0);
+            MicGain = Math.Clamp(MicGain, 0.0, 3.0);
             LoopGain = Math.Clamp(LoopGain, 0.0, 10.0);
             Mp3BitrateKbps = Mp3BitrateKbps == 0 ? 0 : Math.Clamp(Mp3BitrateKbps, 64, 320);
 

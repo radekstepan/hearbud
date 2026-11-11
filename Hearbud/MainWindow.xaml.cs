@@ -322,6 +322,39 @@ namespace Hearbud
             }
         }
 
+        /// <summary>
+        /// Locks a source off while its side has no devices: the checkbox is
+        /// unchecked and disabled so it cannot be ticked, and the dropdown is
+        /// disabled with a cleared selection. Once a refresh finds 1+ devices
+        /// the checkbox is unlocked (checked state left as-is) and the
+        /// dropdown follows it again. While recording, sources are fixed for
+        /// the running file, so everything stays frozen but checked state is
+        /// never touched.
+        /// </summary>
+        private void ApplySideAvailability(bool hasDevices,
+            System.Windows.Controls.CheckBox box,
+            System.Windows.Controls.ComboBox combo)
+        {
+            if (_engine.IsRecording)
+            {
+                box.IsEnabled = false;
+                combo.IsEnabled = false;
+                return;
+            }
+            if (!hasDevices)
+            {
+                combo.SelectedItem = null;
+                box.IsChecked = false;
+                box.IsEnabled = false;
+                combo.IsEnabled = false;
+            }
+            else
+            {
+                box.IsEnabled = true;
+                combo.IsEnabled = box.IsChecked ?? true;
+            }
+        }
+
         private void SafeRefreshDevices()
         {
             try
@@ -359,9 +392,31 @@ namespace Hearbud
                 try
                 {
                     using var e3 = new MMDeviceEnumerator();
-                    var defOut = e3.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                    if (defOut != null && _spkDict.ContainsKey(defOut.FriendlyName))
-                        SpeakerCombo.SelectedItem = defOut.FriendlyName;
+                    // OBS_LESSONS 3.5: OBS defaults speakers to eConsole (not
+                    // Multimedia). Match it so "Default Device" agrees with OBS.
+                    // Console first (OBS win-wasapi.cpp:613-615 Desktop Audio
+                    // uses eRender/eConsole), Multimedia fallback when
+                    // Console != Multimedia.
+                    string? defName = null;
+                    try
+                    {
+                        var defConsole = e3.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
+                        if (defConsole != null && _spkDict.ContainsKey(defConsole.FriendlyName))
+                            defName = defConsole.FriendlyName;
+                    }
+                    catch { }
+                    if (defName == null)
+                    {
+                        try
+                        {
+                            var defMulti = e3.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                            if (defMulti != null && _spkDict.ContainsKey(defMulti.FriendlyName))
+                                defName = defMulti.FriendlyName;
+                        }
+                        catch { }
+                    }
+                    if (defName != null)
+                        SpeakerCombo.SelectedItem = defName;
                 }
                 catch { }
 
@@ -369,6 +424,8 @@ namespace Hearbud
                     MicCombo.SelectedItem = _micDict.Keys.First();
                 if (SpeakerCombo.SelectedItem == null && _spkDict.Count > 0)
                     SpeakerCombo.SelectedItem = _spkDict.Keys.First();
+                ApplySideAvailability(_micDict.Count > 0, IncludeMicCheck, MicCombo);
+                ApplySideAvailability(_spkDict.Count > 0, RecordSysCheck, SpeakerCombo);
 
                 StatusText.Text = "Devices refreshed";
             }
@@ -657,6 +714,10 @@ namespace Hearbud
                 PauseBtn.IsEnabled = true;
                 UpdateHotkeyButtonLabels();
                 StopBtn.IsEnabled  = true;
+                // Sources are fixed for the running file: freeze the
+                // include checkboxes and device dropdowns.
+                ApplySideAvailability(_micDict.Count > 0, IncludeMicCheck, MicCombo);
+                ApplySideAvailability(_spkDict.Count > 0, RecordSysCheck, SpeakerCombo);
                 StatusText.Text = "Recording...";
                 _lastAutoReason = null;
                 UpdateTrayTooltip();
@@ -751,6 +812,9 @@ namespace Hearbud
                 PauseBtn.IsEnabled = true;
                 UpdateHotkeyButtonLabels();
                 StopBtn.IsEnabled = true;
+                // Still recording into the next part: keep sources frozen.
+                ApplySideAvailability(_micDict.Count > 0, IncludeMicCheck, MicCombo);
+                ApplySideAvailability(_spkDict.Count > 0, RecordSysCheck, SpeakerCombo);
                 StatusText.Text = "Recording...";
                 _limitTimer.Start();
                 ShowTrayBalloon("Hearbud: auto-split", $"{reason} — continuing in a new file.");
@@ -845,24 +909,29 @@ namespace Hearbud
         private void UpdateGainLabels()
         {
             if (MicGainLabel == null || LoopGainLabel == null) return;
-            MicGainLabel.Text  = Dbfs.FormatGain(MicGain.Value);
+            MicGainLabel.Text  = Dbfs.FormatGain(MicGain.Value)
+                + (MicGain.Value > 2.0 ? " — high, move mic closer" : "");
             LoopGainLabel.Text = Dbfs.FormatGain(LoopGain.Value);
         }
 
         private volatile float _micPeak;
         private volatile float _sysPeak;
+        private volatile float _mixPeak;
         private DateTime _micClipUntil = DateTime.MinValue;
         private DateTime _sysClipUntil = DateTime.MinValue;
+        private DateTime _mixClipUntil = DateTime.MinValue;
 
         private void OnEngineLevelChanged(object? sender, LevelChangedEventArgs e)
         {
             if (e.Source == LevelSource.Mic) _micPeak = e.Peak;
-            else _sysPeak = e.Peak;
+            else if (e.Source == LevelSource.System) _sysPeak = e.Peak;
+            else _mixPeak = e.Peak;
 
             if (e.Clipped)
             {
                 if (e.Source == LevelSource.Mic) _micClipUntil = DateTime.Now.AddMilliseconds(1500);
-                else _sysClipUntil = DateTime.Now.AddMilliseconds(1500);
+                else if (e.Source == LevelSource.System) _sysClipUntil = DateTime.Now.AddMilliseconds(1500);
+                else _mixClipUntil = DateTime.Now.AddMilliseconds(1500);
             }
         }
 
@@ -872,12 +941,15 @@ namespace Hearbud
             {
                 var mp = Math.Clamp(_micPeak, 0f, 1f);
                 var sp = Math.Clamp(_sysPeak, 0f, 1f);
+                var xp = Math.Clamp(_mixPeak, 0f, 1f);
 
                 MicBar.Value = Math.Round(mp * 100, 1);
                 SysBar.Value = Math.Round(sp * 100, 1);
+                MixBar.Value = Math.Round(xp * 100, 1);
 
                 MicDb.Text = $"{Dbfs.ToDbfs(mp),6:0.0} dBFS";
                 SysDb.Text = $"{Dbfs.ToDbfs(sp),6:0.0} dBFS";
+                MixDb.Text = $"{Dbfs.ToDbfs(xp),6:0.0} dBFS";
 
                 UpdateRecordingElapsed();
                 UpdateTransportState();
@@ -886,6 +958,7 @@ namespace Hearbud
                 var off = _disabledBrush ?? (System.Windows.Media.Brush)FindResource("ControlDisabled");
                 MicClip.Foreground = DateTime.Now < _micClipUntil ? clip : off;
                 SysClip.Foreground = DateTime.Now < _sysClipUntil ? clip : off;
+                MixClip.Foreground = DateTime.Now < _mixClipUntil ? clip : off;
             }
             catch { /* best-effort: meters must never break input */ }
         }
@@ -979,6 +1052,10 @@ namespace Hearbud
                     StartBtn.IsEnabled = true;
                     StopBtn.IsEnabled = false;
                     PauseBtn.IsEnabled = false;
+                    // Recording over: unfreeze source controls (an empty
+                    // side stays locked off until devices come back).
+                    ApplySideAvailability(_micDict.Count > 0, IncludeMicCheck, MicCombo);
+                    ApplySideAvailability(_spkDict.Count > 0, RecordSysCheck, SpeakerCombo);
                     UpdateHotkeyButtonLabels();
                     UpdateTrayTooltip();
 
@@ -1009,6 +1086,10 @@ namespace Hearbud
                 }
                 else if (e.Kind == EngineStatusKind.Error)
                 {
+                    // Engine failed: restore source controls unless a
+                    // recording is somehow still active (helper freezes).
+                    ApplySideAvailability(_micDict.Count > 0, IncludeMicCheck, MicCombo);
+                    ApplySideAvailability(_spkDict.Count > 0, RecordSysCheck, SpeakerCombo);
                     WpfMessageBox.Show(e.Message, "Recording Error",
                         MessageBoxButton.OK, MessageBoxImage.Error);
                 }
@@ -1349,8 +1430,10 @@ namespace Hearbud
 
                 IncludeMicCheck.IsChecked = _settings.IncludeMic;
                 RecordSysCheck.IsChecked = _settings.IncludeSystem;
-                MicCombo.IsEnabled = _settings.IncludeMic;
-                SpeakerCombo.IsEnabled = _settings.IncludeSystem;
+                // An empty side stays locked off even if settings say
+                // include (the startup refresh above already ran).
+                ApplySideAvailability(_micDict.Count > 0, IncludeMicCheck, MicCombo);
+                ApplySideAvailability(_spkDict.Count > 0, RecordSysCheck, SpeakerCombo);
 
                 // Output format, stems, limits, countdown and hotkeys now live
                 // in the Settings dialog and are already in _settings; just

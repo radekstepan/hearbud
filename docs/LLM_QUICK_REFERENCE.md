@@ -119,9 +119,9 @@ foreach (var job in _writeQueue.GetConsumingEnumerable()) {
 float systemSample = loopBufF[i] * LoopGain;
 float micSample = micBufF[i] * MicGain;
 
-// Mix formula: straight sum, normalize only on overs (bit-transparent otherwise)
-float mix = systemSample + micSample;
-mix *= ComputeMixScale(blockPeak);      // 1/peak if peak > 1, else 1
+// Mix formula: fixed -6 dB headroom, limit only on overs (transparent otherwise)
+float mix = (systemSample + micSample) * 0.5f;
+mix = ApplyMixLimit(mix, blockPeak);   // 1/peak memoryless per-frame cap, no release envelope
 float mixClipped = SoftClipIfNeeded(mix);  // tanh only above ±1, then clamp
 ```
 
@@ -226,7 +226,7 @@ public void Dispose() {
 
 **Key Diagnostics (1 Hz `lagTime` line):**
 ```text
-[...] INFO Info: lagTime=0.052s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.120s masterFrames=… resyncs=0 trim=… lagWatch=ok
+[...] INFO Info: lagTime=0.052s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.120s masterFrames=… resyncs=0 lagWatch=ok
 ```
 - `lagTime` small + `lagWatch=ok` → Healthy sync
 - `under`/`silenced` climbing → Underruns (mic too slow)

@@ -28,19 +28,22 @@ Related: `docs/WORKING_WITH_AUDIO.md` (DSP/clock background),
 
 ## 2. Clock drift 0.1–0.5% (mic faster or slower than loopback)
 
-- **Rule:** `RecorderEngine.TryGentleTrim` applies a small proportional +
-  integral correction each master tick (2 ms deadband, 8–96 sample window,
-  frame-aligned zero-cross drops / faded inserts). Errors ≥ 80 ms sustained
-  over 3 ticks fall through to `CheckLagResync`, which drops the mic backlog
-  to one fixed frame and counts a resync.
-- **Test:** `RecorderEngineChaosTests.DriftAbsorption_HalfPercentFast_BacklogStaysBounded`
-  (600 ticks of 0.5%-fast mic held under 80 ms by trim alone),
-  `RecorderEngineDspTests.Trim_SmallPositive_DropsBounded_AndCounts`,
-  `Trim_Negative_InsertsFade_AndCounts`,
-  `CheckLagResync_SustainedBacklog_DropsToOneFrame`.
+- **Rule:** sync pairs by count and absorbs steady offsets as latency —
+  `TryPopFixedFrame` consumes take-oldest, nothing drops or pads. Only
+  sustained backlog ≥ 80 ms over 3 ticks falls through to `CheckLagResync`,
+  which drops the mic backlog to one fixed frame and counts a resync.
+- **Test:** `RecorderEngineDspTests.CheckLagResync_SustainedBacklog_DropsToOneFrame`,
+  `CheckLagResync_BelowThreshold_NoResync`,
+  `RecorderEngineMixerTests.PairByCount_SyntheticTake_NoSplices_NoDrops`
+  (synthetic 13 s take at 003933 gains: silent→system→silent, asserts the
+  mix equals the gained sum with zero jumps, zero shortfalls, zero resyncs),
+  `RecorderEnginePairByCountTests` (aligned / fully-ahead / far-ahead all
+  pair by count; resync never triggers on stamp lead with healthy depth),
+  `TakeVerifierTests` (clean sine passes; embedded pad and frame-edge steps fail).
 - **Try:** Record 30+ minutes, then check the session `*.txt` log: backlog
-  should hover near target, with `trim=` activity and no `resync #`
-  warnings.
+  hovers near the natural device offset and no `resync #` warnings appear.
+  For a byte-level gate run `hearbud verify-take <recordings-dir>` — it
+  scans the take mix for pads and frame-edge jumps (exit 0 clean, 1 splice).
 
 ## 3. Jitter / bursts (variable-size WASAPI packets)
 
@@ -82,21 +85,28 @@ Related: `docs/WORKING_WITH_AUDIO.md` (DSP/clock background),
   must contain speech, `system.wav` silence — then start playback and confirm
   sync restarts cleanly.
 
-## 6. Clipping (hot gains): normalize + clamp
+## 6. Clipping (hot gains): headroom + memoryless cap + clamp + mix CLIP light
 
-- **Rule:** `RecorderEngine.EmitFixedMix` measures the block peak,
-  `ComputeMixScale` normalizes only on overs (bit-transparent at/below full
-  scale), `SoftClipIfNeeded` applies tanh above ±1, and `FloatToPcm16/32`
-  clamp to the integer range (16-bit adds ±1 LSB TPDF dither). The chain
-  cannot wrap around no matter the gain.
+- **Rule:** `RecorderEngine.EmitFixedMix` sums with fixed -6 dB headroom
+  (`* 0.5`: two hot sources routinely sum past 0 dBFS), `ApplyMixLimit`
+  caps memorylessly on overs (1/peak per frame, no release envelope so
+  overs never duck following audio), `SoftClipIfNeeded`
+  applies tanh above ±1, and `FloatToPcm16/32` clamp to the integer range
+  (16-bit adds ±1 LSB TPDF dither). The chain cannot wrap around no
+  matter the gain. A mix-bus meter (`LevelSource.Mix`,
+  post-gain/post-headroom) drives a third CLIP light so persistent overs
+  tell the user to turn the gains down instead of being ducked away.
 - **Test:** `RecorderEngineChaosTests.GainSweep_MixScaleAndSoftClip_NoWrapAround`
   (gains 0–3 × probes to ±100),
   `RecorderEngineDspTests.ComputeMixScale_NormalizesOnlyOnOvers`,
+  `MixCap_HotFrame_CapsAtCeiling_NoStickyDuck`,
+  `MixCap_SustainedOvers_StayAtCeiling_QuietRecoversInstantly`,
+  `MixMeter_ReportsPostGainPeak_AndClipsOnOvers`,
   `SoftClip_MatchesTanh_OnlyAboveOne`, `FloatToPcm32_Clipping_ClampsToIntMax`,
   `FloatToPcm16_Clipping_ClampsToShortRange`.
-- **Try:** Set mic and loop gain to max (3.0x), record loud audio, and confirm
-  the mix is limited — loud but harsh-digital-clipping-free — with the meter
-  clip indicator as the only complaint.
+- **Try:** Set mic and loop gain to max (3.0x / 3.0x), record loud
+  audio, and confirm the mix never exceeds 0 dBFS — no ducking of following
+  audio — with the Mix clip indicator as the cue to back the gains off.
 
 ## 7. Mute / volume changes mid-record
 

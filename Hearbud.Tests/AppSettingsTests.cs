@@ -72,9 +72,9 @@ public class AppSettingsTests : IDisposable
     [Fact]
     public void SaveLoad_RoundTrips_MicGain()
     {
-        var s = new AppSettings { MicGain = 3.5 };
+        var s = new AppSettings { MicGain = 2.5 };
         s.Save();
-        Assert.Equal(3.5, AppSettings.Load().MicGain);
+        Assert.Equal(2.5, AppSettings.Load().MicGain);
     }
 
     [Fact]
@@ -132,12 +132,12 @@ public class AppSettingsTests : IDisposable
     // ── Validation / clamping ─────────────────────────────────────────────────
 
     [Fact]
-    public void Load_ClampsGainAbove10()
+    public void Load_ClampsMicGainAbove3()
     {
         var json = """{"MicGain":99.0,"LoopGain":1.0,"Mp3BitrateKbps":192,"IncludeMic":true,"OutputDir":"/tmp"}""";
         File.WriteAllText(ConfigPath, json);
         var s = AppSettings.Load();
-        Assert.Equal(10.0, s.MicGain);
+        Assert.Equal(3.0, s.MicGain);
     }
 
     [Fact]
@@ -202,7 +202,7 @@ public class AppSettingsTests : IDisposable
         var json = """{"MicGain":99.0,"LoopGain":-5.0,"Mp3BitrateKbps":192,"IncludeMic":true,"OutputDir":"/tmp"}""";
         File.WriteAllText(ConfigPath, json);
         var s = AppSettings.Load();
-        Assert.Equal(10.0, s.MicGain);  // clamped to upper bound
+        Assert.Equal(3.0, s.MicGain);  // clamped to upper bound (3×: above 2× is noise floor, not signal)
         Assert.Equal(0.0,  s.LoopGain); // clamped to lower bound
     }
 }

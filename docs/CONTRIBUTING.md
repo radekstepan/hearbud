@@ -560,7 +560,7 @@ Hearbud writes session logs alongside output files (e.g., `rec-20250623_143022.t
 
 ```
 [2026-11-08 14:30:22.123] INFO Info: Recording started
-[2026-11-08 14:30:22.456] INFO Info: lagTime=0.052s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.120s masterFrames=… resyncs=0 trim=… lagWatch=ok
+[2026-11-08 14:30:22.456] INFO Info: lagTime=0.052s micDepth=… over=0 loopOver=0 under=0 silenced=0 backlogMax=0.120s masterFrames=… resyncs=0 lagWatch=ok
 [2026-11-08 14:30:25.789] WARN Warn: Master-clock resync: dropped 4800 mic samples (backlog 0.100s > 0.08s, resync #1)
 ```
 

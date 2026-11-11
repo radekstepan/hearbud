@@ -407,6 +407,11 @@ Master clock = `_masterFramesEmitted`; sustained backlog >80 ms over 3 ticks tri
 `CheckLagResync` (drop mic to one frame, `_resyncCount`, Warn); 1 Hz `lagTime` line logs
 depth/over/loopOver/under/silenced/max/masterFrames/resyncs. Pre-roll 2 fixed frames;
 MMCSS Pro Audio on writer thread + 1 ms timer; `DumpDir` taps; log cap keeps WARN/ERROR + tail.
+OBS lessons: packet-start ticks on the shared QPC clock (`clkErr` on the 1 Hz line,
+diagnostics only); pair-by-count sync absorbs steady delivery offsets as latency
+(windowed pull and drift trim were deleted — they chopped healthy audio);
+emits run on a dedicated 10 ms mixer thread (`DoMixerTick`), so a stalled
+device cannot block the mix.
 
 **Rationale:**
 - Handles mic/loopback sample rate differences on arrival (not lazily at mix)
@@ -432,8 +437,8 @@ Countdown + in-window transport + tray: `CountdownSeconds` (0/3/5/10, cancellabl
 Format picker (#9 mapping-only, Settings dialog): `OutputFormatCombo` (WAV master / WAV + MP3) + bitrate-only combo map to the same `Mp3BitrateKbps` (0 vs kbps); no engine change, no sample-rate override by design (loopback stays bit-exact).
 Removed in the compact-window round: the mic/system sound-test buttons, the recent-sessions history list, and the startup WAV repair scan. `HistoryStore` (JSON log), `SessionManifest` (crash bookkeeping — engine still calls `Begin`/`MarkClosed`) and `WavRepair` (header fix + `ScanUnclosed`/`RepairUnclosed`) remain in the tree with test coverage, but no UI currently writes history or runs the recovery scan.
 
-### 6. Conditional limiter (tanh only on overs) + peak normalize
-**Decision:** Sum `s*gL + m*gM` at full level, peak-normalize the block only if peak>1, then apply `tanh` soft-knee only to samples with `|x|>1` before clamp.
+### 6. Conditional limiter (tanh only on overs) + memoryless mix cap + mix headroom
+**Decision:** Sum `(s*gL + m*gM) * 0.5` (-6 dB headroom: two hot sources routinely sum past 0 dBFS), then `ApplyMixLimit` (memoryless 1/peak per-frame cap from `ComputeMixScale`, no release envelope) only if peak>1, then `tanh` soft-knee only on samples with `|x|>1` before clamp. A post-gain mix-bus meter (`LevelSource.Mix`) drives a Mix CLIP light.
 
 **Rationale:**
 - Tanh provides natural limiting curve (sounds better than hard clip)
@@ -498,7 +503,7 @@ Removed in the compact-window round: the mic/system sound-test buttons, the rece
 2. **Mic Ring Buffer Lock Contention**
    - Brief critical sections via `lock (_micRingLock)`
    - Keep lock duration minimal (just ring read/write operations)
-   - Two writers: `OnMicData` adds, `OnLoopbackData` consumes
+   - Two producers, one consumer: `OnMicData` adds, `OnLoopbackData` buffers, the mixer thread (`DoMixerTick`) pops both FIFOs and owns every emit
 
 3. **Dispose Pattern Safety**
    - `RecorderEngine.Dispose()` must be idempotent
